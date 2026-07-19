@@ -167,6 +167,15 @@ pub fn install(target: AgentTarget) -> Result<String> {
     Ok(crate::i18n::tr(crate::i18n::Lang::current(), "cmd.mcpConfigInstalled").to_string())
 }
 
+pub fn install_codex_with_environment(environment: &[(&str, &str)]) -> Result<String> {
+    let exe = current_exe_string()?;
+    let path = config_path(AgentTarget::Codex);
+    let original = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = apply_install_toml_with_environment(AgentTarget::Codex, &original, &exe, environment)?;
+    write_text(&path, &updated)?;
+    Ok(crate::i18n::tr(crate::i18n::Lang::current(), "cmd.mcpConfigInstalled").to_string())
+}
+
 /// 更新：与安装同样写入逻辑，仅反馈文案不同。
 pub fn update(target: AgentTarget) -> Result<String> {
     write_entry(target)?;
@@ -428,7 +437,27 @@ fn json_entry_matches(value: &Value, command: &str, timeout_ms: Option<i64>) -> 
 /// upsert `[mcp_servers.askhuman]`（command/args/startup_timeout_sec/tool_timeout_sec，
 /// Grok 额外写 `tool_timeouts = { ask = 86400 }`）。
 fn apply_install_toml(target: AgentTarget, text: &str, command: &str) -> Result<String> {
-    Ok(apply_install_toml_outcome(target, text, command)?.text)
+    Ok(apply_install_toml_with_environment(target, text, command, &[])?)
+}
+
+fn apply_install_toml_with_environment(
+    target: AgentTarget,
+    text: &str,
+    command: &str,
+    environment: &[(&str, &str)],
+) -> Result<String> {
+    let mut output = apply_install_toml_outcome(target, text, command)?.text;
+    if target == AgentTarget::Codex && !environment.is_empty() {
+        let mut document = output.parse::<toml_edit::DocumentMut>()?;
+        let entry = document["mcp_servers"][SERVER_NAME].as_table_mut().unwrap();
+        let mut table = toml_edit::Table::new();
+        for (name, value) in environment {
+            table.insert(*name, toml_edit::value(*value));
+        }
+        entry.insert("env", toml_edit::Item::Table(table));
+        output = document.to_string();
+    }
+    Ok(output)
 }
 
 fn apply_install_toml_outcome(
@@ -1023,6 +1052,22 @@ mod tests {
         let grok = apply_install_toml(GROK, "", EXE).unwrap();
         let doc = grok.parse::<toml_edit::DocumentMut>().unwrap();
         assert!(toml_entry(&doc).unwrap().get("approval_mode").is_none());
+    }
+
+    #[test]
+    fn codex_install_writes_requested_environment() {
+        let environment = [("WEBKIT_DISABLE_DMABUF_RENDERER", "1")];
+        let out = apply_install_toml_with_environment(CODEX, "", EXE, &environment).unwrap();
+        let doc = out.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            toml_entry(&doc)
+                .unwrap()
+                .get("env")
+                .and_then(|item| item.as_table_like())
+                .and_then(|table| table.get("WEBKIT_DISABLE_DMABUF_RENDERER"))
+                .and_then(|item| item.as_str()),
+            Some("1")
+        );
     }
 
     #[test]

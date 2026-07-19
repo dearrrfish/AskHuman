@@ -213,7 +213,17 @@ fn mode_cmd(args: &[String], lang: Lang) -> Result<(), String> {
                     &format!("未知模式: {want}（应为 none|cli|mcp）"),
                 )
             })?;
+            let environment = parse_environment(&args[2..])?;
+            if !environment.is_empty()
+                && !(target == AgentTarget::Codex && mode == agent_mode::Mode::Mcp)
+            {
+                return Err("--env is supported only by `agents mode codex mcp`".to_string());
+            }
             agent_mode::set(target, mode).map_err(|e| e.to_string())?;
+            if !environment.is_empty() {
+                mcp_config::install_codex_with_environment(&environment)
+                    .map_err(|e| e.to_string())?;
+            }
             print_line(&format!(
                 "[{}] {} {}",
                 kind.label(),
@@ -225,11 +235,40 @@ fn mode_cmd(args: &[String], lang: Lang) -> Result<(), String> {
     }
 }
 
+fn parse_environment(args: &[String]) -> Result<Vec<(&str, &str)>, String> {
+    let mut environment = Vec::new();
+    let mut extra = args.iter();
+    while let Some(flag) = extra.next() {
+        if flag != "--env" { return Err("only --env NAME=VALUE arguments are accepted after the mode".to_string()); }
+        let value = extra.next().ok_or_else(|| "--env requires NAME=VALUE".to_string())?;
+        let (name, value) = value.split_once('=').ok_or_else(|| "--env requires NAME=VALUE".to_string())?;
+        if name.is_empty() { return Err("--env requires a non-empty name".to_string()); }
+        environment.push((name, value));
+    }
+    Ok(environment)
+}
+
 fn mode_label(m: agent_mode::Mode, lang: Lang) -> String {
     match m {
         agent_mode::Mode::None => cfgio::t(lang, "off", "未集成"),
         agent_mode::Mode::Cli => "CLI".to_string(),
         agent_mode::Mode::Mcp => "MCP".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_environment;
+
+    #[test]
+    fn parses_repeated_environment_pairs() {
+        let args = vec!["--env".into(), "A=one".into(), "--env".into(), "B=two".into()];
+        assert_eq!(parse_environment(&args).unwrap(), [("A", "one"), ("B", "two")]);
+    }
+
+    #[test]
+    fn rejects_incomplete_environment_pair() {
+        assert!(parse_environment(&["--env".into()]).is_err());
     }
 }
 
