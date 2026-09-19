@@ -5,17 +5,34 @@ import { i18n } from "../../i18n";
 import SequentialPane from "./SequentialPane.vue";
 import { PopupCtxKey, type PopupContext } from "./context";
 
-function mountPane(whatsNext: boolean) {
+function mountPane(whatsNext: boolean, markdown = false) {
   const options = [
     {
-      text: "Run todo: ship the fix",
+      text: "Run todo: ship the fix 【2 attachments】",
       recommended: false,
       todoId: "todo-1",
+      todoText: "ship the fix",
+      todoAttachments: [
+        {
+          id: "attachment-1",
+          name: "one.txt",
+          path: "/tmp/one.txt",
+          sourcePath: "/tmp/one.txt",
+          storage: "reference",
+        },
+        {
+          id: "attachment-2",
+          name: "two.txt",
+          path: "/tmp/two.txt",
+          sourcePath: "/tmp/two.txt",
+          storage: "reference",
+        },
+      ],
     },
     { text: "Review logs", recommended: true },
   ];
   const ctx = {
-    request: ref({ whatsNext, isMarkdown: false }),
+    request: ref({ whatsNext, isMarkdown: markdown }),
     showQuestionHeader: ref(false),
     showDescription: ref(false),
     questionHeaderLabel: ref("Question"),
@@ -23,7 +40,10 @@ function mountPane(whatsNext: boolean) {
     transitionName: ref("none"),
     onQuestionEntered: vi.fn(),
     current: ref(0),
-    currentQuestion: ref({ message: "", predefinedOptions: options }),
+    currentQuestion: ref({
+      message: markdown ? "```mermaid\nflowchart TD\nA-->B\n```" : "",
+      predefinedOptions: options,
+    }),
     renderedHtml: ref(""),
     viewSource: ref(false),
     onContentClick: vi.fn(),
@@ -38,7 +58,14 @@ function mountPane(whatsNext: boolean) {
     global: {
       plugins: [i18n],
       provide: { [PopupCtxKey as symbol]: ctx },
-      stubs: { AnswerComposer: true, Transition: false },
+      stubs: {
+        AnswerComposer: true,
+        MarkdownContent: {
+          props: ["source"],
+          template: '<div class="markdown-stub">{{ source }}</div>',
+        },
+        Transition: false,
+      },
     },
   });
 }
@@ -49,6 +76,9 @@ describe("SequentialPane todo badge", () => {
     const rows = wrapper.findAll(".option");
     expect(rows[0].get(".todo-option-badge").text()).toBe("TODO");
     expect(rows[0].text()).toContain("ship the fix");
+    expect(rows[0].get(".todo-attachment-badge").text()).toBe(
+      "【2 attachments】",
+    );
     expect(rows[0].text()).not.toContain("Run todo:");
     expect(rows[1].find(".todo-option-badge").exists()).toBe(false);
   });
@@ -57,5 +87,11 @@ describe("SequentialPane todo badge", () => {
     const wrapper = mountPane(false);
     expect(wrapper.find(".todo-option-badge").exists()).toBe(false);
     expect(wrapper.text()).toContain("Run todo: ship the fix");
+  });
+
+  it("routes Markdown questions through the shared Mermaid-capable component", () => {
+    const wrapper = mountPane(false, true);
+    expect(wrapper.get(".markdown-stub").text()).toContain("flowchart TD");
+    expect(wrapper.find(".plain-body").exists()).toBe(false);
   });
 });

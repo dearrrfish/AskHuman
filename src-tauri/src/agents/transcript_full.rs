@@ -1,10 +1,11 @@
-//! Full-session transcript parse for IM `/transcript` (best-effort, four agent families).
+//! Full-session transcript parse for IM `/transcript` (best-effort, five agent families).
 //!
 //! Separate from `activity.rs` (tail-only “what now”). Spec: im-diff-stage-transcript D17–D21.
 
 use super::title::transcript_path;
 use super::AgentKind;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -57,9 +58,26 @@ pub enum TranscriptEvent {
     Meta(String),
 }
 
+/// Structured AskHuman interaction (spec gui-agent-console C14): shared message + per-question
+/// answers. A plain single-question ask keeps one entry with empty `text`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AskHumanBlock {
-    pub question: String,
+    pub kind: AskHumanKind,
+    /// Shared message shown above the questions (may be long Markdown).
+    pub message: String,
+    pub questions: Vec<AskQA>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskHumanKind {
+    Ask,
+    WhatsNext,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AskQA {
+    pub text: String,
+    /// None while in-flight / cancelled.
     pub answer: Option<String>,
 }
 
@@ -115,7 +133,7 @@ fn event_time(v: &Value) -> Option<u64> {
 }
 
 /// Parse `2026-06-13T10:09:57.062Z` / `2026-06-13T10:09:57+08:00` → unix seconds (UTC).
-fn parse_iso8601_secs(s: &str) -> Option<u64> {
+pub(super) fn parse_iso8601_secs(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.len() < 19 {
         return None;
@@ -170,6 +188,13 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
 }
 
 pub fn load_events(kind: AgentKind, session_id: &str) -> Result<TranscriptDoc, String> {
+    // Cursor IDE 形态：全局 state.vscdb 实时源优先（jsonl 长回合内冻结）；
+    // 未命中（CLI 会话 / 库缺失）回退 jsonl。
+    if kind == AgentKind::Cursor {
+        if let Ok(doc) = super::cursor_vscdb::load_events(session_id) {
+            return Ok(doc);
+        }
+    }
     let path =
         transcript_path(kind, session_id).ok_or_else(|| "transcript not found".to_string())?;
     let mut doc = load_path(kind, &path)?;
@@ -180,14 +205,272 @@ pub fn load_events(kind: AgentKind, session_id: &str) -> Result<TranscriptDoc, S
     Ok(doc)
 }
 
+/// Latest real user prompt in a session that has a reliable unix timestamp (seconds → ms).
+/// Best-effort: missing transcript, inject-only text, or unparseable time → `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastUserPrompt {
+    pub text: String,
+    pub at_ms: i64,
+}
+
+/// How far back from the end of a transcript file to search for the latest real user prompt.
+/// Full export (`load_events`) only keeps a 2 MiB tail for IM/console; long Codex sessions often
+/// have **no** user lines in that tail (only tools/assistant). show_last needs a wider scan.
+const LAST_USER_PROMPT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
+
+pub fn last_timestamped_user_prompt(kind: AgentKind, session_id: &str) -> Option<LastUserPrompt> {
+    // Cursor IDE: vscdb is already the live source with per-bubble times.
+    if kind == AgentKind::Cursor {
+        if let Ok(doc) = super::cursor_vscdb::load_events(session_id) {
+            if let Some(found) = last_user_prompt_from_events(&doc.events) {
+                return Some(found);
+            }
+        }
+    }
+    let path = transcript_path(kind, session_id)?;
+    last_timestamped_user_prompt_from_path(kind, &path)
+}
+
+fn last_timestamped_user_prompt_from_path(kind: AgentKind, path: &Path) -> Option<LastUserPrompt> {
+    let (lines, _) = read_lines_bounded(path, LAST_USER_PROMPT_SCAN_BYTES).ok()?;
+    let mut events: Vec<TranscriptEvent> = Vec::new();
+    let mut open_tools = OpenTools::default();
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if kind == AgentKind::Codex
+            && (codex_response_user_is_followed_by_explicit_user(&v, &lines[index + 1..])
+                || codex_response_assistant_is_preceded_by_explicit_assistant(&v, &lines[..index]))
+        {
+            continue;
+        }
+        push_full(kind, &v, &mut events, &mut open_tools);
+    }
+    if kind == AgentKind::Grok {
+        grok_backfill_times(path.parent(), &mut events);
+    }
+    last_user_prompt_from_events(&events)
+}
+
+fn last_user_prompt_from_events(events: &[TranscriptEvent]) -> Option<LastUserPrompt> {
+    for ev in events.iter().rev() {
+        let TranscriptEvent::UserText { text, at, at_label } = ev else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let at_ms = match at {
+            Some(secs) => (*secs as i64).saturating_mul(1000),
+            None => match at_label.as_deref().and_then(parse_cursor_wall_clock_label) {
+                Some(secs) => (secs as i64).saturating_mul(1000),
+                None => continue,
+            },
+        };
+        return Some(LastUserPrompt {
+            text: text.to_string(),
+            at_ms,
+        });
+    }
+    None
+}
+
+/// Parse Cursor-style wall-clock labels such as
+/// `Monday, May 25, 2026, 7:57 AM (UTC+8)` → unix seconds.
+/// Best-effort; unknown layouts return `None`.
+pub fn parse_cursor_wall_clock_label(label: &str) -> Option<u64> {
+    let s = label.trim();
+    // Drop leading weekday: "Monday, May 25, 2026, 7:57 AM (UTC+8)"
+    let rest = s.split_once(", ").map(|(_, r)| r).unwrap_or(s);
+    // rest: "May 25, 2026, 7:57 AM (UTC+8)" or "May 25, 2026, 7:57 AM (UTC+08:00)"
+    let (date_time, tz) = rest.rsplit_once('(')?;
+    let tz = tz.trim().trim_end_matches(')').trim();
+    let date_time = date_time.trim().trim_end_matches(',').trim();
+    // date_time: "May 25, 2026, 7:57 AM"
+    let parts: Vec<&str> = date_time.split(',').map(str::trim).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let mon_day: Vec<&str> = parts[0].split_whitespace().collect();
+    if mon_day.len() != 2 {
+        return None;
+    }
+    let month = month_abbr_to_num(mon_day[0])?;
+    let day: u32 = mon_day[1].parse().ok()?;
+    let year: i32 = parts[1].parse().ok()?;
+    let time_bits: Vec<&str> = parts[2].split_whitespace().collect();
+    if time_bits.len() != 2 {
+        return None;
+    }
+    let (hh_mm, ampm) = (time_bits[0], time_bits[1].to_ascii_uppercase());
+    let (h_str, m_str) = hh_mm.split_once(':')?;
+    let mut hour: u32 = h_str.parse().ok()?;
+    let minute: u32 = m_str.parse().ok()?;
+    match ampm.as_str() {
+        "AM" => {
+            if hour == 12 {
+                hour = 0;
+            }
+        }
+        "PM" => {
+            if hour != 12 {
+                hour += 12;
+            }
+        }
+        _ => return None,
+    }
+    let offset_secs = parse_utc_offset_label(tz)?;
+    // Civil time in that offset → UTC unix.
+    let utc_secs = civil_to_unix_secs(year, month, day, hour, minute, 0)? - offset_secs;
+    if utc_secs < 0 {
+        return None;
+    }
+    Some(utc_secs as u64)
+}
+
+fn month_abbr_to_num(s: &str) -> Option<u32> {
+    match s {
+        "Jan" | "January" => Some(1),
+        "Feb" | "February" => Some(2),
+        "Mar" | "March" => Some(3),
+        "Apr" | "April" => Some(4),
+        "May" => Some(5),
+        "Jun" | "June" => Some(6),
+        "Jul" | "July" => Some(7),
+        "Aug" | "August" => Some(8),
+        "Sep" | "Sept" | "September" => Some(9),
+        "Oct" | "October" => Some(10),
+        "Nov" | "November" => Some(11),
+        "Dec" | "December" => Some(12),
+        _ => None,
+    }
+}
+
+/// `UTC+8`, `UTC+08:00`, `UTC-5`, `UTC` → offset east of UTC in seconds.
+fn parse_utc_offset_label(tz: &str) -> Option<i64> {
+    let t = tz.trim();
+    if t.eq_ignore_ascii_case("UTC") || t.eq_ignore_ascii_case("GMT") {
+        return Some(0);
+    }
+    let rest = t
+        .strip_prefix("UTC")
+        .or_else(|| t.strip_prefix("utc"))
+        .or_else(|| t.strip_prefix("GMT"))
+        .or_else(|| t.strip_prefix("gmt"))?;
+    if rest.is_empty() {
+        return Some(0);
+    }
+    let (sign, body) = match rest.chars().next()? {
+        '+' => (1i64, &rest[1..]),
+        '-' => (-1i64, &rest[1..]),
+        _ => return None,
+    };
+    let (h, m) = if let Some((h, m)) = body.split_once(':') {
+        (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?)
+    } else {
+        (body.parse::<i64>().ok()?, 0)
+    };
+    Some(sign * (h * 3600 + m * 60))
+}
+
+/// Proleptic Gregorian civil date/time → unix seconds (UTC components).
+fn civil_to_unix_secs(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    min: u32,
+    sec: u32,
+) -> Option<i64> {
+    if !(1..=12).contains(&month) || day == 0 || day > 31 || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+    // Howard Hinnant civil_from_days inverse.
+    let y = year as i64 - if month <= 2 { 1 } else { 0 };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400) as u64;
+    let mp = month as u64 + if month > 2 { 0 } else { 12 } - 3;
+    let doy = (153 * mp + 2) / 5 + day as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146097 + doe as i64) - 719468;
+    Some(days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64)
+}
+
+/// Transcript file mtime（控制台分页缓存的失效键，spec gui-agent-console C14）。
+/// Cursor IDE 形态取 vscdb 的 `lastUpdatedAt`（全局库文件 mtime 恒变，不能当键）。
+pub fn transcript_mtime(kind: AgentKind, session_id: &str) -> Option<std::time::SystemTime> {
+    if kind == AgentKind::Cursor {
+        if let Some(t) = super::cursor_vscdb::last_updated(session_id) {
+            return Some(t);
+        }
+    }
+    transcript_path(kind, session_id)
+        .and_then(|p| fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+}
+
+/// 控制台事件 JSON（spec gui-agent-console C14）：按 `type` 打标
+/// （user/assistant/thinking/tool/ask/meta）；工具行 label/object 拆分与 IM 渲染器同源。
+pub fn event_json(ev: &TranscriptEvent) -> Value {
+    match ev {
+        TranscriptEvent::UserText { text, at, at_label } => serde_json::json!({
+            "type": "user", "text": text, "at": at, "atLabel": at_label,
+        }),
+        TranscriptEvent::AssistantText { text, at, at_label } => serde_json::json!({
+            "type": "assistant", "text": text, "at": at, "atLabel": at_label,
+        }),
+        TranscriptEvent::Thinking { text, at, at_label } => serde_json::json!({
+            "type": "thinking", "text": text, "at": at, "atLabel": at_label,
+        }),
+        TranscriptEvent::ToolCall {
+            args_summary,
+            result_summary,
+            is_error,
+            ask_human,
+            at,
+            at_label,
+            ..
+        } => {
+            if let Some(ah) = ask_human {
+                serde_json::json!({
+                    "type": "ask",
+                    "kind": match ah.kind {
+                        AskHumanKind::Ask => "ask",
+                        AskHumanKind::WhatsNext => "whatsNext",
+                    },
+                    "message": ah.message,
+                    "questions": ah
+                        .questions
+                        .iter()
+                        .map(|q| serde_json::json!({ "text": q.text, "answer": q.answer }))
+                        .collect::<Vec<_>>(),
+                    "at": at, "atLabel": at_label,
+                })
+            } else {
+                let (label, object) = split_tool_line(args_summary);
+                serde_json::json!({
+                    "type": "tool", "label": label, "object": object,
+                    "isError": is_error, "resultSummary": result_summary,
+                    "at": at, "atLabel": at_label,
+                })
+            }
+        }
+        TranscriptEvent::Meta(t) => serde_json::json!({ "type": "meta", "text": t }),
+    }
+}
+
 pub fn load_path(kind: AgentKind, path: &Path) -> Result<TranscriptDoc, String> {
     let (lines, truncated_head) = read_lines_bounded(path, MAX_READ_BYTES)?;
     let mut events = Vec::new();
     let mut partial = false;
-    // Open tool calls waiting for result (order pairing fallback).
-    let mut open_tools: Vec<usize> = Vec::new();
+    let mut open_tools = OpenTools::default();
 
-    for line in lines {
+    for (index, line) in lines.iter().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -196,6 +479,12 @@ pub fn load_path(kind: AgentKind, path: &Path) -> Result<TranscriptDoc, String> 
             partial = true;
             continue;
         };
+        if kind == AgentKind::Codex
+            && (codex_response_user_is_followed_by_explicit_user(&v, &lines[index + 1..])
+                || codex_response_assistant_is_preceded_by_explicit_assistant(&v, &lines[..index]))
+        {
+            continue;
+        }
         let before = events.len();
         push_full(kind, &v, &mut events, &mut open_tools);
         if events.len() == before {
@@ -315,16 +604,210 @@ fn push_full(
     kind: AgentKind,
     v: &Value,
     out: &mut Vec<TranscriptEvent>,
-    open_tools: &mut Vec<usize>,
+    open_tools: &mut OpenTools,
 ) {
     match kind {
         AgentKind::Cursor | AgentKind::Claude => push_msg(v, out, open_tools),
         AgentKind::Codex => push_codex(v, out, open_tools),
         AgentKind::Grok => push_grok(v, out, open_tools),
+        AgentKind::Pi => push_pi(v, out, open_tools),
     }
 }
 
-fn push_msg(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut Vec<usize>) {
+fn push_pi(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut OpenTools) {
+    match v.get("type").and_then(Value::as_str).unwrap_or("") {
+        "message" => {
+            let Some(message) = v.get("message") else {
+                return;
+            };
+            let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+            if role == "toolResult" {
+                close_tool(
+                    out,
+                    open_tools,
+                    message.get("toolCallId").and_then(Value::as_str),
+                    tool_result_text(message),
+                    message
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                );
+                return;
+            }
+            let content = message.get("content");
+            if role == "user" {
+                if let Some(text) = value_text(content) {
+                    let (text, label) = clean_user(text.trim());
+                    if !text.is_empty() {
+                        out.push(TranscriptEvent::UserText {
+                            text: trunc(&text, MAX_TEXT_CHARS),
+                            at: event_time(v),
+                            at_label: label,
+                        });
+                    }
+                }
+                return;
+            }
+            if role != "assistant" {
+                return;
+            }
+            let Some(parts) = content.and_then(Value::as_array) else {
+                return;
+            };
+            for part in parts {
+                match part.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "text" => {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            let text = text.trim();
+                            if !text.is_empty() && !is_noise_assistant(text) {
+                                out.push(TranscriptEvent::AssistantText {
+                                    text: trunc(text, MAX_TEXT_CHARS),
+                                    at: event_time(v),
+                                    at_label: None,
+                                });
+                            }
+                        }
+                    }
+                    "thinking" => {
+                        if let Some(text) = part.get("thinking").and_then(Value::as_str) {
+                            let text = text.trim();
+                            if !text.is_empty() {
+                                out.push(TranscriptEvent::Thinking {
+                                    text: trunc(text, 800),
+                                    at: event_time(v),
+                                    at_label: None,
+                                });
+                            }
+                        }
+                    }
+                    "toolCall" => {
+                        let name = part.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        if super::activity::is_todo_tool(name) {
+                            continue;
+                        }
+                        let display = super::activity::classify_tool(name, part.get("arguments"));
+                        out.push(TranscriptEvent::ToolCall {
+                            name: name.to_string(),
+                            args_summary: format_tool_line(&display),
+                            result_summary: None,
+                            is_error: false,
+                            ask_human: None,
+                            at: event_time(v),
+                            at_label: None,
+                        });
+                        open_tools.insert(out.len() - 1, part.get("id").and_then(Value::as_str));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "compaction" => {
+            if let Some(summary) = v.get("summary").and_then(Value::as_str) {
+                out.push(TranscriptEvent::Meta(format!(
+                    "Compaction: {}",
+                    trunc(summary.trim(), MAX_TEXT_CHARS)
+                )));
+            }
+        }
+        "branch_summary" => {
+            if let Some(summary) = v.get("summary").and_then(Value::as_str) {
+                out.push(TranscriptEvent::Meta(format!(
+                    "Branch summary: {}",
+                    trunc(summary.trim(), MAX_TEXT_CHARS)
+                )));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Codex records a real human submission twice: first as a model-facing
+/// `response_item/message(role=user)`, then immediately as the authoritative
+/// `event_msg/user_message` (legacy) or `event_msg/item_completed` `UserMessage`
+/// (paginated, Codex 0.147+). Context fragments such as loaded skills only use
+/// the first envelope. Drop the model-facing duplicate when the explicit user
+/// event follows, while retaining standalone response items as a compatibility
+/// fallback for older rollout formats.
+fn codex_response_user_is_followed_by_explicit_user(v: &Value, following: &[String]) -> bool {
+    if !is_codex_response_user_message(v) {
+        return false;
+    }
+    following
+        .iter()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .is_some_and(|next| is_codex_explicit_user_message(&next))
+}
+
+/// Paginated sessions emit `item_completed` AgentMessage *before* the
+/// `response_item` assistant copy. Drop that copy so `/transcript` does not
+/// double the same reply.
+fn codex_response_assistant_is_preceded_by_explicit_assistant(
+    v: &Value,
+    previous: &[String],
+) -> bool {
+    if !is_codex_response_assistant_message(v) {
+        return false;
+    }
+    previous
+        .iter()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .is_some_and(|prev| is_codex_explicit_assistant_message(&prev))
+}
+
+fn is_codex_response_user_message(v: &Value) -> bool {
+    v.get("type").and_then(Value::as_str) == Some("response_item")
+        && v.pointer("/payload/type").and_then(Value::as_str) == Some("message")
+        && v.pointer("/payload/role").and_then(Value::as_str) == Some("user")
+}
+
+fn is_codex_response_assistant_message(v: &Value) -> bool {
+    v.get("type").and_then(Value::as_str) == Some("response_item")
+        && v.pointer("/payload/type").and_then(Value::as_str) == Some("message")
+        && v.pointer("/payload/role").and_then(Value::as_str) == Some("assistant")
+}
+
+fn is_codex_explicit_user_message(v: &Value) -> bool {
+    if v.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return false;
+    }
+    match v.pointer("/payload/type").and_then(Value::as_str) {
+        Some("user_message") => true,
+        Some("item_completed") => {
+            v.pointer("/payload/item/type").and_then(Value::as_str) == Some("UserMessage")
+        }
+        _ => false,
+    }
+}
+
+fn is_codex_explicit_assistant_message(v: &Value) -> bool {
+    if v.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return false;
+    }
+    match v.pointer("/payload/type").and_then(Value::as_str) {
+        Some("agent_message") => true,
+        Some("item_completed") => {
+            v.pointer("/payload/item/type").and_then(Value::as_str) == Some("AgentMessage")
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn codex_turn_item_text(item: &Value) -> Option<String> {
+    value_text(item.get("content")).and_then(|text| {
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    })
+}
+
+fn is_codex_contextual_user_payload(text: &str) -> bool {
+    // ContextualUserFragment uses an XML-like wrapper. A real modern Codex submission also has an
+    // `event_msg/user_message`, so an actual user prompt beginning with markup remains visible via
+    // that authoritative event. This check only governs the response-item compatibility path.
+    text.trim_start().starts_with('<')
+}
+
+fn push_msg(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut OpenTools) {
     let role = v
         .get("role")
         .and_then(|r| r.as_str())
@@ -421,7 +904,7 @@ fn push_msg(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut Vec<usiz
                     at: event_time(v),
                     at_label: None,
                 });
-                open_tools.push(out.len() - 1);
+                open_tools.insert(out.len() - 1, None);
             }
             "tool_result" => {
                 let err = item
@@ -429,14 +912,14 @@ fn push_msg(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut Vec<usiz
                     .and_then(|x| x.as_bool())
                     .unwrap_or(false);
                 let content = tool_result_text(item);
-                close_tool(out, open_tools, content, err);
+                close_tool(out, open_tools, None, content, err);
             }
             _ => {}
         }
     }
 }
 
-fn push_codex(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut Vec<usize>) {
+fn push_codex(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut OpenTools) {
     let ttype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let Some(payload) = v.get("payload") else {
         return;
@@ -451,6 +934,9 @@ fn push_codex(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut Vec<us
                     return;
                 }
                 if role == "user" {
+                    if is_codex_contextual_user_payload(t) {
+                        return;
+                    }
                     let (t, label) = clean_user(t);
                     if !t.is_empty() {
                         out.push(TranscriptEvent::UserText {
@@ -498,16 +984,20 @@ fn push_codex(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut Vec<us
             }
             let args_val = parse_args_value(payload.get("arguments"));
             let td = super::activity::classify_tool(name, args_val.as_ref());
+            let ask_human = detect_askhuman(name, args_val.as_ref(), None);
             out.push(TranscriptEvent::ToolCall {
                 name: name.to_string(),
                 args_summary: format_tool_line(&td),
                 result_summary: None,
                 is_error: false,
-                ask_human: None,
+                ask_human,
                 at: event_time(v),
                 at_label: None,
             });
-            open_tools.push(out.len() - 1);
+            open_tools.insert(
+                out.len() - 1,
+                payload.get("call_id").and_then(Value::as_str),
+            );
         }
         ("response_item", "function_call_output") => {
             let content = payload
@@ -515,7 +1005,13 @@ fn push_codex(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut Vec<us
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
-            close_tool(out, open_tools, content, false);
+            close_tool(
+                out,
+                open_tools,
+                payload.get("call_id").and_then(Value::as_str),
+                content,
+                false,
+            );
         }
         ("event_msg", "agent_message") => {
             if let Some(t) = payload.get("message").and_then(|m| m.as_str()) {
@@ -541,11 +1037,60 @@ fn push_codex(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut Vec<us
                 }
             }
         }
+        ("event_msg", "item_completed") => {
+            push_codex_item_completed(v, payload.get("item"), out);
+        }
         _ => {}
     }
 }
 
-fn push_grok(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut Vec<usize>) {
+fn push_codex_item_completed(v: &Value, item: Option<&Value>, out: &mut Vec<TranscriptEvent>) {
+    let Some(item) = item else {
+        return;
+    };
+    match item.get("type").and_then(Value::as_str).unwrap_or("") {
+        "UserMessage" => {
+            if let Some(text) = codex_turn_item_text(item) {
+                let (text, label) = clean_user(&text);
+                if !text.is_empty() {
+                    out.push(TranscriptEvent::UserText {
+                        text: trunc(&text, MAX_TEXT_CHARS),
+                        at: event_time(v),
+                        at_label: label,
+                    });
+                }
+            }
+        }
+        "AgentMessage" => {
+            if let Some(text) = codex_turn_item_text(item) {
+                out.push(TranscriptEvent::AssistantText {
+                    text: trunc(&text, MAX_TEXT_CHARS),
+                    at: event_time(v),
+                    at_label: None,
+                });
+            }
+        }
+        "FileChange" => {
+            let td = super::activity::ToolDisplay {
+                label: super::activity::ToolLabel::Write,
+                object: super::activity::patch_changes_object(item.get("changes")),
+            };
+            let failed = super::activity::codex_file_change_failed(item);
+            out.push(TranscriptEvent::ToolCall {
+                name: "apply_patch".to_string(),
+                args_summary: format_tool_line(&td),
+                result_summary: None,
+                is_error: failed,
+                ask_human: None,
+                at: event_time(v),
+                at_label: None,
+            });
+        }
+        _ => {}
+    }
+}
+
+fn push_grok(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut OpenTools) {
     match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "user" => {
             if let Some(t) = value_text(v.get("content")) {
@@ -605,7 +1150,7 @@ fn push_grok(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut Vec<usi
                         at: event_time(v),
                         at_label: None,
                     });
-                    open_tools.push(out.len() - 1);
+                    open_tools.insert(out.len() - 1, None);
                 }
             }
         }
@@ -616,7 +1161,7 @@ fn push_grok(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut Vec<usi
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
-            close_tool(out, open_tools, content, err);
+            close_tool(out, open_tools, None, content, err);
         }
         "thinking" | "reasoning" => {
             if let Some(t) = value_text(v.get("content")).or_else(|| {
@@ -638,24 +1183,56 @@ fn push_grok(v: &Value, out: &mut Vec<TranscriptEvent>, open_tools: &mut Vec<usi
     }
 }
 
+#[derive(Default)]
+struct OpenTools {
+    /// Formats without stable call IDs are paired in their existing LIFO order.
+    stack: Vec<usize>,
+    /// Codex emits the same `call_id` on function_call and function_call_output.
+    by_call_id: HashMap<String, usize>,
+}
+
+impl OpenTools {
+    fn insert(&mut self, event_idx: usize, call_id: Option<&str>) {
+        if let Some(call_id) = call_id.filter(|id| !id.is_empty()) {
+            self.by_call_id.insert(call_id.to_string(), event_idx);
+        } else {
+            self.stack.push(event_idx);
+        }
+    }
+
+    fn take(&mut self, call_id: Option<&str>) -> Option<usize> {
+        call_id
+            .and_then(|id| self.by_call_id.remove(id))
+            .or_else(|| self.stack.pop())
+    }
+}
+
 fn close_tool(
     out: &mut [TranscriptEvent],
-    open_tools: &mut Vec<usize>,
+    open_tools: &mut OpenTools,
+    call_id: Option<&str>,
     content: String,
     is_error: bool,
 ) {
-    let _ = content;
-    if let Some(idx) = open_tools.pop() {
-        if let Some(TranscriptEvent::ToolCall { is_error: ie, .. }) = out.get_mut(idx) {
+    if let Some(idx) = open_tools.take(call_id) {
+        if let Some(TranscriptEvent::ToolCall {
+            is_error: ie,
+            ask_human,
+            ..
+        }) = out.get_mut(idx)
+        {
             // 与 watch 一致：不展示 tool result；仅标记失败。
             *ie = is_error;
+            if let Some(ask_human) = ask_human {
+                apply_askhuman_result(ask_human, &content);
+            }
         }
     }
 }
 
 /// Watch 同款：类别词 + 对象。`args_summary` 存 **纯文本** `读取: file.rs`；
 /// 渲染层负责 **粗体类别** / *斜体对象*（与 watch 卡 `**类别**: *对象*` 一致）。
-fn format_tool_line(td: &super::activity::ToolDisplay) -> String {
+pub(super) fn format_tool_line(td: &super::activity::ToolDisplay) -> String {
     use super::activity::ToolLabel;
     let label = match &td.label {
         ToolLabel::Run => "运行",
@@ -731,130 +1308,450 @@ fn summarize_args(name: &str, args: Option<&Value>) -> String {
     trunc(&s, MAX_ARG_CHARS)
 }
 
-fn detect_askhuman(
+pub(super) fn detect_askhuman(
     name: &str,
     args: Option<&Value>,
     result: Option<&str>,
 ) -> Option<AskHumanBlock> {
     let name_l = name.to_ascii_lowercase();
-    let mut question = String::new();
-    let mut is_ah = name_l == "ask" || name_l.contains("askhuman");
+    let mut message = String::new();
+    let mut questions: Vec<String> = Vec::new();
+    let mut is_ah = false;
+    let mut kind = AskHumanKind::Ask;
 
     if let Some(a) = args {
-        if let Some(cmd) = a.get("command").and_then(|v| v.as_str()) {
-            if cmd.to_ascii_lowercase().contains("askhuman") {
+        // CLI 形态（Bash/Shell 命令，string 或 argv 数组）。仅当解析出**命令位**的 AskHuman
+        // 提问调用才算——`rg 'AskHuman'`、`pkill -f AskHuman`、`AskHuman daemon status` 等
+        // 只是提到或非提问子命令，一律不算（用户实证：脚本里的字面量全被误判成问答卡）。
+        let cmd_string = a
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                a.get("command").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+            });
+        if let Some(cmd) = cmd_string {
+            if let Some((m, qs, parsed_kind)) = parse_askhuman_cli(&cmd) {
                 is_ah = true;
-                question = extract_askhuman_cli_question(cmd);
+                message = m;
+                questions = qs;
+                kind = parsed_kind;
             }
         }
-        if let Some(arr) = a.get("command").and_then(|v| v.as_array()) {
-            let joined: Vec<&str> = arr.iter().filter_map(|x| x.as_str()).collect();
-            let s = joined.join(" ");
-            if s.to_ascii_lowercase().contains("askhuman") {
-                is_ah = true;
-                question = extract_askhuman_cli_question(&s);
-            }
-        }
+        // MCP `ask` 形态：message + questions[]。
         if name_l == "ask" {
             is_ah = true;
             if let Some(m) = a.get("message").and_then(|v| v.as_str()) {
-                question = m.to_string();
+                message = m.to_string();
             }
             if let Some(qs) = a.get("questions").and_then(|v| v.as_array()) {
                 for q in qs {
-                    if let Some(qt) = q.get("question").and_then(|x| x.as_str()) {
-                        if !question.is_empty() {
-                            question.push('\n');
-                        }
-                        question.push_str(qt);
+                    if let Some(qt) = q
+                        .get("question")
+                        .and_then(|x| x.as_str())
+                        .or_else(|| q.get("message").and_then(|x| x.as_str()))
+                    {
+                        questions.push(qt.to_string());
                     }
                 }
+            }
+            if message.is_empty() && questions.is_empty() {
+                message = summarize_args(name, args);
+            }
+        } else if name_l == "whats_next" {
+            // AskHuman localizes the fixed whats_next question at runtime, so it is absent from
+            // rollout arguments. Match the CLI parser: keep the report and use one implicit Q&A.
+            is_ah = true;
+            kind = AskHumanKind::WhatsNext;
+            if let Some(m) = a.get("message").and_then(Value::as_str) {
+                message = m.to_string();
             }
         }
     }
     if !is_ah {
         return None;
     }
-    if question.is_empty() {
-        question = summarize_args(name, args);
-    }
-    let answer = result.and_then(parse_askhuman_answer);
+    let answers = result
+        .map(|r| parse_askhuman_answers(r, questions.len().max(1)))
+        .unwrap_or_default();
+    let qa: Vec<AskQA> = if questions.is_empty() {
+        // 无显式 -q / questions：单隐式问题（text 空）承载答案。
+        vec![AskQA {
+            text: String::new(),
+            answer: answers.first().cloned().flatten(),
+        }]
+    } else {
+        questions
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| AskQA {
+                text: trunc(&text, MAX_TEXT_CHARS),
+                answer: answers.get(i).cloned().flatten(),
+            })
+            .collect()
+    };
     Some(AskHumanBlock {
-        question: trunc(&question, MAX_TEXT_CHARS),
-        answer,
+        kind,
+        message: trunc(&message, MAX_TEXT_CHARS),
+        questions: qa,
     })
 }
 
-fn extract_askhuman_cli_question(cmd: &str) -> String {
-    // Best-effort: last quoted string or text after -m / message.
-    if let Some(i) = cmd.find(" -m ") {
-        return cmd[i + 4..]
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
+/// Quote-aware best-effort tokenizer for a shell-ish command line: double/single quotes and
+/// backslash escapes inside double quotes; no expansion. Never fails — returns whatever parsed.
+fn shellish_tokens(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut chars = cmd.chars().peekable();
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut has_any = false;
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            } else {
+                cur.push(c);
+            }
+            continue;
+        }
+        if in_double {
+            match c {
+                '"' => in_double = false,
+                '\\' => {
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                    }
+                }
+                _ => cur.push(c),
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_single = true;
+                has_any = true;
+            }
+            '"' => {
+                in_double = true;
+                has_any = true;
+            }
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            c if c.is_whitespace() => {
+                if has_any || !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                    has_any = false;
+                }
+            }
+            _ => cur.push(c),
+        }
     }
-    if let Some(i) = cmd.find(" --message ") {
-        return cmd[i + 11..]
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
+    if has_any || !cur.is_empty() {
+        tokens.push(cur);
     }
-    // positional after AskHuman
-    if let Some(i) = cmd.to_ascii_lowercase().find("askhuman") {
-        let rest = cmd[i..]
-            .split_whitespace()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join(" ");
-        return rest.trim_matches('"').to_string();
+    tokens
+}
+
+/// AskHuman 后第一个位置参数是这些 → 非提问子命令（daemon 管理 / 待办 / 配置等），不算 ask。
+/// 隐藏 hook 子命令（`__` 前缀）另行排除。
+const NON_ASK_SUBCOMMANDS: &[&str] = &[
+    "daemon", "agents", "dev", "todo", "channel", "config", "doctor", "mcp", "debug", "help",
+    "version",
+];
+
+/// Parse an AskHuman CLI invocation into `(message, questions, kind)`
+/// (spec gui-agent-console C14).
+/// 判定（用户实证修正 2026-07-25：字面量/子命令全被误判）：
+/// 1. AskHuman 必须处于**命令位**（整条命令或 `&&`/`;`/`|` 某段的首 token，允许 env 前缀）；
+/// 2. 首位置参数是管理子命令 / `__` 隐藏 hook → 不算；
+/// 3. 必须有**提问特征**：`-q/--question`、`-m/--message`、`--whats-next`、`--stdin`
+///    或非空位置 message；纯旗标调用（--show-last 等）不算。
+///
+/// 多段命令取第一个满足条件的段。不是 ask 调用返回 None。
+fn parse_askhuman_cli(cmd: &str) -> Option<(String, Vec<String>, AskHumanKind)> {
+    let tokens = shellish_tokens(cmd);
+    // 按 shell 操作符切段（shellish_tokens 后操作符是独立 token 或粘连 token 的边界近似）。
+    let mut segments: Vec<Vec<&str>> = vec![Vec::new()];
+    for t in &tokens {
+        if matches!(t.as_str(), "&&" | "||" | ";" | "|" | "&") {
+            segments.push(Vec::new());
+        } else {
+            segments.last_mut().unwrap().push(t.as_str());
+        }
     }
-    cmd.to_string()
+    segments.iter().find_map(|seg| parse_ask_segment(seg))
+}
+
+/// 单段解析：命令位是 AskHuman 且具备提问特征才返回 Some。
+fn parse_ask_segment(seg: &[&str]) -> Option<(String, Vec<String>, AskHumanKind)> {
+    // 跳过 env 前缀（VAR=val）与常见包装器。
+    let mut idx = 0;
+    while idx < seg.len()
+        && (seg[idx].contains('=') && !seg[idx].starts_with('-')
+            || matches!(seg[idx], "env" | "nohup" | "command"))
+    {
+        idx += 1;
+    }
+    let head = seg.get(idx)?;
+    let base = head.rsplit('/').next().unwrap_or(head).to_ascii_lowercase();
+    if base != "askhuman" && base != "humaninloop" {
+        return None;
+    }
+    let rest = &seg[idx + 1..];
+    // 首位置参数是管理子命令 / 隐藏 hook → 不是 ask。
+    if let Some(first) = rest.first() {
+        let f = first.to_ascii_lowercase();
+        if f.starts_with("__") || NON_ASK_SUBCOMMANDS.contains(&f.as_str()) {
+            return None;
+        }
+    }
+    let mut message = String::new();
+    let mut questions: Vec<String> = Vec::new();
+    let mut has_signal = false;
+    let mut kind = AskHumanKind::Ask;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = rest[i];
+        match tok {
+            "-q" | "--question" => {
+                has_signal = true;
+                if let Some(v) = rest.get(i + 1) {
+                    questions.push(v.to_string());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "-m" | "--message" => {
+                has_signal = true;
+                if let Some(v) = rest.get(i + 1) {
+                    message = v.to_string();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--whats-next" => {
+                has_signal = true;
+                kind = AskHumanKind::WhatsNext;
+                i += 1;
+            }
+            "--stdin" => {
+                has_signal = true;
+                i += 1;
+            }
+            "-o" | "--option" | "-o!" | "--option!" | "-f" | "--file" => {
+                i += 2; // 跳过取值
+            }
+            _ => {
+                if !tok.starts_with('-')
+                    && !tok.contains("<<")
+                    && !tok
+                        .chars()
+                        .any(|c| matches!(c, '<' | '>' | '|' | '&' | ';'))
+                {
+                    positional.push(tok.to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+    if message.is_empty() {
+        message = positional.into_iter().next().unwrap_or_default();
+    }
+    if !message.is_empty() {
+        has_signal = true;
+    }
+    if !has_signal {
+        return None; // 纯旗标调用（--show-last / --settings 等）。
+    }
+    Some((message, questions, kind))
+}
+
+/// Split a multi-question output（`# Qn` 分组 + `---` 分隔）into per-question answers；
+/// 单问题输出整体回填到第一题。`n` 为期望题数（越界分组忽略）。
+fn parse_askhuman_answers(content: &str, n: usize) -> Vec<Option<String>> {
+    let mut out: Vec<Option<String>> = vec![None; n];
+    let content = codex_output_payload(content);
+
+    // Codex wraps MCP CallToolResult content blocks in a JSON array. Unwrap the text blocks before
+    // parsing the CLI-compatible marker format returned by current AskHuman versions.
+    if let Ok(v) = serde_json::from_str::<Value>(content) {
+        if let Some(text) = mcp_text_content(&v) {
+            return parse_askhuman_answers(&text, n);
+        }
+        // Older AskHuman/Codex combinations exposed the structured CLI JSON form directly.
+        if let Some(answers) = v.get("answers").and_then(Value::as_array) {
+            for answer in answers {
+                let idx = answer
+                    .get("question_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                if idx < out.len() {
+                    out[idx] = json_answer_text(answer);
+                }
+            }
+            return out;
+        }
+        if n > 0 {
+            if let Some(answer) = json_answer_text(&v) {
+                out[0] = Some(answer);
+                return out;
+            }
+        }
+    }
+
+    let has_groups = content
+        .lines()
+        .any(|l| l.trim().starts_with("# Q") && l.trim()[3..].trim().parse::<usize>().is_ok());
+    if !has_groups {
+        if n > 0 {
+            out[0] = parse_askhuman_answer(content);
+        }
+        return out;
+    }
+    let mut current: Option<usize> = None;
+    let mut buf = String::new();
+    let flush = |q: Option<usize>, buf: &mut String, out: &mut Vec<Option<String>>| {
+        if let Some(qn) = q {
+            if qn >= 1 && qn <= out.len() {
+                out[qn - 1] = parse_askhuman_answer(buf);
+            }
+        }
+        buf.clear();
+    };
+    for line in content.lines() {
+        let lt = line.trim();
+        if let Some(rest) = lt.strip_prefix("# Q") {
+            if let Ok(qn) = rest.trim().parse::<usize>() {
+                flush(current.take(), &mut buf, &mut out);
+                current = Some(qn);
+                continue;
+            }
+        }
+        if lt == "---" {
+            continue;
+        }
+        if current.is_some() {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    flush(current, &mut buf, &mut out);
+    out
 }
 
 fn parse_askhuman_answer(content: &str) -> Option<String> {
-    // JSON result
+    let content = codex_output_payload(content);
     if let Ok(v) = serde_json::from_str::<Value>(content) {
-        let mut parts = Vec::new();
-        if let Some(s) = v.get("user_input").and_then(|x| x.as_str()) {
-            if !s.is_empty() {
-                parts.push(s.to_string());
-            }
+        if let Some(text) = mcp_text_content(&v) {
+            return parse_askhuman_answer(&text);
         }
-        if let Some(arr) = v.get("selected_options").and_then(|x| x.as_array()) {
-            for o in arr {
-                if let Some(s) = o.as_str() {
-                    parts.push(s.to_string());
-                }
-            }
-        }
-        if !parts.is_empty() {
-            return Some(trunc(&parts.join("\n"), MAX_TOOL_RESULT_CHARS));
+        return json_answer_text(&v);
+    }
+
+    // Current output contract: the same plain marker blocks as the CLI. Read complete blocks
+    // instead of stopping at any `[` character, which may legitimately occur in an answer.
+    #[derive(Clone, Copy)]
+    enum AnswerSection {
+        Selected,
+        Input,
+        Ignored,
+    }
+    let mut section: Option<AnswerSection> = None;
+    let mut selected = Vec::new();
+    let mut input = Vec::new();
+    for line in content.lines() {
+        match line.trim() {
+            "[selected_options]" => section = Some(AnswerSection::Selected),
+            "[user_input]" => section = Some(AnswerSection::Input),
+            "[files]" | "[status]" => section = Some(AnswerSection::Ignored),
+            _ => match section {
+                Some(AnswerSection::Selected) => selected.push(line),
+                Some(AnswerSection::Input) => input.push(line),
+                Some(AnswerSection::Ignored) | None => {}
+            },
         }
     }
-    // Text markers
-    if let Some(i) = content.find("[user_input]") {
-        let rest = &content[i + "[user_input]".len()..];
-        let end = rest.find('[').unwrap_or(rest.len());
-        let s = rest[..end].trim();
-        if !s.is_empty() {
-            return Some(trunc(s, MAX_TOOL_RESULT_CHARS));
+
+    let mut parts = Vec::new();
+    let selected = selected.join("\n").trim().to_string();
+    if !selected.is_empty() {
+        parts.push(selected);
+    }
+    let input = input.join("\n").trim().to_string();
+    if !input.is_empty() {
+        parts.push(input);
+    }
+    (!parts.is_empty()).then(|| trunc(&parts.join("\n"), MAX_TOOL_RESULT_CHARS))
+}
+
+/// Codex prefixes tool results with timing metadata and an `Output:` section.
+fn codex_output_payload(content: &str) -> &str {
+    let content = content.trim();
+    content
+        .split_once("\nOutput:\n")
+        .map(|(_, output)| output.trim())
+        .unwrap_or(content)
+}
+
+/// Extract text from MCP content blocks (`[{"type":"text","text":"…"}]`). Also accepts the
+/// object-wrapped `{"content":[…]}` shape for low-cost compatibility with older clients.
+fn mcp_text_content(v: &Value) -> Option<String> {
+    let blocks = v
+        .as_array()
+        .or_else(|| v.get("content").and_then(Value::as_array))?;
+    let text = blocks
+        .iter()
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn json_answer_text(answer: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(options) = answer.get("selected_options").and_then(Value::as_array) {
+        let options = options
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|option| !option.trim().is_empty())
+            .collect::<Vec<_>>();
+        if !options.is_empty() {
+            parts.push(options.join(", "));
         }
     }
-    if let Some(i) = content.find("[selected_options]") {
-        let rest = &content[i + "[selected_options]".len()..];
-        let end = rest.find('[').unwrap_or(rest.len());
-        let s = rest[..end].trim();
-        if !s.is_empty() {
-            return Some(trunc(s, MAX_TOOL_RESULT_CHARS));
+    if let Some(input) = answer.get("user_input").and_then(Value::as_str) {
+        if !input.trim().is_empty() {
+            parts.push(input.trim().to_string());
         }
     }
-    None
+    (!parts.is_empty()).then(|| trunc(&parts.join("\n"), MAX_TOOL_RESULT_CHARS))
+}
+
+fn apply_askhuman_result(ask_human: &mut AskHumanBlock, content: &str) {
+    let answers = parse_askhuman_answers(content, ask_human.questions.len().max(1));
+    for (question, answer) in ask_human.questions.iter_mut().zip(answers) {
+        if answer.is_some() {
+            question.answer = answer;
+        }
+    }
 }
 
 /// Clean user text; also return Cursor `<timestamp>` label if present.
-fn clean_user(text: &str) -> (String, Option<String>) {
+/// `pub(super)`：title.rs 的「首条用户消息」回退共用同一清洗（Cursor 把用户输入包在
+/// `<timestamp>`/`<user_query>` 里，直接按「`<` 开头＝注入块」过滤会漏掉全部真实输入）。
+pub(super) fn clean_user(text: &str) -> (String, Option<String>) {
     let t = text.trim();
     if t.is_empty() {
         return (String::new(), None);
@@ -1016,6 +1913,141 @@ fn trunc(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn write_jsonl(lines: &[Value]) -> tempfile::NamedTempFile {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        file
+    }
+
+    fn codex_response_user(timestamp: &str, text: &str) -> Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}]
+            }
+        })
+    }
+
+    fn codex_explicit_user(timestamp: &str, text: &str) -> Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": text}
+        })
+    }
+
+    #[test]
+    fn codex_loader_deduplicates_real_users_and_filters_context_fragments() {
+        let file = write_jsonl(&[
+            // Standalone response items remain as a fallback for older rollout formats.
+            codex_response_user("2026-08-05T15:00:00Z", "legacy prompt"),
+            serde_json::json!({
+                "timestamp": "2026-08-05T15:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "legacy answer"}]
+                }
+            }),
+            // Modern real submissions have two different model/event texts when attachments exist.
+            codex_response_user(
+                "2026-08-05T15:01:00.100Z",
+                "<section>real markup prompt</section>\n<image>attachment</image>",
+            ),
+            codex_explicit_user(
+                "2026-08-05T15:01:00.101Z",
+                "<section>real markup prompt</section>",
+            ),
+            // Model-facing context uses role=user but has no explicit user event.
+            codex_response_user(
+                "2026-08-05T15:01:00.102Z",
+                "<skill>\n<name>demo</name>\nloaded skill body\n</skill>",
+            ),
+            codex_response_user(
+                "2026-08-05T15:01:02Z",
+                "<hook_prompt hook_run_id=\"stop:1\">continue</hook_prompt>",
+            ),
+        ]);
+
+        let doc = load_path(AgentKind::Codex, file.path()).unwrap();
+        let users = doc
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                TranscriptEvent::UserText { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            users,
+            vec!["legacy prompt", "<section>real markup prompt</section>"]
+        );
+
+        let last = last_timestamped_user_prompt_from_path(AgentKind::Codex, file.path()).unwrap();
+        assert_eq!(last.text, "<section>real markup prompt</section>");
+        assert_eq!(
+            last.at_ms,
+            (parse_iso8601_secs("2026-08-05T15:01:00.101Z").unwrap() as i64) * 1000
+        );
+    }
+
+    #[test]
+    fn pi_v3_loader_keeps_messages_tools_and_session_metadata() {
+        let file = write_jsonl(&[
+            serde_json::json!({"type":"session","version":3,"id":"pi-transcript","cwd":"/tmp"}),
+            serde_json::json!({"type":"message","timestamp":"2026-08-18T12:00:00Z","message":{"role":"user","content":[{"type":"text","text":"hello pi"}]}}),
+            serde_json::json!({"type":"message","timestamp":"2026-08-18T12:00:01Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning"},{"type":"text","text":"working"},{"type":"toolCall","id":"tool-1","name":"bash","arguments":{"command":"pwd"}}]}}),
+            serde_json::json!({"type":"message","timestamp":"2026-08-18T12:00:02Z","message":{"role":"toolResult","toolCallId":"tool-1","content":[{"type":"text","text":"/tmp"}],"isError":false}}),
+            serde_json::json!({"type":"compaction","summary":"older context"}),
+            serde_json::json!({"type":"branch_summary","summary":"branch context"}),
+        ]);
+        let doc = load_path(AgentKind::Pi, file.path()).unwrap();
+        assert!(doc.events.iter().any(
+            |event| matches!(event, TranscriptEvent::UserText { text, .. } if text == "hello pi")
+        ));
+        assert!(doc.events.iter().any(
+            |event| matches!(event, TranscriptEvent::AssistantText { text, .. } if text == "working")
+        ));
+        assert!(doc.events.iter().any(
+            |event| matches!(event, TranscriptEvent::ToolCall { name, is_error: false, .. } if name == "bash")
+        ));
+        assert!(doc.events.iter().any(
+            |event| matches!(event, TranscriptEvent::Meta(text) if text.contains("older context"))
+        ));
+    }
+
+    #[test]
+    fn codex_context_only_response_items_are_not_user_prompts() {
+        let file = write_jsonl(&[
+            codex_response_user(
+                "2026-08-05T15:00:00Z",
+                "<recommended_plugins>plugins</recommended_plugins>",
+            ),
+            codex_response_user(
+                "2026-08-05T15:00:01Z",
+                "<turn_aborted>interrupted</turn_aborted>",
+            ),
+        ]);
+
+        let doc = load_path(AgentKind::Codex, file.path()).unwrap();
+        assert!(doc
+            .events
+            .iter()
+            .all(|event| !matches!(event, TranscriptEvent::UserText { .. })));
+        assert_eq!(
+            last_timestamped_user_prompt_from_path(AgentKind::Codex, file.path()),
+            None
+        );
+    }
+
     #[test]
     fn parse_claude_style_assistant_and_tool() {
         let lines = vec![
@@ -1024,7 +2056,7 @@ mod tests {
             r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"a\nb"}]}}"#.to_string(),
         ];
         let mut events = Vec::new();
-        let mut open = Vec::new();
+        let mut open = OpenTools::default();
         for l in lines {
             let v: Value = serde_json::from_str(&l).unwrap();
             push_full(AgentKind::Claude, &v, &mut events, &mut open);
@@ -1051,13 +2083,260 @@ mod tests {
     fn detect_askhuman_cli() {
         let args = serde_json::json!({"command": "AskHuman -m \"pick one\""});
         let ah = detect_askhuman("Bash", Some(&args), None).unwrap();
-        assert!(ah.question.contains("pick one"));
+        assert!(ah.message.contains("pick one"));
+        assert_eq!(ah.questions.len(), 1);
+        assert!(ah.questions[0].text.is_empty());
+    }
+
+    /// CLI 多问题（spec gui-agent-console C14）：message 为位置参数，-q 逐条入列，
+    /// -o/-o! 取值被跳过；答案按 `# Qn` 分组回填对应题。
+    #[test]
+    fn detect_askhuman_cli_multi_question() {
+        let args = serde_json::json!({
+            "command": "AskHuman \"整体背景说明\" -q \"先修 port 吗？\" -o! \"修\" -o \"不修\" -q \"要加配置项吗？\""
+        });
+        let result =
+            "# Q1\n[selected_options]\n修\n\n---\n\n# Q2\n[user_input]\n不用，保持固定。\n";
+        let ah = detect_askhuman("Bash", Some(&args), Some(result)).unwrap();
+        assert_eq!(ah.message, "整体背景说明");
+        assert_eq!(ah.questions.len(), 2);
+        assert_eq!(ah.questions[0].text, "先修 port 吗？");
+        assert_eq!(ah.questions[0].answer.as_deref(), Some("修"));
+        assert_eq!(ah.questions[1].text, "要加配置项吗？");
+        assert_eq!(ah.questions[1].answer.as_deref(), Some("不用，保持固定。"));
+    }
+
+    /// MCP `ask` 多问题：message + questions[]；单段答案回填第一题。
+    #[test]
+    fn detect_askhuman_mcp_questions() {
+        let args = serde_json::json!({
+            "message": "背景",
+            "questions": [{ "question": "Q甲？" }, { "question": "Q乙？" }]
+        });
+        let ah = detect_askhuman("ask", Some(&args), Some("[user_input]\n答甲\n")).unwrap();
+        assert_eq!(ah.kind, AskHumanKind::Ask);
+        assert_eq!(ah.message, "背景");
+        assert_eq!(ah.questions.len(), 2);
+        assert_eq!(ah.questions[0].answer.as_deref(), Some("答甲"));
+        assert_eq!(ah.questions[1].answer, None);
+    }
+
+    /// Codex完整链路：MCP `ask` 调用先生成问答卡，当前纯文本 CLI 区块从 Codex content-block
+    /// wrapper 解出；结果按 call_id 回填，即使另一个工具调用夹在中间也不会串卡。
+    #[test]
+    fn codex_mcp_ask_round_trip_uses_call_id_and_text_blocks() {
+        let ask_args = serde_json::json!({
+            "message": "背景",
+            "questions": [{ "question": "继续吗？" }]
+        })
+        .to_string();
+        let output_blocks = serde_json::json!([{
+            "type": "text",
+            "text": "[selected_options]\n继续\n\n[user_input]\n并补一条测试"
+        }])
+        .to_string();
+        let lines = vec![
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "ask",
+                    "call_id": "call_ask",
+                    "arguments": ask_args
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec",
+                    "call_id": "call_exec",
+                    "arguments": "{\"command\":\"pwd\"}"
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_ask",
+                    "output": format!("Wall time: 1.2 seconds\nOutput:\n{output_blocks}")
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_exec",
+                    "output": "done"
+                }
+            }),
+        ];
+        let mut events = Vec::new();
+        let mut open = OpenTools::default();
+        for line in lines {
+            push_full(AgentKind::Codex, &line, &mut events, &mut open);
+        }
+
+        assert_eq!(events.len(), 2);
+        let ask = event_json(&events[0]);
+        assert_eq!(ask["type"], "ask");
+        assert_eq!(ask["kind"], "ask");
+        assert_eq!(ask["message"], "背景");
+        assert_eq!(ask["questions"][0]["text"], "继续吗？");
+        assert_eq!(ask["questions"][0]["answer"], "继续\n并补一条测试");
+        assert_eq!(event_json(&events[1])["type"], "tool");
+    }
+
+    /// MCP whats_next uses the same content-block and marker output path as ask. It becomes an
+    /// AskHuman card with an implicit fixed question; non-interactive AskHuman tools stay tools.
+    #[test]
+    fn codex_mcp_whats_next_is_ask_card_but_read_and_write_tools_are_not() {
+        let args = serde_json::json!({
+            "message": "All tests passed.",
+            "options": [{ "text": "Ship it", "recommended": true }]
+        })
+        .to_string();
+        let output_blocks = serde_json::json!([{
+            "type": "text",
+            "text": "[selected_options]\nEnd this turn"
+        }])
+        .to_string();
+        let lines = vec![
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "whats_next",
+                    "call_id": "call_next",
+                    "arguments": args
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_next",
+                    "output": format!("Wall time: 2 seconds\nOutput:\n{output_blocks}")
+                }
+            }),
+        ];
+        let mut events = Vec::new();
+        let mut open = OpenTools::default();
+        for line in lines {
+            push_full(AgentKind::Codex, &line, &mut events, &mut open);
+        }
+
+        let ask = event_json(&events[0]);
+        assert_eq!(ask["type"], "ask");
+        assert_eq!(ask["kind"], "whatsNext");
+        assert_eq!(ask["message"], "All tests passed.");
+        assert_eq!(ask["questions"][0]["text"], "");
+        assert_eq!(ask["questions"][0]["answer"], "End this turn");
+        assert!(detect_askhuman("show_last", Some(&serde_json::json!({})), None).is_none());
+        assert!(detect_askhuman(
+            "todo_add",
+            Some(&serde_json::json!({"text": "later"})),
+            None
+        )
+        .is_none());
+    }
+
+    /// 旧版结构化 JSON 很容易顺手兼容：按 question_index 回填，不影响当前纯文本主路径。
+    #[test]
+    fn parse_legacy_structured_mcp_answers() {
+        let content = concat!(
+            "Wall time: 1 seconds\nOutput:\n",
+            r#"{"answers":[{"question_index":1,"user_input":"第二题"},"#,
+            r#"{"question_index":0,"selected_options":["第一题选项"],"user_input":"补充"}]}"#
+        );
+        let answers = parse_askhuman_answers(content, 2);
+        assert_eq!(answers[0].as_deref(), Some("第一题选项\n补充"));
+        assert_eq!(answers[1].as_deref(), Some("第二题"));
     }
 
     #[test]
     fn parse_answer_markers() {
         let c = "[status] answered\n[user_input]\nyes please\n[files]\n";
         assert_eq!(parse_askhuman_answer(c).as_deref(), Some("yes please"));
+    }
+
+    /// heredoc / 操作符不当作 message；--stdin 场景 message 允许为空。
+    #[test]
+    fn cli_parser_ignores_shell_operators() {
+        let (m, qs, kind) =
+            parse_askhuman_cli("AskHuman -q \"继续吗？\" --stdin <<'EOF'").expect("is an ask");
+        assert_eq!(m, "");
+        assert_eq!(qs, vec!["继续吗？"]);
+        assert_eq!(kind, AskHumanKind::Ask);
+    }
+
+    /// 判定收紧（用户实证 2026-07-25）：字面量提及 / 管理子命令 / 纯旗标不算 ask；
+    /// 链式命令取第一个真正的提问段。
+    #[test]
+    fn cli_parser_rejects_mentions_and_subcommands() {
+        // 字面量提及（非命令位）。
+        assert!(parse_askhuman_cli("rg -n 'AskHuman' src-tauri/src | head -5").is_none());
+        assert!(parse_askhuman_cli("pkill -f '\\.local/bin/AskHuman --gui-host'").is_none());
+        assert!(parse_askhuman_cli("ls -la ~/.local/bin/AskHuman").is_none());
+        // 管理子命令 / 隐藏 hook / 纯旗标。
+        assert!(parse_askhuman_cli("AskHuman daemon status").is_none());
+        assert!(parse_askhuman_cli("AskHuman agents monitor --json").is_none());
+        assert!(parse_askhuman_cli("AskHuman todo add \"买菜\"").is_none());
+        assert!(parse_askhuman_cli("AskHuman __agent-hook cursor activity").is_none());
+        assert!(parse_askhuman_cli("AskHuman --show-last").is_none());
+        // 链式：管理段被跳过，提问段命中。
+        let (m, qs, kind) = parse_askhuman_cli(
+            "AskHuman agents monitor && AskHuman \"报告\" -q \"下一步？\" -o \"A\"",
+        )
+        .expect("second segment is an ask");
+        assert_eq!(m, "报告");
+        assert_eq!(qs, vec!["下一步？"]);
+        assert_eq!(kind, AskHumanKind::Ask);
+        // whats-next 是提问。
+        let (message, questions, kind) =
+            parse_askhuman_cli("AskHuman --whats-next \"总结\" -o \"好\"").unwrap();
+        assert_eq!(message, "总结");
+        assert!(questions.is_empty());
+        assert_eq!(kind, AskHumanKind::WhatsNext);
+        // 带路径的命令位。
+        assert!(parse_askhuman_cli("/usr/local/bin/AskHuman -m \"选一个\"").is_some());
+    }
+
+    /// 事件 JSON：ask 块打 `type:"ask"`，普通工具行打 `type:"tool"` 且 label/object 拆分。
+    #[test]
+    fn event_json_tags_ask_and_tool() {
+        let ask = TranscriptEvent::ToolCall {
+            name: "Bash".into(),
+            args_summary: "运行: AskHuman".into(),
+            result_summary: None,
+            is_error: false,
+            ask_human: Some(AskHumanBlock {
+                kind: AskHumanKind::Ask,
+                message: "m".into(),
+                questions: vec![AskQA {
+                    text: "q?".into(),
+                    answer: Some("a".into()),
+                }],
+            }),
+            at: Some(1),
+            at_label: None,
+        };
+        let v = event_json(&ask);
+        assert_eq!(v["type"], "ask");
+        assert_eq!(v["questions"][0]["answer"], "a");
+        let tool = TranscriptEvent::ToolCall {
+            name: "Bash".into(),
+            args_summary: "运行: cargo test".into(),
+            result_summary: None,
+            is_error: false,
+            ask_human: None,
+            at: None,
+            at_label: None,
+        };
+        let v2 = event_json(&tool);
+        assert_eq!(v2["type"], "tool");
+        assert_eq!(v2["label"], "运行");
+        assert_eq!(v2["object"], "cargo test");
     }
 
     #[test]
@@ -1218,5 +2497,152 @@ mod tests {
                 eprintln!("  {l}");
             }
         }
+    }
+
+    #[test]
+    fn paginated_codex_item_completed_is_authoritative_and_deduped() {
+        let file = write_jsonl(&[
+            serde_json::json!({
+                "timestamp": "2026-08-20T10:47:18.000Z",
+                "ordinal": 8,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "ASKHUMAN_PAGINATED_PROBE_20260820"}]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-20T10:47:18.058Z",
+                "ordinal": 9,
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "id": "um-1",
+                        "content": [{"type": "text", "text": "ASKHUMAN_PAGINATED_PROBE_20260820", "text_elements": []}]
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-20T10:47:26.127Z",
+                "ordinal": 12,
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "AgentMessage",
+                        "id": "am-1",
+                        "content": [{"type": "Text", "text": "ASKHUMAN_PAGINATED_PROBE_20260820"}],
+                        "phase": "final_answer"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-20T10:47:26.128Z",
+                "ordinal": 13,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ASKHUMAN_PAGINATED_PROBE_20260820"}]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-20T10:51:51.477Z",
+                "ordinal": 15,
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "FileChange",
+                        "id": "exec-1",
+                        "changes": {"/tmp/probe.txt": {"type": "add", "content": "PING\n"}},
+                        "status": "completed"
+                    }
+                }
+            }),
+        ]);
+        let doc = load_path(AgentKind::Codex, file.path()).unwrap();
+        let users: Vec<&str> = doc
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                TranscriptEvent::UserText { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let assistants: Vec<&str> = doc
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                TranscriptEvent::AssistantText { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let writes: Vec<&str> = doc
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                TranscriptEvent::ToolCall {
+                    name, args_summary, ..
+                } if name == "apply_patch" => Some(args_summary.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec!["ASKHUMAN_PAGINATED_PROBE_20260820"]);
+        assert_eq!(assistants, vec!["ASKHUMAN_PAGINATED_PROBE_20260820"]);
+        assert_eq!(writes, vec!["写入: probe.txt"]);
+    }
+
+    #[test]
+    fn paginated_codex_148_real_session_transcript_when_present() {
+        let sid = "01a01ec8-3867-7730-8acf-8911ef19b587";
+        let Some(path) = crate::agents::title::transcript_path(AgentKind::Codex, sid) else {
+            eprintln!("skip: paginated probe session not on disk");
+            return;
+        };
+        let doc = load_path(AgentKind::Codex, &path).expect("load paginated rollout");
+        let users: Vec<&str> = doc
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                TranscriptEvent::UserText { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let assistants: Vec<&str> = doc
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                TranscriptEvent::AssistantText { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        eprintln!(
+            "paginated transcript events={} users={users:?} assistants={assistants:?}",
+            doc.events.len()
+        );
+        assert!(
+            users
+                .iter()
+                .any(|text| text.contains("ASKHUMAN_PAGINATED_PROBE_20260820")),
+            "expected user prompt via response_item fallback, got {users:?}"
+        );
+        assert!(
+            assistants
+                .iter()
+                .any(|text| text.contains("ASKHUMAN_PAGINATED_PROBE_20260820")),
+            "expected assistant reply via response_item, got {assistants:?}"
+        );
+        let prompt = last_timestamped_user_prompt(AgentKind::Codex, sid);
+        eprintln!("last_timestamped_user_prompt={prompt:?}");
+        assert!(
+            prompt
+                .as_ref()
+                .is_some_and(|p| p.text.contains("ASKHUMAN_PAGINATED_PROBE_20260820")),
+            "show_last User Prompt should still resolve via response_item, got {prompt:?}"
+        );
     }
 }

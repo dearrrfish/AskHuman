@@ -1,6 +1,6 @@
 [package]
 name = "humaninloop"
-version = "0.10.0"
+version = "0.13.2"
 description = "HumanInLoop - Human-in-the-loop interaction tool (Rust + Tauri)"
 authors = ["Naituw"]
 license = "MIT"
@@ -43,15 +43,21 @@ uuid = { version = "1", features = ["v4"] }
 # 会话型渠道公共接口（Telegram/钉钉等共享多问题驱动逻辑）需要 async trait。
 async-trait = "0.1"
 dirs = "6"
+# Shared local-time conversion. Chrono's `Local` backend uses each platform's maintained
+# timezone APIs, including Windows DST rules.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+fs2 = "0.4"
 base64 = "0.22"
 anyhow = "1"
 thiserror = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process", "signal"] }
 # Daemon 监听 ~/.askhuman/config.json 变更以实时重载配置（A12）。
 notify = "8"
 # 从窗口向系统发起原生文件拖拽（-f 附件胶囊可拖到其它应用打开）。
 tauri-plugin-drag = "2"
+# Todo 编辑器使用系统文件选择器选择附件。
+tauri-plugin-dialog = "2"
 # macOS 26+ Liquid Glass 整窗背景（NSGlassEffectView）；旧系统自动回退到 NSVisualEffectView；
 # 非 macOS 为安全空操作。
 tauri-plugin-liquid-glass = "0.1"
@@ -82,9 +88,11 @@ tree-sitter = "=0.25.10"
 tree-sitter-bash = "=0.25.1"
 # rmcp 每请求 CancellationToken：MCP client 取消 tools/call 时 ask 据此杀 CLI 子进程。
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 # Unix 下用于在进入 GUI 事件循环前静默系统噪音日志（重定向 stderr）。
 [target.'cfg(unix)'.dependencies]
@@ -93,6 +101,21 @@ libc = "0.2"
 # Store channel secrets in the Windows Credential Manager.
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Cryptography",
+  "Win32_Security_WinTrust",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Console",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 # Store channel secrets in the Linux Secret Service (D-Bus; needs gnome-keyring/kwallet).
 # Falls back to plaintext config when unavailable (headless servers).
@@ -119,3 +142,21 @@ codegen-units = 16
 incremental = true
 strip = true
 panic = "abort"
+
+# Fast local installation profile. Published artifacts and CI release builds continue to use
+# `profile.release`; this profile trades runtime optimization for much faster edit-build-install
+# cycles while retaining release semantics such as stripped symbols and panic=abort.
+[profile.local-install]
+inherits = "release"
+opt-level = 0
+codegen-units = 64
+incremental = true
+
+# Default tests and debug builds keep line tables/backtraces without the much larger full local
+# variable/type information. Use `--profile full-debug` when source-level debugger detail matters.
+[profile.dev]
+debug = 1
+
+[profile.full-debug]
+inherits = "dev"
+debug = 2

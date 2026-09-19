@@ -41,6 +41,14 @@ pub enum RuleKey {
     ShellExact { argv: Vec<String> },
     /// Shell command prefix (D38, model-provided prefix_rule only).
     ShellPrefix { prefix: Vec<String> },
+    /// Relaxed mode for this session (D52): auto-allow splittable shell commands that
+    /// hit no dangerous list; only checked via [`check_relaxed_auto_allow`], never via
+    /// [`query_hits`].
+    ShellRelaxed,
+    /// YOLO mode for this session (D53): auto-allow every Codex permission request,
+    /// dangerous ones included. Only checked via [`check_yolo_auto_allow`], never via
+    /// [`query_hits`]; turned off via [`disable_yolo`] (panel button / IM `/yolo`).
+    Yolo,
 }
 
 impl RuleKey {
@@ -58,6 +66,8 @@ impl RuleKey {
             } => format!("{protocol}://{host}:{port}"),
             Self::ShellExact { argv } => argv.join(" "),
             Self::ShellPrefix { prefix } => format!("{} …", prefix.join(" ")),
+            Self::ShellRelaxed => String::new(),
+            Self::Yolo => String::new(),
         }
     }
 
@@ -66,8 +76,8 @@ impl RuleKey {
         const MAX_TEXT: usize = 8_192;
         let text_ok = |value: &str| !value.is_empty() && value.len() <= MAX_TEXT;
         match self {
-            Self::FileExact { path } => text_ok(path) && path.starts_with('/'),
-            Self::FileProject { root } => text_ok(root) && root.starts_with('/'),
+            Self::FileExact { path } => text_ok(path) && path_is_absolute_text(path),
+            Self::FileProject { root } => text_ok(root) && path_is_absolute_text(root),
             Self::FileDisk => true,
             Self::McpTool { tool } => text_ok(tool) && tool.starts_with("mcp__"),
             Self::NetworkHost { host, protocol, .. } => {
@@ -83,6 +93,8 @@ impl RuleKey {
             Self::ShellPrefix { prefix } => {
                 !prefix.is_empty() && prefix.iter().all(|token| text_ok(token))
             }
+            Self::ShellRelaxed => true,
+            Self::Yolo => true,
         }
     }
 }
@@ -102,7 +114,14 @@ pub enum MemoryQuery {
         port: u16,
     },
     /// Every split segment of a shell script must be covered (D38).
-    ShellCommands { commands: Vec<Vec<String>> },
+    ShellCommands {
+        commands: Vec<Vec<String>>,
+        /// Hook-side verdict for relaxed mode (D52): splittable, no segment on the
+        /// extended dangerous list, no native prompt/forbidden hit. Only such requests
+        /// may be auto-allowed by relaxed mode; rule-based matching ignores this flag.
+        #[serde(default)]
+        relaxed_eligible: bool,
+    },
 }
 
 /// Rule namespace a save targets.
@@ -158,6 +177,9 @@ pub struct SessionRuleSummary {
     pub shell_count: usize,
     pub network_count: usize,
     pub mcp_count: usize,
+    /// YOLO mode active for this session (D53).
+    #[serde(default)]
+    pub yolo: bool,
     pub last_used_at_ms: u64,
 }
 
@@ -223,38 +245,24 @@ fn total_rules(data: &RuleFile) -> usize {
 
 // ===== Cross-process write lock (same pattern as todos.rs) =====
 
-#[cfg(unix)]
-struct LockGuard {
-    _file: std::fs::File,
-}
-
-#[cfg(unix)]
-fn lock_at(path: &Path) -> Option<LockGuard> {
-    use std::os::unix::io::AsRawFd;
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
-        .ok()?;
-    unsafe {
-        libc::flock(file.as_raw_fd(), libc::LOCK_EX);
-    }
-    Some(LockGuard { _file: file })
-}
-
-#[cfg(not(unix))]
-fn lock_at(_path: &Path) -> Option<()> {
-    None
+fn lock_at(path: &Path) -> Option<crate::file_lock::FileLock> {
+    crate::file_lock::FileLock::exclusive(path).ok()
 }
 
 // ===== Matching =====
 
+pub(crate) fn path_is_absolute_text(value: &str) -> bool {
+    value.starts_with('/') || Path::new(value).is_absolute()
+}
+
+fn comparable_path(value: &str) -> String {
+    crate::path_identity::key(value)
+}
+
 /// Lexical prefix check on normalized absolute paths (component boundary aware).
-fn path_within(path: &str, root: &str) -> bool {
+pub(crate) fn path_within_text(path: &str, root: &str) -> bool {
+    let path = comparable_path(path);
+    let root = comparable_path(root);
     if path == root {
         return true;
     }
@@ -265,6 +273,10 @@ fn path_within(path: &str, root: &str) -> bool {
     }
     path.strip_prefix(root_trimmed)
         .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn path_within(path: &str, root: &str) -> bool {
+    path_within_text(path, root)
 }
 
 /// D46: on an aggregated-scope hit, refuse auto-allow when any existing component of the
@@ -344,7 +356,7 @@ fn query_hits(
                 } if rule_host == host && rule_protocol == protocol && rule_port == port)
             })
             .map(|index| (vec![index], Vec::new())),
-        MemoryQuery::ShellCommands { commands } => {
+        MemoryQuery::ShellCommands { commands, .. } => {
             if commands.is_empty() {
                 return None;
             }
@@ -371,6 +383,31 @@ fn query_hits(
 /// Check whether stored rules cover `query`; refreshes `last_used_at` on hit (D15).
 pub fn check_auto_allow(session_id: &str, query: &MemoryQuery) -> bool {
     check_auto_allow_at(&rules_file(), &rules_lock(), session_id, query)
+}
+
+/// Whether relaxed mode (D52) is enabled for this session via a stored [`RuleKey::ShellRelaxed`]
+/// rule; refreshes its rolling retention on hit. Eligibility of the request itself is
+/// the caller's concern (`MemoryQuery::ShellCommands::relaxed_eligible`).
+pub fn check_relaxed_auto_allow(session_id: &str) -> bool {
+    check_relaxed_auto_allow_at(&rules_file(), &rules_lock(), session_id)
+}
+
+/// Whether YOLO mode (D53) is enabled for this session via a stored [`RuleKey::Yolo`] rule;
+/// refreshes its rolling retention on hit.
+pub fn check_yolo_auto_allow(session_id: &str) -> bool {
+    check_session_flag_at(&rules_file(), &rules_lock(), session_id, &RuleKey::Yolo)
+}
+
+/// Turn YOLO mode off for one session (D53): remove its [`RuleKey::Yolo`] rule only,
+/// leaving every other grant intact. Returns whether a rule was removed.
+pub fn disable_yolo(session_id: &str) -> bool {
+    disable_yolo_at(&rules_file(), &rules_lock(), session_id)
+}
+
+/// Session ids with YOLO mode currently on (D53), most recently used first.
+/// Feeds the IM `/yolo` picker.
+pub fn yolo_session_ids() -> Vec<String> {
+    yolo_session_ids_at(&rules_file())
 }
 
 /// Persist rules; dedup against existing keys. Errors mean the caller must degrade per D25.
@@ -447,6 +484,75 @@ pub fn check_auto_allow_at(
     }
     store_at(path, data);
     true
+}
+
+pub fn check_relaxed_auto_allow_at(path: &Path, lock: &Path, session_id: &str) -> bool {
+    check_session_flag_at(path, lock, session_id, &RuleKey::ShellRelaxed)
+}
+
+/// Shared checker for keyless session-mode rules (relaxed D52 / yolo D53): present ⇒ hit,
+/// and a hit refreshes the rule's rolling retention.
+pub fn check_session_flag_at(path: &Path, lock: &Path, session_id: &str, key: &RuleKey) -> bool {
+    if session_id.trim().is_empty() {
+        return false;
+    }
+    let _guard = lock_at(lock);
+    let mut data = load_at(path);
+    let now = now_ms();
+    prune_expired(&mut data, now);
+    let hit = data
+        .sessions
+        .get_mut(session_id)
+        .and_then(|rules| rules.iter_mut().find(|rule| rule.key == *key));
+    let found = match hit {
+        Some(rule) => {
+            rule.last_used_at_ms = now;
+            true
+        }
+        None => false,
+    };
+    store_at(path, data);
+    found
+}
+
+pub fn disable_yolo_at(path: &Path, lock: &Path, session_id: &str) -> bool {
+    let _guard = lock_at(lock);
+    let mut data = load_at(path);
+    let Some(rules) = data.sessions.get_mut(session_id) else {
+        return false;
+    };
+    let before = rules.len();
+    rules.retain(|rule| !matches!(rule.key, RuleKey::Yolo));
+    let removed = rules.len() < before;
+    if removed {
+        store_at(path, data);
+    }
+    removed
+}
+
+pub fn yolo_session_ids_at(path: &Path) -> Vec<String> {
+    let mut data = load_at(path);
+    prune_expired(&mut data, now_ms());
+    let mut sessions: Vec<(String, u64)> = data
+        .sessions
+        .iter()
+        .filter_map(|(session_id, rules)| {
+            rules
+                .iter()
+                .find(|rule| matches!(rule.key, RuleKey::Yolo))
+                .map(|rule| {
+                    (
+                        session_id.clone(),
+                        rule.last_used_at_ms.max(rule.created_at_ms),
+                    )
+                })
+        })
+        .collect();
+    sessions.sort_by_key(|(_, last_used)| std::cmp::Reverse(*last_used));
+    sessions
+        .into_iter()
+        .map(|(session_id, _)| session_id)
+        .collect()
 }
 
 pub fn save_rules_at(
@@ -526,6 +632,7 @@ pub fn session_summaries_at(path: &Path) -> Vec<SessionRuleSummary> {
                 shell_count: 0,
                 network_count: 0,
                 mcp_count: 0,
+                yolo: false,
                 last_used_at_ms: 0,
             };
             for rule in rules {
@@ -542,9 +649,10 @@ pub fn session_summaries_at(path: &Path) -> Vec<SessionRuleSummary> {
                     RuleKey::FileDisk => summary.full_disk = true,
                     RuleKey::McpTool { .. } => summary.mcp_count += 1,
                     RuleKey::NetworkHost { .. } => summary.network_count += 1,
-                    RuleKey::ShellExact { .. } | RuleKey::ShellPrefix { .. } => {
-                        summary.shell_count += 1
-                    }
+                    RuleKey::ShellExact { .. }
+                    | RuleKey::ShellPrefix { .. }
+                    | RuleKey::ShellRelaxed => summary.shell_count += 1,
+                    RuleKey::Yolo => summary.yolo = true,
                 }
             }
             summary
@@ -591,38 +699,73 @@ pub fn normalize_path(raw: &str, cwd: &str) -> Option<String> {
     let expanded: String = if raw == "~" {
         dirs_home()?
     } else if let Some(rest) = raw.strip_prefix("~/") {
-        format!("{}/{rest}", dirs_home()?)
+        Path::new(&dirs_home()?)
+            .join(rest)
+            .to_string_lossy()
+            .to_string()
     } else {
         raw.to_string()
     };
-    let joined = if expanded.starts_with('/') {
+
+    // Keep POSIX-shaped protocol fixtures valid on every host. Native Windows paths use
+    // the component-aware branch below.
+    if expanded.starts_with('/') || (cwd.starts_with('/') && !Path::new(&expanded).is_absolute()) {
+        let joined = if expanded.starts_with('/') {
+            expanded
+        } else {
+            format!("{}/{expanded}", cwd.trim_end_matches('/'))
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for component in joined.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        let mut result = String::from("/");
+        result.push_str(&parts.join("/"));
+        return Some(result);
+    }
+
+    let expanded = PathBuf::from(expanded);
+    let joined = if expanded.is_absolute() {
         expanded
     } else {
-        if !cwd.starts_with('/') {
+        let cwd = PathBuf::from(cwd);
+        if !cwd.is_absolute() {
             return None;
         }
-        format!("{}/{expanded}", cwd.trim_end_matches('/'))
+        cwd.join(expanded)
     };
-    let mut parts: Vec<&str> = Vec::new();
-    for component in joined.split('/') {
+    let mut result = PathBuf::new();
+    for component in joined.components() {
         match component {
-            "" | "." => {}
-            ".." => {
-                // `..` above root stays at root, same as lexical normalize_lexically.
-                parts.pop();
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(
+                    result.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    result.pop();
+                }
             }
-            other => parts.push(other),
+            other => result.push(other.as_os_str()),
         }
     }
-    let mut result = String::from("/");
-    result.push_str(&parts.join("/"));
-    Some(result)
+    result
+        .is_absolute()
+        .then(|| result.to_string_lossy().to_string())
 }
 
 fn dirs_home() -> Option<String> {
-    std::env::var("HOME")
-        .ok()
-        .filter(|value| value.starts_with('/'))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .filter(|value| value.is_absolute())
+        .map(|value| value.to_string_lossy().to_string())
 }
 
 // ===== Wire payload: hook -> daemon =====
@@ -707,8 +850,8 @@ impl NativeWrite {
                 server,
                 tool,
             } => {
-                config_path.starts_with('/')
-                    && config_path.ends_with("/config.toml")
+                path_is_absolute_text(config_path)
+                    && comparable_path(config_path).ends_with("/config.toml")
                     && config_path.len() <= 4_096
                     && !server.is_empty()
                     && server.len() <= 512
@@ -720,15 +863,15 @@ impl NativeWrite {
                 host,
                 protocol,
             } => {
-                rules_path.starts_with('/')
-                    && rules_path.ends_with("/rules/default.rules")
+                path_is_absolute_text(rules_path)
+                    && comparable_path(rules_path).ends_with("/rules/default.rules")
                     && rules_path.len() <= 4_096
                     && network_host_is_valid(host)
                     && NETWORK_PROTOCOLS.contains(&protocol.as_str())
             }
             Self::PrefixRule { rules_path, prefix } => {
-                rules_path.starts_with('/')
-                    && rules_path.ends_with("/rules/default.rules")
+                path_is_absolute_text(rules_path)
+                    && comparable_path(rules_path).ends_with("/rules/default.rules")
                     && rules_path.len() <= 4_096
                     && !prefix.is_empty()
                     && prefix.len() <= 64
@@ -1142,6 +1285,7 @@ mod tests {
                 vec!["git".into(), "status".into()],
                 vec!["cargo".into(), "build".into()],
             ],
+            relaxed_eligible: false,
         };
         assert!(check_auto_allow_at(&t.file(), &t.lock(), "s1", &ok));
         let partial = MemoryQuery::ShellCommands {
@@ -1149,13 +1293,87 @@ mod tests {
                 vec!["git".into(), "status".into()],
                 vec!["rm".into(), "-rf".into(), "/".into()],
             ],
+            relaxed_eligible: false,
         };
         assert!(!check_auto_allow_at(&t.file(), &t.lock(), "s1", &partial));
         // Exact match means full argv, not prefix.
         let longer = MemoryQuery::ShellCommands {
             commands: vec![vec!["git".into(), "status".into(), "--short".into()]],
+            relaxed_eligible: false,
         };
         assert!(!check_auto_allow_at(&t.file(), &t.lock(), "s1", &longer));
+    }
+
+    #[test]
+    fn relaxed_rule_is_session_scoped_and_refreshes_retention() {
+        let t = TempStore::new();
+        assert!(!check_relaxed_auto_allow_at(&t.file(), &t.lock(), "s1"));
+        save_rules_at(
+            &t.file(),
+            &t.lock(),
+            "s1",
+            RuleNamespace::Session,
+            &[RuleKey::ShellRelaxed],
+        )
+        .unwrap();
+        assert!(check_relaxed_auto_allow_at(&t.file(), &t.lock(), "s1"));
+        // Other sessions are unaffected; empty session ids never match.
+        assert!(!check_relaxed_auto_allow_at(&t.file(), &t.lock(), "s2"));
+        assert!(!check_relaxed_auto_allow_at(&t.file(), &t.lock(), ""));
+        // The relaxed rule never satisfies command queries by itself.
+        let query = MemoryQuery::ShellCommands {
+            commands: vec![vec!["ls".into()]],
+            relaxed_eligible: true,
+        };
+        assert!(!check_auto_allow_at(&t.file(), &t.lock(), "s1", &query));
+    }
+
+    #[test]
+    fn yolo_rule_checks_disables_and_lists_per_session() {
+        let t = TempStore::new();
+        let check = |sid: &str| check_session_flag_at(&t.file(), &t.lock(), sid, &RuleKey::Yolo);
+        assert!(!check("s1"));
+        save_rules_at(
+            &t.file(),
+            &t.lock(),
+            "s1",
+            RuleNamespace::Session,
+            &[RuleKey::Yolo, RuleKey::ShellRelaxed],
+        )
+        .unwrap();
+        save_rules_at(
+            &t.file(),
+            &t.lock(),
+            "s2",
+            RuleNamespace::Session,
+            &[RuleKey::Yolo],
+        )
+        .unwrap();
+        assert!(check("s1"));
+        assert!(!check("s3"));
+        assert!(!check(""));
+        // The yolo rule never satisfies command queries by itself.
+        let query = MemoryQuery::ShellCommands {
+            commands: vec![vec!["ls".into()]],
+            relaxed_eligible: false,
+        };
+        assert!(!check_auto_allow_at(&t.file(), &t.lock(), "s1", &query));
+        // Listing covers exactly the sessions with a yolo rule.
+        let mut ids = yolo_session_ids_at(&t.file());
+        ids.sort();
+        assert_eq!(ids, ["s1", "s2"]);
+        // Summary flags yolo without counting it as a shell rule.
+        let summaries = session_summaries_at(&t.file());
+        let s1 = summaries.iter().find(|s| s.session_id == "s1").unwrap();
+        assert!(s1.yolo);
+        // shell_count covers the relaxed rule only.
+        assert_eq!(s1.shell_count, 1);
+        // Disable removes only the yolo rule and keeps the rest.
+        assert!(disable_yolo_at(&t.file(), &t.lock(), "s1"));
+        assert!(!disable_yolo_at(&t.file(), &t.lock(), "s1"));
+        assert!(!check("s1"));
+        assert!(check_relaxed_auto_allow_at(&t.file(), &t.lock(), "s1"));
+        assert_eq!(yolo_session_ids_at(&t.file()), ["s2"]);
     }
 
     #[test]

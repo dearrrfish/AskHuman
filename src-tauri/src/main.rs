@@ -9,20 +9,22 @@
 
 mod agents;
 mod app;
+mod ask_question;
 mod autochannel;
 mod channels;
 mod cli;
-#[cfg(unix)]
 mod client;
 mod commands;
 mod config;
 mod confirm;
+mod context_binding;
 mod daemon;
 mod dev_instance;
 mod dev_presets;
 mod dingtalk;
 mod export;
 mod feishu;
+mod file_lock;
 mod gitutil;
 mod gui_host;
 mod history;
@@ -30,6 +32,7 @@ mod hooks;
 mod i18n;
 mod integrations;
 mod ipc;
+mod local_time;
 #[cfg(target_os = "macos")]
 mod macos_dock_icon;
 #[cfg(target_os = "macos")]
@@ -38,9 +41,12 @@ mod macos_menu;
 mod macos_quicklook;
 #[cfg(target_os = "macos")]
 mod macos_window_anim;
+#[cfg(target_os = "macos")]
+mod macos_window_order;
 mod mcp;
 mod models;
 mod msg_card;
+mod path_identity;
 mod paths;
 mod perf;
 mod permission_diff;
@@ -53,12 +59,14 @@ mod prompts;
 mod secrets;
 mod select;
 mod shell_safety;
+mod show_last;
 mod slack;
 mod sound;
 #[cfg(target_os = "macos")]
 mod speech;
 mod telegram;
 mod textnorm;
+mod todo_attachments;
 mod todos;
 mod uistate;
 mod update;

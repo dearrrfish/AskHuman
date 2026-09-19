@@ -10,7 +10,7 @@ import {
 import { useI18n } from "vue-i18n";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
-import { renderMarkdown, handleCodeCopyClick } from "../lib/markdown";
+import MarkdownContent from "./MarkdownContent.vue";
 import {
   closePreview,
   fileIconDataUrl,
@@ -20,9 +20,15 @@ import {
   showAttachmentMenu,
 } from "../lib/ipc";
 import type { FileAttachment, HistoryAnswer, HistoryEntry } from "../lib/types";
-import { agentKindOf, customSourceOf, workspaceNameOf } from "../lib/history";
+import {
+  agentKindOf,
+  customSourceOf,
+  historySessionOf,
+  shortSessionId,
+  workspaceNameOf,
+} from "../lib/history";
 
-const props = defineProps<{ entry: HistoryEntry }>();
+const props = defineProps<{ entry: HistoryEntry; sessionTitle?: string }>();
 const { t, locale } = useI18n();
 
 // —— 来源 meta（agent 家族 / 自定义来源名 / workspace）——
@@ -34,8 +40,44 @@ const agentLabel = computed(() => {
 });
 const customSource = computed(() => customSourceOf(props.entry, agentLabel.value));
 const workspaceName = computed(() => workspaceNameOf(props.entry));
+const sessionRef = computed(() => historySessionOf(props.entry));
+const sessionLabel = computed(() => {
+  const session = sessionRef.value;
+  if (session.type === "agent") {
+    const id = shortSessionId(session.sessionId);
+    return props.sessionTitle ? `${props.sessionTitle} · ${id}` : id;
+  }
+  if (session.type === "mcp") {
+    return t("history.sessionMcpDetail", { id: shortSessionId(session.instanceId) });
+  }
+  return "";
+});
+const sessionTooltip = computed(() => {
+  const session = sessionRef.value;
+  if (session.type === "agent") {
+    return [agentLabel.value, props.sessionTitle, session.sessionId].filter(Boolean).join(" · ");
+  }
+  if (session.type === "mcp") {
+    return `${t("history.sessionMcpFull")} · ${session.instanceId} · ${session.project}`;
+  }
+  return "";
+});
+const sessionPlainText = computed(() => {
+  const session = sessionRef.value;
+  if (session.type === "agent") {
+    return [props.sessionTitle, session.sessionId].filter(Boolean).join(" · ");
+  }
+  if (session.type === "mcp") {
+    return `${t("history.sessionMcpFull")} · ${session.instanceId}`;
+  }
+  return "";
+});
 const hasMeta = computed(
-  () => !!agentLabel.value || !!customSource.value || !!workspaceName.value
+  () =>
+    !!agentLabel.value ||
+    !!customSource.value ||
+    !!sessionLabel.value ||
+    !!workspaceName.value
 );
 
 function openWorkspace() {
@@ -45,17 +87,6 @@ function openWorkspace() {
 const isMulti = computed(() => props.entry.questions.length > 1);
 const isCancel = computed(() => props.entry.action === "cancel");
 
-// Localized labels for the markdown code-block copy button (reactive to locale).
-const codeCopyLabels = computed(() => ({
-  copyLabel: t("common.copyCode"),
-  copiedLabel: t("common.copied"),
-}));
-
-const messageHtml = computed(() =>
-  props.entry.isMarkdown
-    ? renderMarkdown(props.entry.message.text, codeCopyLabels.value)
-    : ""
-);
 const showMessage = computed(
   () =>
     props.entry.message.text.trim() !== "" ||
@@ -101,6 +132,9 @@ function buildPlainText(): string {
   const meta: string[] = [];
   if (agentLabel.value) meta.push(agentLabel.value);
   if (customSource.value) meta.push(customSource.value);
+  if (sessionPlainText.value) {
+    meta.push(t("history.copySession", { session: sessionPlainText.value }));
+  }
   if (e.project) meta.push(e.project);
   if (meta.length) lines.push(meta.join(" · "));
 
@@ -172,27 +206,8 @@ function isAnswerEmpty(a: HistoryAnswer | null): boolean {
   );
 }
 
-function questionHtml(message: string): string {
-  return props.entry.isMarkdown
-    ? renderMarkdown(message, codeCopyLabels.value)
-    : "";
-}
-
 function fileName(path: string): string {
   return path.split(/[\\/]/).pop() || path;
-}
-
-function onContentClick(e: MouseEvent) {
-  if (handleCodeCopyClick(e)) return;
-  const anchor = (e.target as HTMLElement | null)?.closest?.("a") as
-    | HTMLAnchorElement
-    | null;
-  if (!anchor) return;
-  const href = anchor.href;
-  if (!/^(https?:|mailto:)/i.test(href)) return;
-  e.preventDefault();
-  e.stopPropagation();
-  openPath(href).catch(() => {});
 }
 
 function open(path: string) {
@@ -369,9 +384,16 @@ watch(
       </button>
     </div>
 
-    <!-- Source meta: agent family / custom source name / workspace -->
+    <!-- Source meta: agent family / session / custom source name / workspace -->
     <div v-if="hasMeta" class="meta-row">
       <span v-if="agentLabel" class="meta-chip">{{ agentLabel }}</span>
+      <span
+        v-if="sessionLabel"
+        class="meta-chip meta-session"
+        :title="sessionTooltip"
+      >
+        {{ t("history.sessionMeta", { value: sessionLabel }) }}
+      </span>
       <span v-if="customSource" class="meta-chip">{{ customSource }}</span>
       <button
         v-if="workspaceName"
@@ -388,12 +410,10 @@ watch(
 
     <!-- Shared message -->
     <template v-if="showMessage">
-      <div
+      <MarkdownContent
         v-if="entry.message.text && entry.isMarkdown"
-        class="markdown-body"
-        v-html="messageHtml"
-        @click="onContentClick"
-      ></div>
+        :source="entry.message.text"
+      />
       <pre v-else-if="entry.message.text" class="plain-body">{{ entry.message.text }}</pre>
 
       <div v-if="attachments.length" class="attachments">
@@ -449,12 +469,10 @@ watch(
         }}</span>
       </div>
 
-      <div
+      <MarkdownContent
         v-if="entry.isMarkdown && q.message"
-        class="markdown-body"
-        v-html="questionHtml(q.message)"
-        @click="onContentClick"
-      ></div>
+        :source="q.message"
+      />
       <pre v-else-if="q.message" class="plain-body">{{ q.message }}</pre>
 
       <!-- Options (selected highlighted, read-only) -->
@@ -597,6 +615,11 @@ watch(
   flex: 0 0 auto;
   width: 11px;
   height: 11px;
+}
+.meta-session {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .meta-workspace {
   cursor: pointer;

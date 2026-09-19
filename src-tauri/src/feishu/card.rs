@@ -7,6 +7,8 @@
 //! - 用户点「提交」→ 一次 `card.action.trigger` 回调，`action.form_value` 汇总所有组件取值。
 //! - 选项 ↔ 组件名映射 `opt_{i}`，便于回调里还原勾选了哪些选项（规避超长/重复选项文案）。
 
+use crate::autochannel::{self, HelpQuestionState, HelpView};
+use crate::i18n::Lang;
 use crate::models::OptionItem;
 use serde_json::{json, Value};
 
@@ -106,6 +108,7 @@ pub fn build_question_card_with_todo(
         single,
         select_only,
         input_placeholder,
+        "",
         submit_label,
         recommended_prefix,
         todo_text_prefix,
@@ -129,6 +132,7 @@ pub fn build_msg_compose_card(
             false,
             false,
             &view.input_placeholder,
+            "",
             &view.send_label,
             "",
             "",
@@ -146,9 +150,11 @@ pub struct Finalized<'a> {
     pub options: &'a [OptionItem],
     /// 用户已选选项（原文；被抢答收尾时为空 → 勾选器都不勾）。
     pub selected: &'a [String],
-    /// 补充文字回显（无则 None → 输入框留空）。
+    /// 补充文字回显（无则 None → 整段不渲染）。
     pub user_input: Option<&'a str>,
     pub input_placeholder: &'a str,
+    /// 补充文字上方的小标题（本地化「我的补充：」）。
+    pub note_label: &'a str,
     /// 禁用按钮的文案（「已提交」/「已在 X 回答」）。
     pub button_label: &'a str,
     /// 推荐选项的显示前缀（本地化 lark_md）。
@@ -168,6 +174,59 @@ pub fn build_message_card(title: &str, markdown_body: &str) -> Value {
         elements.push(body_text(markdown_body, true));
     }
     assemble_card(title, elements, false)
+}
+
+/// Build a non-interactive JSON 2.0 help card with grouped Markdown command lists.
+pub fn build_help_card(view: &HelpView, lang: Lang) -> Value {
+    let mut elements = vec![body_text(&view.intro, false)];
+    for section in &view.sections {
+        let mut markdown = format!("**{}**", section.title);
+        for command in &section.commands {
+            markdown.push_str("\n- `");
+            markdown.push_str(&command.syntax);
+            markdown.push_str("` — ");
+            markdown.push_str(&command.description);
+            if let Some(phrase) = &command.phrase {
+                markdown.push_str("　<font color='grey'>· ");
+                markdown.push_str(&autochannel::help_phrase_hint(phrase, lang));
+                markdown.push_str("</font>");
+            }
+        }
+        elements.push(body_text(&markdown, true));
+    }
+    elements.push(json!({ "tag": "hr", "margin": "0px 0px 0px 0px" }));
+
+    let state = match &view.question_state {
+        HelpQuestionState::Active { instruction } => instruction,
+        HelpQuestionState::None { message } => message,
+    };
+    let mut footer = format!("**{state}**");
+    if let Some(hint) = &view.switch_hint {
+        footer.push_str("\n<font color='grey'>");
+        footer.push_str(hint);
+        footer.push_str("</font>");
+    }
+    elements.push(body_text(&footer, true));
+    assemble_card(&view.title, elements, true)
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+
+    #[test]
+    fn help_card_uses_bullets_code_and_grey_phrases() {
+        let view = autochannel::help_view(true, false, true, "/", Lang::Zh);
+        let card = build_help_card(&view, Lang::Zh);
+        assert_eq!(card["schema"], "2.0");
+        assert_eq!(card["config"]["update_multi"], true);
+        let serialized = card.to_string();
+        assert!(serialized.contains("**Agent 管理**"));
+        assert!(serialized.contains("- `/status [编号]`"));
+        assert!(serialized.contains("<font color='grey'>· 直接说「状态」</font>"));
+        assert!(serialized.contains("- `/msg-clear <编号>`"));
+        assert!(!serialized.contains("msg-clear <编号>` — 撤回该 Agent 待送达的插话　<font"));
+    }
 }
 
 /// 卡片回调的同步「更新卡片」回包体：`{card:{type:"raw",data:<新卡片>}}`。
@@ -217,6 +276,7 @@ pub fn build_finalized_card_with_todo(
         p.single,
         p.select_only,
         p.input_placeholder,
+        p.note_label,
         p.button_label,
         p.recommended_prefix,
         todo_text_prefix,
@@ -240,7 +300,14 @@ fn checker_element(
 ) -> Value {
     let display = if opt.todo_id.is_some() {
         let text = opt.text.strip_prefix(todo_text_prefix).unwrap_or(&opt.text);
-        format!("{}{}", todo_badge_prefix, text)
+        let (body, attachment_badge) = crate::todos::split_attachment_badge(text);
+        match attachment_badge {
+            Some(badge) => format!(
+                "{}{} <font color='grey'>{}</font>",
+                todo_badge_prefix, body, badge
+            ),
+            None => format!("{}{}", todo_badge_prefix, body),
+        }
     } else if opt.recommended {
         format!("{}{}", recommended_prefix, opt.text)
     } else {
@@ -297,6 +364,7 @@ fn build_form(
     single: bool,
     select_only: bool,
     input_placeholder: &str,
+    note_label: &str,
     button_label: &str,
     recommended_prefix: &str,
     todo_text_prefix: &str,
@@ -321,18 +389,31 @@ fn build_form(
 
     // 严格选择无补充输入框。
     if !select_only {
-        let mut input = json!({
-            "tag": "input",
-            "name": INPUT_NAME,
-            "placeholder": { "tag": "plain_text", "content": input_placeholder },
-        });
-        if let Some(v) = user_input {
-            input["default_value"] = Value::String(v.to_string());
-        }
+        // 终态用「灰色小标题 + 引用块」回显补充文字：飞书的 `input` 一旦 disabled 就既不能编辑
+        // 也**不能选中复制**，而人常常要回头引用自己写过的话。无补充时整段省略。
         if disabled {
-            input["disabled"] = Value::Bool(true);
+            if let Some(v) = user_input.filter(|s| !s.trim().is_empty()) {
+                let quoted = v
+                    .lines()
+                    .map(|line| format!("> {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                form_elements.push(json!({
+                    "tag": "markdown",
+                    "content": format!("<font color='grey'>{note_label}</font>\n{quoted}"),
+                }));
+            }
+        } else {
+            let mut input = json!({
+                "tag": "input",
+                "name": INPUT_NAME,
+                "placeholder": { "tag": "plain_text", "content": input_placeholder },
+            });
+            if let Some(v) = user_input {
+                input["default_value"] = Value::String(v.to_string());
+            }
+            form_elements.push(input);
         }
-        form_elements.push(input);
     }
 
     let mut button = json!({
@@ -639,6 +720,8 @@ fn select_button_type(action: crate::select::SelectAction) -> &'static str {
         | crate::select::SelectAction::TaskWorkspace
         | crate::select::SelectAction::TaskAgent
         | crate::select::SelectAction::TaskPermission
+        | crate::select::SelectAction::TaskInputSource
+        | crate::select::SelectAction::Fork
         | crate::select::SelectAction::Msg
         | crate::select::SelectAction::MsgTarget
         | crate::select::SelectAction::Stage
@@ -649,7 +732,9 @@ fn select_button_type(action: crate::select::SelectAction) -> &'static str {
         | crate::select::SelectAction::Transcript
         | crate::select::SelectAction::Todo
         | crate::select::SelectAction::TodoAutoEntry => "default",
-        crate::select::SelectAction::Unwatch | crate::select::SelectAction::TodoRmEntry => "danger",
+        crate::select::SelectAction::Unwatch
+        | crate::select::SelectAction::TodoRmEntry
+        | crate::select::SelectAction::Yolo => "danger",
     }
 }
 
@@ -665,7 +750,8 @@ fn select_option_markdown(opt: &crate::select::SelectOption) -> String {
     if let Some(seq) = opt.seq {
         line1.push_str(&format!("**[{}]** ", seq));
     }
-    line1.push_str(&opt.primary);
+    let (primary, attachment_badge) = crate::todos::split_attachment_badge(&opt.primary);
+    line1.push_str(primary);
     if let Some(badge) = &opt.badge {
         line1.push(' ');
         line1.push_str(badge);
@@ -673,6 +759,11 @@ fn select_option_markdown(opt: &crate::select::SelectOption) -> String {
     if let Some(elapsed) = &opt.elapsed {
         line1.push(' ');
         line1.push_str(elapsed);
+    }
+    if let Some(attachment_badge) = attachment_badge {
+        line1.push_str(" <font color='grey'>");
+        line1.push_str(attachment_badge);
+        line1.push_str("</font>");
     }
     match &opt.secondary {
         Some(sec) => format!("{}\n<font color='grey'>{}</font>", line1, sec),
@@ -776,6 +867,7 @@ pub fn build_todo_auto_card(
         false,
         false,
         input_placeholder,
+        "",
         submit_label,
         "",
         "",
@@ -803,6 +895,7 @@ pub fn build_todo_manage_card(
             false,
             false,
             input_placeholder,
+            "",
             submit_label,
             "",
             "",
@@ -1275,6 +1368,45 @@ mod tests {
     }
 
     #[test]
+    fn todo_attachment_badge_uses_grey_rich_text() {
+        let mut option = OptionItem::with_todo("执行待办：修复登录 【1 个附件】", "todo-1");
+        option.todo_attachments = vec![crate::todo_attachments::TodoAttachmentSnapshot {
+            id: "attachment-1".into(),
+            name: "brief.md".into(),
+            path: "/tmp/brief.md".into(),
+            source_path: "/tmp/brief.md".into(),
+            storage: crate::todo_attachments::TodoAttachmentStorage::Reference,
+        }];
+        let card = build_question_card_with_todo(
+            "T",
+            "Q",
+            &[option],
+            true,
+            false,
+            false,
+            &[],
+            "ph",
+            "提交",
+            "<font color='green'>【👍推荐】</font> ",
+            "执行待办：",
+            "<font color='orange'>【TODO】</font> ",
+        );
+        let form = form_of(&card);
+        let content = form["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["tag"] == "checker")
+            .unwrap()["text"]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            content,
+            "<font color='orange'>【TODO】</font> 修复登录 <font color='grey'>【1 个附件】</font>"
+        );
+    }
+
+    #[test]
     fn parse_toggle_reads_index() {
         let event = json!({
             "operator": { "open_id": "ou_1" },
@@ -1331,8 +1463,9 @@ mod tests {
             is_markdown: true,
             options: &opts,
             selected: &sel,
-            user_input: Some("再想想"),
+            user_input: Some("再想想\n第二行"),
             input_placeholder: "补充说明（可选）",
+            note_label: "我的补充：",
             button_label: "已提交",
             recommended_prefix: "【👍推荐】 ",
             single: false,
@@ -1348,15 +1481,41 @@ mod tests {
         assert_eq!(checkers[1]["checked"], true);
         assert_eq!(checkers[1]["disabled"], true);
         assert_eq!(checkers[1]["text"]["content"], "【👍推荐】 停止");
-        // 输入框：禁用 + 回显补充文字。
-        let input = fe.iter().find(|e| e["tag"] == "input").unwrap();
-        assert_eq!(input["disabled"], true);
-        assert_eq!(input["default_value"], "再想想");
+        // 补充文字：不再是禁用输入框（那种在飞书里选不中），而是小标题 + 引用块，可选中复制。
+        assert!(fe.iter().all(|e| e["tag"] != "input"));
+        let note = fe.iter().find(|e| e["tag"] == "markdown").unwrap();
+        assert_eq!(
+            note["content"],
+            "<font color='grey'>我的补充：</font>\n> 再想想\n> 第二行"
+        );
         // 按钮：禁用 + 改文案 + 无 behaviors。
         let button = fe.iter().find(|e| e["tag"] == "button").unwrap();
         assert_eq!(button["disabled"], true);
         assert_eq!(button["text"]["content"], "已提交");
         assert!(button.get("behaviors").is_none());
+    }
+
+    #[test]
+    fn finalized_card_without_note_drops_the_whole_note_block() {
+        let opts = vec![OptionItem::new("继续", false)];
+        let card = build_finalized_card(&Finalized {
+            title: "Question 1/1",
+            text: "要继续吗？",
+            is_markdown: true,
+            options: &opts,
+            selected: &[],
+            user_input: None,
+            input_placeholder: "补充说明（可选）",
+            note_label: "我的补充：",
+            button_label: "已在 弹窗 回答",
+            recommended_prefix: "",
+            single: false,
+            select_only: false,
+        });
+        let form = form_of(&card);
+        let fe = form["elements"].as_array().unwrap();
+        assert!(fe.iter().all(|e| e["tag"] != "input"));
+        assert!(fe.iter().all(|e| e["tag"] != "markdown"));
     }
 
     #[test]
@@ -1690,6 +1849,35 @@ mod tests {
             .unwrap();
         assert!(md1.contains("<font color='grey'>●</font>"));
         assert!(!md1.contains("关注中"));
+    }
+
+    #[test]
+    fn select_card_renders_todo_attachment_badge_in_grey() {
+        let view = crate::select::SelectView {
+            title: "选择任务来源".into(),
+            options: vec![crate::select::SelectOption {
+                id: "todo:1".into(),
+                dot: None,
+                seq: Some(1),
+                primary: "执行待办：修复登录 【2 个附件】".into(),
+                badge: None,
+                elapsed: None,
+                secondary: None,
+            }],
+            truncated_note: None,
+            action: crate::select::SelectAction::TaskInputSource,
+        };
+        let card = build_select_card(&view);
+        let row = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["tag"] == "column_set")
+            .unwrap();
+        let markdown = row["columns"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(markdown.contains("执行待办：修复登录 <font color='grey'>【2 个附件】</font>"));
     }
 
     #[test]

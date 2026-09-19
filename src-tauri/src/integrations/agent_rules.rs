@@ -1,10 +1,11 @@
-//! Agent 全局提示词（Rules）安装/卸载/更新/状态：Cursor / Claude Code / Codex。
+//! Agent 全局提示词（Rules）安装/卸载/更新/状态。
 //!
-//! 三者共用同一份提示词正文（`prompts::cli_reference()`），均以自有 `begin/end` 托管区块写入，
-//! 区块外的用户内容一律保留；落点不同：
+//! Agent families share one prompt template. Rendering may add a target-specific scope rule before
+//! writing the owned `begin/end` block; content outside the block is always preserved. Targets:
 //! - Cursor：`~/.cursor/rules/askhuman.mdc`（`alwaysApply` frontmatter + 托管区块）。
 //! - Claude Code：`~/.claude/CLAUDE.md` 内的托管区块。
 //! - Codex：`~/.codex/AGENTS.md` 内的托管区块。
+//! - Pi：`~/.pi/agent/AGENTS.md` 内的托管区块。
 //!
 //! 「更新」用于内置提示词随版本变化后，把已安装的旧正文覆盖为最新（仅替换区块内部）。
 //! Cursor 卸载时若区块外只剩 frontmatter / 空白则删除整个文件，否则保留用户内容。
@@ -34,11 +35,11 @@ pub enum Variant {
 }
 
 impl Variant {
-    /// 该变体对应的最新内置提示词正文。
-    pub fn body(self) -> String {
+    /// Render the latest built-in body for this variant and agent target.
+    pub fn body(self, agent: AgentTarget) -> String {
         match self {
-            Variant::Cli => crate::prompts::cli_reference(),
-            Variant::Mcp => crate::prompts::mcp_reference(),
+            Variant::Cli => crate::prompts::cli_reference_for(agent.kind()),
+            Variant::Mcp => crate::prompts::mcp_reference_for(agent.kind()),
         }
     }
 }
@@ -48,13 +49,14 @@ impl Variant {
 /// 注意 `Grok` 的「指令载体」不是 rules 文件，而是 `~/.grok/skills/interaction-protocol/SKILL.md`
 /// （见 [`crate::integrations::grok_skill`]）：Grok 默认模型 Composer 不读全局 `~/.grok/AGENTS.md`，
 /// 故本模块对 `Grok` 的所有指令查询 / 安装 / 卸载 / 打开一律**委托** `grok_skill`，让 `agent_mode`、
-/// 命令层、CLI 可用同一套 `AgentTarget` 统一处理四家（Grok 的 `Variant` 无意义，恒按 MCP 语义）。
+/// 命令层、CLI 可用同一套 `AgentTarget` 统一处理五家（Grok 的 `Variant` 无意义，恒按 MCP 语义）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgentTarget {
     Cursor,
     ClaudeCode,
     Codex,
     Grok,
+    Pi,
 }
 
 impl AgentTarget {
@@ -65,6 +67,7 @@ impl AgentTarget {
             "claude" => Some(AgentTarget::ClaudeCode),
             "codex" => Some(AgentTarget::Codex),
             "grok" => Some(AgentTarget::Grok),
+            "pi" => Some(AgentTarget::Pi),
             _ => None,
         }
     }
@@ -81,12 +84,23 @@ impl AgentTarget {
             AgentTarget::ClaudeCode => paths::claude_md(),
             AgentTarget::Codex => paths::codex_agents_md(),
             AgentTarget::Grok => paths::grok_skill_md(),
+            AgentTarget::Pi => paths::pi_agents_md(),
         }
     }
 
     /// 是否为「独占文件」模式（Cursor 为整文件拥有；其余为共享文件托管区块）。
     fn is_owned_file(self) -> bool {
         matches!(self, AgentTarget::Cursor)
+    }
+
+    fn kind(self) -> crate::agents::AgentKind {
+        match self {
+            AgentTarget::Cursor => crate::agents::AgentKind::Cursor,
+            AgentTarget::ClaudeCode => crate::agents::AgentKind::Claude,
+            AgentTarget::Codex => crate::agents::AgentKind::Codex,
+            AgentTarget::Grok => crate::agents::AgentKind::Grok,
+            AgentTarget::Pi => crate::agents::AgentKind::Pi,
+        }
     }
 }
 
@@ -240,13 +254,13 @@ pub fn needs_update_variant(agent: AgentTarget, variant: Variant) -> bool {
     };
     if has_block(&text) {
         return block_body(&text)
-            .map(|b| b != variant.body())
+            .map(|b| b != variant.body(agent))
             .unwrap_or(true);
     }
     agent.is_owned_file() && is_managed_cursor_file(&text)
 }
 
-/// 已安装规则的变体：区块正文精确匹配 `mcp_reference()`/`cli_reference()` 即判定对应变体；
+/// 已安装规则的变体：区块正文精确匹配目标 Agent 的 MCP / CLI reference 即判定对应变体；
 /// 漂移（旧版本提示词）时用结构性信号兜底（见 [`classify_body`]）。未安装返回 None。
 pub fn installed_variant(agent: AgentTarget) -> Option<Variant> {
     if agent.is_grok_skill() {
@@ -255,7 +269,7 @@ pub fn installed_variant(agent: AgentTarget) -> Option<Variant> {
     }
     let text = std::fs::read_to_string(agent.file()).ok()?;
     if let Some(body) = block_body(&text) {
-        return Some(classify_body(&body));
+        return Some(classify_body(&body, agent));
     }
     if agent.is_owned_file() && is_managed_cursor_file(&text) {
         return Some(Variant::Cli);
@@ -268,11 +282,11 @@ pub fn installed_variant(agent: AgentTarget) -> Option<Variant> {
 /// 精确匹配当前内置正文优先；**漂移**（已装的是旧版本提示词、与当前正文不等）时改用结构性信号：
 /// CLI 版必然指引「经 Shell/Bash 工具调用」，MCP 版只提工具调用、从不出现 `Shell/Bash`。
 /// 这样即便内置提示词改版，已装规则仍能稳定归类，不会在更新后被错分模式。
-pub fn classify_body(body: &str) -> Variant {
-    if body == crate::prompts::mcp_reference() {
+pub fn classify_body(body: &str, agent: AgentTarget) -> Variant {
+    if body == crate::prompts::mcp_reference_for(agent.kind()) {
         return Variant::Mcp;
     }
-    if body == crate::prompts::cli_reference() {
+    if body == crate::prompts::cli_reference_for(agent.kind()) {
         return Variant::Cli;
     }
     if body.contains("Shell/Bash") {
@@ -282,7 +296,7 @@ pub fn classify_body(body: &str) -> Variant {
     }
 }
 
-/// 当前平台是否支持（四家指令文件读写均跨平台）。
+/// 当前平台是否支持（五家指令文件读写均跨平台）。
 pub fn supported(_agent: AgentTarget) -> bool {
     true
 }
@@ -321,7 +335,7 @@ pub fn install_variant(agent: AgentTarget, variant: Variant) -> Result<String> {
     if agent.is_grok_skill() {
         return crate::integrations::grok_skill::install();
     }
-    write_rule(agent, &variant.body())?;
+    write_rule(agent, &variant.body(agent))?;
     Ok(crate::i18n::tr(crate::i18n::Lang::current(), "cmd.ruleInstalled").to_string())
 }
 
@@ -330,7 +344,7 @@ pub fn update_variant(agent: AgentTarget, variant: Variant) -> Result<String> {
     if agent.is_grok_skill() {
         return crate::integrations::grok_skill::update();
     }
-    write_rule(agent, &variant.body())?;
+    write_rule(agent, &variant.body(agent))?;
     Ok(crate::i18n::tr(crate::i18n::Lang::current(), "cmd.ruleUpdated").to_string())
 }
 
@@ -564,22 +578,50 @@ mod tests {
     fn classify_body_exact_and_drift() {
         // 精确匹配当前内置正文。
         assert_eq!(
-            classify_body(&crate::prompts::cli_reference()),
+            classify_body(
+                &crate::prompts::cli_reference_for(crate::agents::AgentKind::Codex),
+                AgentTarget::Codex,
+            ),
             Variant::Cli
         );
         assert_eq!(
-            classify_body(&crate::prompts::mcp_reference()),
+            classify_body(
+                &crate::prompts::mcp_reference_for(crate::agents::AgentKind::Codex),
+                AgentTarget::Codex,
+            ),
             Variant::Mcp
         );
         // 漂移（旧版本提示词）：CLI 必含 Shell/Bash 指引 → Cli；MCP 从不提 Shell → Mcp。
         assert_eq!(
-            classify_body("... invoke via the Shell/Bash tool ... (older wording)"),
+            classify_body(
+                "... invoke via the Shell/Bash tool ... (older wording)",
+                AgentTarget::Codex,
+            ),
             Variant::Cli
         );
         assert_eq!(
-            classify_body("... call the AskHuman `ask` tool ... (older wording)"),
+            classify_body(
+                "... call the AskHuman `ask` tool ... (older wording)",
+                AgentTarget::Codex,
+            ),
             Variant::Mcp
         );
+    }
+
+    #[test]
+    fn variant_body_uses_the_same_subagent_scope_for_every_agent() {
+        for variant in [Variant::Cli, Variant::Mcp] {
+            for target in [
+                AgentTarget::Codex,
+                AgentTarget::ClaudeCode,
+                AgentTarget::Cursor,
+                AgentTarget::Grok,
+            ] {
+                let body = variant.body(target);
+                assert!(body.contains(crate::prompts::SUBAGENT_PROTOCOL_RULE));
+                assert!(!body.contains("task-suggestion generators"));
+            }
+        }
     }
 
     #[test]

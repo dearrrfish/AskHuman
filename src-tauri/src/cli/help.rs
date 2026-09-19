@@ -52,10 +52,12 @@ pub fn help_text(lang: Lang) -> String {
             "Management:".to_string(),
             "  --settings              Open the settings window".to_string(),
             "  --history [--all]       Open the reply history window (current project; --all for every project)".to_string(),
+            "  --show-last [N]         Print recent completed AskHuman exchange(s) for this Agent session (N=1–10, default 1)".to_string(),
             "  --todos                 Open the project todos window (preselects current project)".to_string(),
             "  daemon <sub>            Manage the background daemon: status/stop/restart/start/logs (stop/restart drain active requests; add --force to terminate now)".to_string(),
-            "  mcp                     Run as an MCP server over STDIO, exposing the 'ask', 'whats_next', and 'todo_add' tools (for MCP clients, not humans)".to_string(),
-            "  todo <sub>              Project todo queue: add [--auto] <text> / list / rm <n> / clear (todos surface as --whats-next choices; --auto ones auto-dispatch)".to_string(),
+            "  update prepare          Windows: drain background processes before a manual update".to_string(),
+            "  mcp                     Run as an MCP server over STDIO, exposing ask, whats_next, show_last, todo_add, todo_list, and todo_update".to_string(),
+            "  todo <sub>              Project todos: add [--auto] [-f path] <text> / list / attach / detach / rm / clear".to_string(),
             "  channel <sub>           Configure IM channels without a GUI (list/set/enable/disable/test/detect; see 'channel help')".to_string(),
             "  agents <sub>            Agent status & integrations (monitor/show/install/uninstall/update; see 'agents help')".to_string(),
             "  config <sub>            Generic config key/value fallback (show/get/set/unset/path; see 'config help')".to_string(),
@@ -88,10 +90,12 @@ pub fn help_text(lang: Lang) -> String {
             "管理:".to_string(),
             "  --settings              启动设置界面".to_string(),
             "  --history [--all]       启动回复历史窗口（默认当前项目；--all 查看全部项目）".to_string(),
+            "  --show-last [N]         输出当前 Agent 会话最近 N 条已完成 AskHuman 问答（N=1–10，默认 1）".to_string(),
             "  --todos                 启动项目待办窗口（预选当前项目）".to_string(),
             "  daemon <子命令>          管理后台 daemon：status/stop/restart/start/logs（stop/restart 默认等在途请求完结；--force 立即终止）".to_string(),
-            "  mcp                     以 MCP server（STDIO）运行，暴露 'ask'、'whats_next' 与 'todo_add' 工具（面向 MCP 客户端，非人类）".to_string(),
-            "  todo <子命令>            项目级待办队列：add [--auto] <text> / list / rm <n> / clear（待办会作为 --whats-next 的选项出现；--auto 的直接自动派发）".to_string(),
+            "  update prepare          Windows：手动更新前排空并关闭后台进程".to_string(),
+            "  mcp                     以 MCP server（STDIO）运行，暴露 ask、whats_next、show_last、todo_add、todo_list 与 todo_update".to_string(),
+            "  todo <子命令>            项目待办：add [--auto] [-f 路径] <文本> / list / attach / detach / rm / clear".to_string(),
             "  channel <子命令>         无 GUI 配置 IM 渠道（list/set/enable/disable/test/detect；见 'channel help'）".to_string(),
             "  agents <子命令>          Agent 状态与集成（monitor/show/install/uninstall/update；见 'agents help'）".to_string(),
             "  config <子命令>          通用配置键值兜底（show/get/set/unset/path；见 'config help'）".to_string(),
@@ -156,13 +160,13 @@ fn result_field_lines(lang: Lang) -> Vec<String> {
             format!("  {m_opts}  Predefined options the user checked"),
             format!("  {m_input}        Free-form text the user typed"),
             format!("  {m_files}             Local paths the user attached (images/files/dirs; tell type by extension)"),
-            format!("  {m_status}            Shown when the user cancels; follow its instructions to keep asking"),
+            format!("  {m_status}            State of this request (cancelled, unanswered, replayed answer); follow its text"),
         ],
         Lang::Zh => vec![
             format!("  {m_opts}  用户勾选的预定义选项"),
             format!("  {m_input}        用户输入的自由文本"),
             format!("  {m_files}             用户附带的本地路径（图片/文件/目录，按后缀区分类型）"),
-            format!("  {m_status}            用户取消时出现，请按其中说明继续询问"),
+            format!("  {m_status}            本次提问的状态（取消 / 未作答 / 重放的旧回答），按其中说明处理"),
         ],
     }
 }
@@ -229,6 +233,9 @@ pub fn agent_help_text(lang: Lang) -> String {
             out.push(format!(
                 "  Add when the user asks or defers a concrete task: {prog} todo add \"<task>\""
             ));
+            out.push(format!(
+                "  Attach files only when explicitly requested: {prog} todo add -f <path> -- \"<task>\"; use todo attach/detach for existing entries."
+            ));
             out.push(String::new());
             out.push("End-of-task handoff (--whats-next):".to_string());
             out.push(format!(
@@ -252,6 +259,11 @@ pub fn agent_help_text(lang: Lang) -> String {
                     .to_string(),
             );
             out.push("  suggestions. Takes no -q (the question is fixed).".to_string());
+            out.push(String::new());
+            out.push("Context-compaction recovery:".to_string());
+            out.push(format!(
+                "  Run {prog} --show-last after summarization, or whenever the exact last AskHuman question/answer is uncertain."
+            ));
         }
         Lang::Zh => {
             out.push(format!("{prog} —— 向人类发起提问并收集回应。"));
@@ -290,6 +302,9 @@ pub fn agent_help_text(lang: Lang) -> String {
             out.push(format!(
                 "  用户要求添加或明确延后具体任务时使用：{prog} todo add \"<任务>\""
             ));
+            out.push(format!(
+                "  仅在用户明确要求时添加文件：{prog} todo add -f <路径> -- \"<任务>\"；已有条目用 todo attach/detach。"
+            ));
             out.push(String::new());
             out.push("任务完成后的交接（--whats-next）:".to_string());
             out.push(format!(
@@ -308,6 +323,11 @@ pub fn agent_help_text(lang: Lang) -> String {
                     .to_string(),
             );
             out.push("  选项，因为结束项已内置。无建议时省略。不接受 -q（问题固定）。".to_string());
+            out.push(String::new());
+            out.push("上下文压缩恢复:".to_string());
+            out.push(format!(
+                "  被摘要后，或不确定上一次 AskHuman 问答的精确内容时，运行 {prog} --show-last。"
+            ));
         }
     }
     out.join("\n")
@@ -482,6 +502,17 @@ mod tests {
             assert!(ah.contains("todo add"));
             // 旧「固定英文结束句」已废除，不应再出现在 help 里。
             assert!(!ah.contains("no more tasks"));
+        }
+    }
+
+    #[test]
+    fn help_and_agent_help_cover_context_recovery_in_both_languages() {
+        for lang in [Lang::En, Lang::Zh] {
+            let help = help_text(lang);
+            let agent = agent_help_text(lang);
+            assert!(help.contains("--show-last"));
+            assert!(help.contains("show_last"));
+            assert!(agent.contains("--show-last"));
         }
     }
 

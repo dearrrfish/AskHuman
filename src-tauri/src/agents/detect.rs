@@ -19,6 +19,19 @@ struct ProcEntry {
     command: String,
 }
 
+/// Native process facts used by lifecycle binding. Fields that the OS refuses to disclose stay
+/// `None`; callers must fail closed rather than substituting another process's identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub executable: Option<String>,
+    pub command_line: Option<String>,
+    pub session_id: Option<u32>,
+    /// Windows FILETIME ticks since 1601; unavailable on Unix adapters today.
+    pub creation_time: Option<u64>,
+}
+
 /// 本程序自身可执行文件名的标记（避免把 reporter / daemon / mcp / ask 子进程误判成 Agent）。
 /// **只按可执行名匹配**（comm + argv0 basename），**不扫描参数**——否则命令行参数里恰好提到
 /// "askhuman" 的 agent（如 `codex exec "用 askhuman 提问…"`）会被误判为自身而被 walk 跳过，
@@ -32,6 +45,14 @@ const SELF_MARKERS: [&str; 2] = ["askhuman", "humaninloop"];
 /// 判不出返回 `None`（调用方应按 intended 处理，避免漏报）。
 pub fn detect_running_agent_from(env: &HashMap<String, String>) -> Option<AgentKind> {
     let has = |k: &str| env.contains_key(k);
+    if env
+        .get("PI_CODING_AGENT")
+        .is_some_and(|value| value == "true")
+        || has("PI_SESSION_ID")
+        || has("PI_SESSION_FILE")
+    {
+        return Some(AgentKind::Pi);
+    }
     // Grok **必须**最先判：它在**每个** hook 子进程都注入 `CLAUDE_PROJECT_DIR`（Claude 兼容别名），
     // 并会合并触发 `~/.claude`/`~/.cursor` 的兼容 hook。凭 `GROK_HOOK_EVENT`（hook runner 恒注入）/
     // `GROK_SESSION_ID` 认出真实家族是 Grok，配合 reporter 的「running==Grok 且 intended!=Grok 跳过」
@@ -71,6 +92,7 @@ pub fn session_id_env_var(kind: AgentKind) -> &'static str {
         AgentKind::Cursor => "CURSOR_CONVERSATION_ID",
         // Grok 在每个 hook 子进程注入 `GROK_SESSION_ID`（见 grok hooks 文档）。
         AgentKind::Grok => "GROK_SESSION_ID",
+        AgentKind::Pi => "PI_SESSION_ID",
     }
 }
 
@@ -112,6 +134,13 @@ fn matches_agent(entry: &ProcEntry, kind: AgentKind) -> bool {
         }
         // Grok 可执行名为 `grok`（软链）或 `grok-macos-*`（真身），故按子串 `grok` 匹配。
         AgentKind::Grok => comm.contains("grok") || argv0_base.contains("grok"),
+        // Keep Pi matching exact: the two-letter name appears in ordinary arguments frequently.
+        AgentKind::Pi => {
+            argv0_base == "pi"
+                || argv0_base == "pi.js"
+                || command.contains("/pi-coding-agent/")
+                || command.contains("\\pi-coding-agent\\")
+        }
     }
 }
 
@@ -123,19 +152,57 @@ fn matches_agent(entry: &ProcEntry, kind: AgentKind) -> bool {
 /// （`walk_agent_pid` 命中它即返回 None，让该会话落到 registry 的「无 pid」路径 = 同 Claude 被
 /// PID-scrub 时）。
 ///
-/// 判据（D27 主判据）：命令行里基名为 `codex` 的令牌，其**紧邻的下一个令牌**是 `app-server`
-/// 子命令（即 `codex app-server …`，覆盖 `--listen unix://` 与 `stdio://`，以及 `node <path>/codex
-/// app-server …` 包装器）。
+/// 判据（D27 主判据）：命令行里基名为 `codex` 的令牌之后，**跳过前导全局选项**，第一个非选项
+/// token 是 `app-server` 子命令（覆盖 `codex app-server …`、`node <path>/codex app-server …`，
+/// 以及 ChatGPT / Codex Desktop 的 `codex -c features.…=true app-server …`）。
 ///
-/// 只认「codex 后面紧跟的子命令位」而非「参数里任意出现 app-server」，以免把提示词里恰好含
+/// 只认「codex 后的子命令位」而非「参数里任意出现 app-server」，以免把提示词里恰好含
 /// "app-server" 的 TUI（如 `codex exec "用 app-server 提问"`）误判。嵌入 / 旧模式 TUI 命令为纯
 /// `codex`（子命令是 `exec`/`resume`/无）→ 返回 false，pid 照常可用。
 fn is_shared_app_server(entry: &ProcEntry) -> bool {
     let command = entry.command.to_ascii_lowercase();
     let tokens: Vec<&str> = command.split_whitespace().collect();
     tokens.iter().enumerate().any(|(i, tok)| {
-        basename(tok) == "codex" && tokens.get(i + 1).is_some_and(|next| *next == "app-server")
+        basename(tok) == "codex" && codex_subcommand(&tokens[i + 1..]) == Some("app-server")
     })
+}
+
+/// Codex CLI 在 argv0（或包装路径中的 `…/codex`）之后、**子命令之前**常见的取值型全局选项。
+/// 命中时需连同下一 token（选项值）一起跳过，才能正确定位子命令（D27 / ChatGPT Desktop）。
+const CODEX_VALUE_OPTS: &[&str] = &[
+    "-c",
+    "--config",
+    "-m",
+    "--model",
+    "-p",
+    "--profile",
+    "--cdn-base-url",
+];
+
+/// 从 `codex` 之后的参数里取出**第一个非选项 token**（即子命令位）；全是选项则 `None`。
+///
+/// 跳过规则：`--flag=value` / `-c=value` 计一个 token；已知取值型选项（见 `CODEX_VALUE_OPTS`）
+/// 再吞掉紧随的值；其余以 `-` 开头的当作 boolean / 未知 flag 只跳自身。这样
+/// `codex -c features.code_mode_host=true app-server …` 的子命令仍是 `app-server`，而
+/// `codex exec … app-server …` 的子命令仍是 `exec`。
+fn codex_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut i = 0;
+    while i < args.len() {
+        let t = args[i];
+        if !t.starts_with('-') {
+            return Some(t);
+        }
+        if t.contains('=') {
+            i += 1;
+            continue;
+        }
+        if CODEX_VALUE_OPTS.contains(&t) {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    None
 }
 
 fn is_self(entry: &ProcEntry) -> bool {
@@ -153,11 +220,17 @@ fn is_self(entry: &ProcEntry) -> bool {
 }
 
 fn basename(p: &str) -> String {
-    p.rsplit('/').next().unwrap_or(p).to_string()
+    let name = p
+        .trim_matches('"')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(p)
+        .trim_matches('"');
+    name.strip_suffix(".exe").unwrap_or(name).to_string()
 }
 
 /// 从 `start_pid` 向上回溯进程树，返回第一个命中指定家族、且非自身的祖先 pid。
-/// 找不到（或非 unix）返回 `None` → 调用方落 TTL 兜底。
+/// 找不到时返回 `None` → 调用方落 TTL 兜底。
 ///
 /// spec D25/D27：Codex 命中的祖先若是**共享 app-server 守护**（`is_shared_app_server`）→ 返回
 /// `None`（walk 只会命中它、拿不到 TUI pid；该会话按「无 pid」路径治理，见 registry）。
@@ -185,7 +258,8 @@ pub fn walk_agent_pid_from_self(kind: AgentKind) -> Option<u32> {
 /// 会话 ID），但进程树依旧能定位到 agent 本体。返回的 pid 是当次现取、真实存活的（可用作 registry
 /// 按 pid 匹配的键）；拿不到 `session_id`。
 pub fn walk_any_agent(start_pid: u32) -> Option<(AgentKind, u32)> {
-    const KINDS: [AgentKind; 4] = [
+    const KINDS: [AgentKind; 5] = [
+        AgentKind::Pi,
         AgentKind::Grok,
         AgentKind::Codex,
         AgentKind::Claude,
@@ -210,9 +284,42 @@ pub fn walk_any_agent_from_self() -> Option<(AgentKind, u32)> {
     walk_any_agent(std::process::id())
 }
 
+/// Return the direct parent process id using the platform process snapshot.
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    process_chain(pid)
+        .first()
+        .map(|entry| entry.ppid)
+        .filter(|parent| *parent != 0)
+}
+
+/// Inspect one process without launching PowerShell, WMI, or another helper process on Windows.
+pub fn inspect_process(pid: u32) -> Option<ProcessIdentity> {
+    #[cfg(unix)]
+    {
+        let (parent_pid, executable) = ps_ppid_comm(pid)?;
+        Some(ProcessIdentity {
+            pid,
+            parent_pid,
+            executable: (!executable.is_empty()).then_some(executable),
+            command_line: ps_command(pid),
+            session_id: None,
+            creation_time: None,
+        })
+    }
+    #[cfg(windows)]
+    {
+        inspect_process_windows(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// 识别 `pid` 所在的终端 App：沿进程链向上找首个已知终端祖先，返回稳定标识串
 /// （`apple-terminal` / `iterm2` / `ghostty` / `kitty` / `wezterm` / `alacritty` / `tmux`
-/// / `vscode` / `cursor`）；找不到（或非 unix）返回 `None`。
+/// / `vscode` / `cursor`）；找不到返回 `None`。
 ///
 /// 供 Agent 状态窗口「聚焦终端」按钮**按支持度显隐**：前端仅对已支持的终端（v1 = `apple-terminal`）
 /// 展示按钮。tmux 在外层终端之前命中（pane 与外层 Tab 不是同一个，单纯聚焦外层 Tab 不准），故视为
@@ -230,6 +337,9 @@ fn terminal_of_entry(e: &ProcEntry) -> Option<&'static str> {
     }
     if s.contains("iterm.app/") || s.contains("iterm2") {
         return Some("iterm2");
+    }
+    if s.contains("windowsterminal.exe") || s.contains("windows terminal") {
+        return Some("windows-terminal");
     }
     if s.contains("ghostty") {
         return Some("ghostty");
@@ -272,12 +382,34 @@ pub fn pid_alive(pid: u32) -> bool {
     )
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return false;
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+    }
+    let mut exit_code = 0u32;
+    let ok = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0;
+    unsafe {
+        CloseHandle(process);
+    }
+    ok && exit_code == STILL_ACTIVE as u32
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn pid_alive(_pid: u32) -> bool {
     false
 }
 
-// ── 进程链回溯（unix：调用 `ps`；非 unix：空） ──
+// ── Process ancestry (Unix: ps; Windows: Toolhelp + native process queries) ──
 
 #[cfg(unix)]
 fn process_chain(start_pid: u32) -> Vec<ProcEntry> {
@@ -303,7 +435,215 @@ fn process_chain(start_pid: u32) -> Vec<ProcEntry> {
     chain
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_chain(start_pid: u32) -> Vec<ProcEntry> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let mut table = HashMap::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        let end = entry
+            .szExeFile
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+        table.insert(entry.th32ProcessID, (entry.th32ParentProcessID, name));
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut pid = start_pid;
+    while pid > 0 && seen.insert(pid) {
+        let Some((ppid, name)) = table.get(&pid).cloned() else {
+            break;
+        };
+        let native = inspect_process_windows_with_parent(pid, ppid);
+        let comm = native
+            .as_ref()
+            .and_then(|process| process.executable.clone())
+            .unwrap_or_else(|| name.clone());
+        let command = native
+            .and_then(|process| process.command_line)
+            .unwrap_or(name);
+        chain.push(ProcEntry {
+            pid,
+            ppid,
+            comm,
+            command,
+        });
+        pid = ppid;
+    }
+    chain
+}
+
+#[cfg(windows)]
+fn inspect_process_windows(pid: u32) -> Option<ProcessIdentity> {
+    inspect_process_windows_with_parent(pid, toolhelp_parent_pid(pid)?)
+}
+
+#[cfg(windows)]
+fn inspect_process_windows_with_parent(pid: u32, parent_pid: u32) -> Option<ProcessIdentity> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let executable = query_process_image(process);
+    let command_line = query_process_command_line(process);
+    let mut session_id = 0u32;
+    let session_id =
+        (unsafe { ProcessIdToSessionId(pid, &mut session_id) } != 0).then_some(session_id);
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let creation_time =
+        (unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) }
+            != 0)
+            .then_some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64);
+    unsafe {
+        CloseHandle(process);
+    }
+
+    Some(ProcessIdentity {
+        pid,
+        parent_pid,
+        executable,
+        command_line,
+        session_id,
+        creation_time,
+    })
+}
+
+#[cfg(windows)]
+fn query_process_image(process: windows_sys::Win32::Foundation::HANDLE) -> Option<String> {
+    use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+
+    let mut buffer = vec![0u16; 32_768];
+    let mut length = buffer.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) } == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buffer[..length as usize]))
+}
+
+#[cfg(windows)]
+fn query_process_command_line(process: windows_sys::Win32::Foundation::HANDLE) -> Option<String> {
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *const u16,
+    }
+
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(
+            process_handle: windows_sys::Win32::Foundation::HANDLE,
+            process_information_class: u32,
+            process_information: *mut std::ffi::c_void,
+            process_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+
+    const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+    let mut required = 0u32;
+    unsafe {
+        NtQueryInformationProcess(
+            process,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut required,
+        );
+    }
+    if required < std::mem::size_of::<UnicodeString>() as u32 {
+        return None;
+    }
+    let mut storage = vec![0u8; required as usize];
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            storage.as_mut_ptr().cast(),
+            required,
+            &mut required,
+        )
+    };
+    if status < 0 {
+        return None;
+    }
+    let value = unsafe { &*(storage.as_ptr().cast::<UnicodeString>()) };
+    let byte_len = value.length as usize;
+    if byte_len == 0 || byte_len % 2 != 0 || value.buffer.is_null() {
+        return None;
+    }
+    let storage_start = storage.as_ptr() as usize;
+    let storage_end = storage_start.checked_add(storage.len())?;
+    let text_start = value.buffer as usize;
+    let text_end = text_start.checked_add(byte_len)?;
+    if text_start < storage_start || text_end > storage_end {
+        return None;
+    }
+    Some(String::from_utf16_lossy(unsafe {
+        std::slice::from_raw_parts(value.buffer, byte_len / 2)
+    }))
+}
+
+#[cfg(windows)]
+fn toolhelp_parent_pid(pid: u32) -> Option<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut found = None;
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        if entry.th32ProcessID == pid {
+            found = Some(entry.th32ParentProcessID);
+            break;
+        }
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    found
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_chain(_start_pid: u32) -> Vec<ProcEntry> {
     Vec::new()
 }
@@ -354,6 +694,21 @@ mod tests {
         // Cursor 兼容性会设 CLAUDE_PROJECT_DIR，但必须判成 cursor。
         let env = env_of(&[("CURSOR_AGENT", "1"), ("CLAUDE_PROJECT_DIR", "/x")]);
         assert_eq!(detect_running_agent_from(&env), Some(AgentKind::Cursor));
+    }
+
+    #[test]
+    fn detect_pi_from_native_session_environment() {
+        let env = env_of(&[
+            ("PI_CODING_AGENT", "1"),
+            ("PI_SESSION_ID", "pi-session"),
+            ("PI_SESSION_FILE", "/tmp/pi-session.jsonl"),
+            ("CLAUDE_PROJECT_DIR", "/x"),
+        ]);
+        assert_eq!(detect_running_agent_from(&env), Some(AgentKind::Pi));
+        assert_eq!(
+            session_id_from_env_map(AgentKind::Pi, &env),
+            Some("pi-session".to_string())
+        );
     }
 
     #[test]
@@ -415,6 +770,18 @@ mod tests {
     }
 
     #[test]
+    fn terminal_detection_recognizes_windows_terminal_process() {
+        let entry = ProcEntry {
+            pid: 42,
+            ppid: 1,
+            comm: r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal\WindowsTerminal.exe"
+                .to_string(),
+            command: "Windows Terminal".to_string(),
+        };
+        assert_eq!(terminal_of_entry(&entry), Some("windows-terminal"));
+    }
+
+    #[test]
     fn self_marker_excluded() {
         let e = ProcEntry {
             pid: 1,
@@ -435,7 +802,7 @@ mod tests {
 
     #[test]
     fn shared_app_server_detected_by_command_token() {
-        // 共享 app-server 守护：argv0=codex 且参数含独立令牌 app-server（unix / stdio 皆算）。
+        // 共享 app-server 守护：子命令位为 app-server（unix / stdio 皆算）。
         let unix = ProcEntry {
             pid: 52407,
             ppid: 1,
@@ -450,7 +817,7 @@ mod tests {
             command: "/Applications/Codex.app/.../codex app-server --listen stdio://".to_string(),
         };
         assert!(is_shared_app_server(&stdio));
-        // node 包装器：`node <path>/codex app-server …`——codex 后紧跟 app-server 也算。
+        // node 包装器：`node <path>/codex app-server …`——codex 后子命令 app-server 也算。
         let wrapper = ProcEntry {
             pid: 52404,
             ppid: 1,
@@ -458,6 +825,24 @@ mod tests {
             command: "node /opt/homebrew/bin/codex app-server --listen unix://".to_string(),
         };
         assert!(is_shared_app_server(&wrapper));
+        // ChatGPT / Codex Desktop：`codex -c features.…=true app-server …`——全局 -c 插在子命令前。
+        let desktop = ProcEntry {
+            pid: 98289,
+            ppid: 98175,
+            comm: "codex".to_string(),
+            command: "/Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled".to_string(),
+        };
+        assert!(is_shared_app_server(&desktop));
+        // `--config=value` 合并写法、以及布尔 flag 夹在中间。
+        let config_eq = ProcEntry {
+            pid: 1,
+            ppid: 1,
+            comm: "codex".to_string(),
+            command:
+                "codex --config=features.code_mode_host=true --analytics-default-enabled app-server"
+                    .to_string(),
+        };
+        assert!(is_shared_app_server(&config_eq));
     }
 
     #[test]
@@ -467,7 +852,11 @@ mod tests {
             "/opt/homebrew/lib/.../bin/codex",
             "codex",
             "codex resume",
-            "codex exec 用 app-server 关键词提问", // "app-server" 只是提示词里的子串，非独立子命令令牌
+            "codex exec 用 app-server 关键词提问", // "app-server" 在提示词里，子命令仍是 exec
+            // 真实 TUI：全局 flag + 用户 prompt，子命令位不是 app-server
+            "codex --dangerously-bypass-approvals-and-sandbox 帮我分析一下提交",
+            // -c 的值碰巧含 app-server 字样也不应误判（子命令缺省 / 另有子命令）
+            "codex -c foo.app-server=true resume",
         ] {
             let e = ProcEntry {
                 pid: 1,
@@ -477,6 +866,24 @@ mod tests {
             };
             assert!(!is_shared_app_server(&e), "should not flag: {cmd}");
         }
+    }
+
+    #[test]
+    fn codex_subcommand_skips_leading_options() {
+        assert_eq!(codex_subcommand(&["app-server"]), Some("app-server"));
+        assert_eq!(
+            codex_subcommand(&["-c", "features.code_mode_host=true", "app-server"]),
+            Some("app-server")
+        );
+        assert_eq!(
+            codex_subcommand(&["--config=x=y", "app-server", "--listen", "unix://"]),
+            Some("app-server")
+        );
+        assert_eq!(
+            codex_subcommand(&["exec", "用", "app-server", "提问"]),
+            Some("exec")
+        );
+        assert_eq!(codex_subcommand(&["-c", "x=y"]), None);
     }
 
     #[test]

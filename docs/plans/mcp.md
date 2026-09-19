@@ -1,7 +1,13 @@
 # 开发计划：MCP 模式支持（Codex / Claude Code / Cursor）
 
+> Windows 注（2026-08）：本文保留首期单进程回退设计；当前 Windows MCP 子进程已与 Unix 一样连接
+> shared daemon，以下回退描述仅作历史记录，当前真值见 spec 与 Windows parity plan。
+
 > 关联需求：`docs/specs/mcp.md`
 > 计划描述方案与技术 / 规则细节，具体代码以实现为准。
+> **注（2026-07-25）**：本计划中 `ask` 的输出形态（`--output json` → `AskResult` → structuredContent +
+> output schema）为首轮方案，已被 spec mcp.md D5 二轮定案推翻——现为**纯文本区块透传**（无
+> output schema / structuredContent），图片路径改从 `[files]` 区块解析。下文相关段落仅作历史记录。
 
 ## 0. 方案总览
 

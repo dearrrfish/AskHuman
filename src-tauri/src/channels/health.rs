@@ -3,7 +3,7 @@
 //! 四个平台 client 的统一请求出口（`call` 系列）失败时登记、成功时清除，daemon 的
 //! `ensure_*_router` 建连失败同样登记——覆盖建连 / 投放发送 / 卡片编辑（含 watch）全部路径，
 //! 无须在每个 `eprintln!` 点各自插桩。daemon 经 `TrayState` / `StatusInfo` 把快照带给
-//! 托盘与设置页；CLI 单进程回退里也会写本表，但无读者、进程即退，无害。
+//! 托盘与设置页；legacy in-process/test callers may also write this table without readers.
 //!
 //! 语义（用户定案）：该渠道下一次任何成功操作即清；纯内存态，daemon 重启即清。
 
@@ -90,6 +90,40 @@ pub fn snapshot() -> Vec<ChannelIssue> {
     v
 }
 
+// ===== Long-connection reconnect policy (shared by the DingTalk / Feishu / Slack routers) =====
+
+/// First retry delay after a long connection drops.
+const RECONNECT_BASE: std::time::Duration = std::time::Duration::from_millis(500);
+/// Ceiling for the exponential backoff. A daemon that lost its network keeps probing at this
+/// cadence for as long as it lives; the in-flight cards stay valid and resume once it reconnects.
+const RECONNECT_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Delay before reconnect `attempt` (0-based): 0.5 s doubling up to the 30 s cap. The routers
+/// never give up — a bounded budget used to turn every longer outage into a card falsely marked
+/// "cancelled" while the request kept waiting.
+pub fn reconnect_delay(attempt: u32) -> std::time::Duration {
+    let factor = 1u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
+    RECONNECT_BASE
+        .checked_mul(factor)
+        .map(|d| d.min(RECONNECT_CAP))
+        .unwrap_or(RECONNECT_CAP)
+}
+
+/// Whether reconnect `attempt` (0-based) deserves a log line: the first three attempts, then
+/// every tenth, so a multi-hour outage does not flood `daemon.log`.
+pub fn should_log_reconnect(attempt: u32) -> bool {
+    attempt < 3 || attempt % 10 == 0
+}
+
+/// Message recorded in the health table while a router is between connections.
+pub fn reconnecting_message(attempt: u32, error: &str) -> String {
+    format!(
+        "long connection lost; reconnecting (attempt {}): {}",
+        attempt + 1,
+        error
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +180,35 @@ mod tests {
             clear("slack");
             assert_eq!(hits.load(Ordering::SeqCst), 3);
         });
+    }
+
+    #[test]
+    fn reconnect_delay_doubles_from_half_a_second_and_caps_at_thirty_seconds() {
+        use std::time::Duration;
+        assert_eq!(reconnect_delay(0), Duration::from_millis(500));
+        assert_eq!(reconnect_delay(1), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(2), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(5), Duration::from_secs(16));
+        assert_eq!(reconnect_delay(6), Duration::from_secs(30));
+        assert_eq!(reconnect_delay(7), Duration::from_secs(30));
+        // No overflow, no panic, still capped for absurd attempt counts.
+        assert_eq!(reconnect_delay(40), Duration::from_secs(30));
+        assert_eq!(reconnect_delay(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reconnect_logging_is_front_loaded_then_sparse() {
+        assert!(should_log_reconnect(0));
+        assert!(should_log_reconnect(1));
+        assert!(should_log_reconnect(2));
+        assert!(!should_log_reconnect(3));
+        assert!(!should_log_reconnect(9));
+        assert!(should_log_reconnect(10));
+        assert!(!should_log_reconnect(11));
+        assert!(should_log_reconnect(20));
+        assert_eq!(
+            reconnecting_message(0, "tls handshake eof"),
+            "long connection lost; reconnecting (attempt 1): tls handshake eof"
+        );
     }
 }

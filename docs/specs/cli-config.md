@@ -1,6 +1,6 @@
 # CLI 配置与 Agent 集成（无 GUI / headless 场景）— 需求
 
-> 状态：已实现；后续新增 `agents stop`，其余命令面保持本文设计。
+> 状态：已实现；后续新增 `agents stop` 与 Pi Agent，核心命令面保持本文设计。
 
 ## 背景与动机
 
@@ -19,7 +19,7 @@
 4. **体检**：一屏汇总 daemon / 渠道 / 集成 的健康状态，便于 headless 排障。
 5. **headless 友好**：原本仅 GUI 的 Agent 实时状态窗口，提供文本 / JSON 输出。
 
-不在本期范围：Windows named-pipe daemon（沿用现状，无 daemon 的能力按下文降级）。
+Windows named-pipe daemon 已在平台对齐项目落地；本命令面在 macOS、Linux 与 Windows 共用同一 daemon 状态和集成模块。
 
 ## 命令总览（锁定）
 
@@ -43,11 +43,12 @@
   设置同值也等同显式更新。
 - `agents update [<agent>]` —— 更新单家或全部当前非 None / 有托管残留的整包。
 - `agents permission <claude|codex> [on|off]` —— 查询或设置独立 PermissionRequest 审批 capability。
-- `agents lifecycle <agent> [on|off]` —— 查询或设置独立生命周期追踪 capability。
-- `agents stop <claude|codex|cursor> [on|off]` —— 查询或设置自然 Stop 时的结束确认；Grok 不支持。
+- `agents lifecycle <agent> [on|off]` —— 查询或设置 active 自动集成内的生命周期追踪 capability；
+  None 下 `on` 拒绝，`off` 可记录偏好并清理残留。
+- `agents stop <claude|codex|cursor|pi> [on|off]` —— 查询或设置自然 Stop 时的结束确认；Pi 默认开，Grok 不支持。
 - `agents show [<agent>]` —— **手动集成**：打印参考提示词 + 粘贴位置 + mode/rules/timeout/
   permission/MCP/lifecycle/stop 状态。
-- agent ∈ cursor | claude | codex | grok（grok 仅 none|mcp）。旧 `install/uninstall` 和逐产物写 flags
+- agent ∈ cursor | claude | codex | grok | pi（grok 仅 none|mcp，pi 仅 none|cli 且最低 0.82.0）。旧 `install/uninstall` 和逐产物写 flags
   已移除：不得部分执行，非零退出并给 mode/update/permission/lifecycle 迁移提示。
 
 ### `AskHuman config` —— 通用键值（兜底）
@@ -69,13 +70,14 @@ daemon 是否在跑 / 各渠道（启用·配置齐全·连接）/ 各 agent 集
 - **D4 密钥输入**：脚本化用 `--<field>-env <VAR>` / `--<field>-file <path>` / `--<field>-stdin`（或值 `-`）；
   交互时隐藏输入。**不**接受密钥明文直接进 argv（避免泄漏 shell 历史 / `ps`）。
 - **D5 `config` 可设密钥键**：自动路由进钥匙串，值仍从 stdin / env 取。
-- **D6 集成写入统一为 mode 整包**：不允许用逐产物 flags 拼装半安装状态；permission 与 lifecycle 保持
-  独立 on/off。重复设置当前 mode 仍完整更新磁盘，但绝不改写 permission preference。
+- **D6 集成写入统一为 mode 整包**：不允许用逐产物 flags 拼装半安装状态；permission preference
+  独立保存；lifecycle 也保留 per-Agent on/off 偏好，但实际产物由 active mode 拥有，None 必须卸载。
+  重复设置当前 mode 仍完整更新磁盘，但尊重显式 capability 偏好。
 - **D7 纳入**：`channel detect`、`doctor`、所有列表 / 状态 / 体检的 `--json`。
 - **D8 改名**：原 `agents status`（GUI 状态窗口）→ `agents monitor`，并增加文本 / `--json`。
 - **D9 每个子命令都要有 `help`** 引导配置。
 - **D10 本地化**：所有面向用户输出复用现有 i18n（中 / 英）。
-- **D11 跨平台**：全平台可用；依赖 daemon 的能力（`test` 部分、`detect`、`monitor` 窗口、连接状态）在无 daemon 平台（当前 Windows）降级并给提示。
+- **D11 跨平台**：macOS、Linux 与 Windows 全部可用；`test`、`detect`、`monitor` 与连接状态均查询 shared daemon，Windows 使用 named pipe，不维护单独降级语义。
 
 ## 反馈意见
 

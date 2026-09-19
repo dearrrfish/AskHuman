@@ -63,7 +63,6 @@ enum ParseOutcome {
     Popup(Box<ParsedPermission>),
 }
 
-#[cfg(unix)]
 pub fn run(agent: Option<&str>) -> Option<String> {
     let agent = Agent::parse(agent)?;
     let mut bytes = Vec::new();
@@ -136,6 +135,13 @@ fn parse_permission(agent: Agent, input: &Value) -> Option<ParseOutcome> {
     let cwd = required_string(object, "cwd", 8_192)?;
     let permission_mode = required_string(object, "permission_mode", 128)?;
     let tool_name = required_string(object, "tool_name", 512)?;
+    // Claude's built-in question tool asks the human something; it never touches their machine, so
+    // an approval card is pure noise (spec claude-ask-user-question D2). Stay out of the way
+    // entirely — a bare `allow` does not satisfy the tool's interaction requirement, and the
+    // takeover, when enabled, happens earlier in PreToolUse.
+    if agent == Agent::Claude && tool_name == "AskUserQuestion" {
+        return None;
+    }
     let tool_input = object.get("tool_input")?.clone();
     if serde_json::to_vec(&tool_input).ok()?.len() > MAX_TOOL_INPUT_BYTES {
         return None;
@@ -215,6 +221,7 @@ fn parse_permission(agent: Agent, input: &Value) -> Option<ParseOutcome> {
         label: if zh { "允许" } else { "Allow" }.into(),
         description: String::new(),
         role: ActionRole::Primary,
+        variant: None,
     }];
     let mut suggestions = Vec::new();
     let mut omitted = 0usize;
@@ -242,10 +249,11 @@ fn parse_permission(agent: Agent, input: &Value) -> Option<ParseOutcome> {
                 label,
                 description,
                 role: ActionRole::Default,
+                variant: None,
             });
         }
     }
-    let memory = match memory_layer {
+    let mut memory = match memory_layer {
         MemoryLayer::Enhanced {
             memory,
             extra_choices,
@@ -255,11 +263,50 @@ fn parse_permission(agent: Agent, input: &Value) -> Option<ParseOutcome> {
         }
         _ => None,
     };
+    // YOLO session opt-in (D53): every Codex permission popup — dangerous commands and
+    // Basic (no memory enhancement) popups included — carries the choice. Once saved,
+    // the daemon auto-allows all further requests of this session, so an active grant
+    // never re-renders this choice. Off-switches: settings panel / IM `/yolo`.
+    if agent == Agent::Codex {
+        choices.push(ConfirmChoice {
+            id: crate::permission_memory::ACTION_YOLO.into(),
+            label: if zh {
+                "本对话开启 YOLO 模式：自动允许一切".into()
+            } else {
+                "YOLO mode this conversation: auto-allow everything".into()
+            },
+            description: if zh {
+                "本对话所有权限请求（含危险命令）自动放行 · 设置面板或 IM 发 /yolo 可关闭".into()
+            } else {
+                "Every permission request of this conversation (dangerous commands included) \
+                 auto-allows · turn off in settings or via /yolo in IM"
+                    .into()
+            },
+            role: ActionRole::Destructive,
+            variant: None,
+        });
+        let save = crate::permission_rules::MemorySave {
+            action_id: crate::permission_memory::ACTION_YOLO.into(),
+            namespace: crate::permission_rules::RuleNamespace::Session,
+            rules: vec![crate::permission_rules::RuleKey::Yolo],
+            native: None,
+        };
+        match memory.as_mut() {
+            Some(memory) => memory.saves.push(save),
+            None => {
+                memory = Some(crate::permission_rules::PermissionMemory {
+                    query: None,
+                    saves: vec![save],
+                });
+            }
+        }
+    }
     choices.push(ConfirmChoice {
         id: "deny".into(),
         label: if zh { "拒绝" } else { "Deny" }.into(),
         description: String::new(),
         role: ActionRole::Destructive,
+        variant: None,
     });
 
     let mut body_md = body;
@@ -287,6 +334,9 @@ fn parse_permission(agent: Agent, input: &Value) -> Option<ParseOutcome> {
             input: Some(ConfirmInput {
                 id: "reason".into(),
                 visible_when_action_id: "deny".into(),
+                always_visible: false,
+                required: false,
+                prefix_chars_by_action_id: Default::default(),
                 label: if zh {
                     "拒绝原因（可选）"
                 } else {
@@ -482,14 +532,10 @@ fn decision_output(parsed: &ParsedPermission, result: &ConfirmResult) -> Option<
         "approve_once" => {
             decision.insert("behavior".into(), json!("allow"));
         }
-        // Daemon answered from stored shadow rules without any surface (memory auto-allow).
-        crate::permission_rules::AUTO_ALLOW_ACTION_ID
-            if parsed
-                .task
-                .memory
-                .as_ref()
-                .is_some_and(|memory| memory.query.is_some()) =>
-        {
+        // Daemon answered from stored shadow rules without any surface: memory auto-allow
+        // (query hit) or a session-wide mode (relaxed D52 / yolo D53, the latter needing
+        // no query — any task carrying memory metadata may be answered this way).
+        crate::permission_rules::AUTO_ALLOW_ACTION_ID if parsed.task.memory.is_some() => {
             decision.insert("behavior".into(), json!("allow"));
         }
         // A remember choice: the daemon has already persisted (or degraded) the rules; the
@@ -570,6 +616,17 @@ mod tests {
     }
 
     /// Test view of parse_permission for the popup path.
+    #[test]
+    fn claudes_own_question_tool_never_becomes_an_approval_card() {
+        let mut value = input(Agent::Claude);
+        value["tool_name"] = json!("AskUserQuestion");
+        value["tool_input"] = json!({
+            "questions": [{ "question": "Which framework?", "options": [{ "label": "React" }] }]
+        });
+        // Not even an auto-allow: we stay out of the way entirely (spec D2).
+        assert!(parse_permission(Agent::Claude, &value).is_none());
+    }
+
     fn parse_popup(agent: Agent, input: &Value) -> Option<ParsedPermission> {
         match parse_permission(agent, input)? {
             ParseOutcome::Popup(parsed) => Some(*parsed),
@@ -749,6 +806,75 @@ mod tests {
                 ["ruleContent"],
             format!("echo {}", MAX_SUGGESTIONS - 1)
         );
+    }
+
+    #[test]
+    fn codex_popups_carry_yolo_choice_and_claude_does_not() {
+        // Codex (Basic layer here: no transcript → no memory enhancement) still gets the
+        // YOLO opt-in right before deny, with a session Yolo save behind it (D53).
+        let parsed = parse_popup(Agent::Codex, &input(Agent::Codex)).unwrap();
+        let choices = &parsed.task.spec.choices;
+        assert_eq!(
+            choices[choices.len() - 2].id,
+            crate::permission_memory::ACTION_YOLO
+        );
+        assert_eq!(choices.last().unwrap().id, "deny");
+        let memory = parsed.task.memory.as_ref().unwrap();
+        assert!(memory.query.is_none());
+        let save = memory
+            .saves
+            .iter()
+            .find(|save| save.action_id == crate::permission_memory::ACTION_YOLO)
+            .unwrap();
+        assert_eq!(save.rules, vec![crate::permission_rules::RuleKey::Yolo]);
+        assert!(save.native.is_none());
+        // Choosing it maps to allow (rules persist daemon-side, D25/D26).
+        let output = decision_output(
+            &parsed,
+            &result(crate::permission_memory::ACTION_YOLO, None),
+        )
+        .unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+        // Claude keeps its native path: no YOLO choice, no memory.
+        let claude = parse_popup(Agent::Claude, &input(Agent::Claude)).unwrap();
+        assert!(claude
+            .task
+            .spec
+            .choices
+            .iter()
+            .all(|choice| choice.id != crate::permission_memory::ACTION_YOLO));
+        assert!(claude.task.memory.is_none());
+    }
+
+    #[test]
+    fn auto_allow_action_is_accepted_without_a_query() {
+        // YOLO auto-allow (D53) answers tasks whose memory carries no query (e.g. dangerous
+        // command popups); the hook must map it to allow.
+        let parsed = parse_popup(Agent::Codex, &input(Agent::Codex)).unwrap();
+        assert!(parsed
+            .task
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.query.is_none()));
+        let output = decision_output(
+            &parsed,
+            &result(crate::permission_rules::AUTO_ALLOW_ACTION_ID, None),
+        )
+        .unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+        // Claude tasks carry no memory: the auto-allow action stays rejected.
+        let claude = parse_popup(Agent::Claude, &input(Agent::Claude)).unwrap();
+        assert!(decision_output(
+            &claude,
+            &result(crate::permission_rules::AUTO_ALLOW_ACTION_ID, None)
+        )
+        .is_none());
     }
 
     #[test]

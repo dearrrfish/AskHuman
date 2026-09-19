@@ -48,17 +48,9 @@ pub fn run(args: &[String]) {
         return;
     }
     // 不在 hook 侧 walk 进程树（~280ms），改发 ppid 给 daemon 缓存解析。
-    let hint_pid = {
-        #[cfg(unix)]
-        {
-            Some(unsafe { libc::getppid() } as u32)
-        }
-        #[cfg(not(unix))]
-        {
-            None::<u32>
-        }
-    };
+    let hint_pid = detect::parent_pid(std::process::id());
     let cwd = resolve_cwd(&env, stdin.as_ref());
+    let transcript_path = resolve_transcript_path(&env, stdin.as_ref());
     let launch_id = env
         .get(crate::integrations::agent_launch::LAUNCH_ID_ENV)
         .cloned();
@@ -88,6 +80,7 @@ pub fn run(args: &[String]) {
         pid: None,
         hint_pid,
         cwd,
+        transcript_path,
         launch_id,
         prompt_sha256,
         ts: 0,
@@ -95,10 +88,10 @@ pub fn run(args: &[String]) {
         interject_poll,
     };
     if interject_poll {
-        if let crate::client::InterjectPollOutcome::Deny(text) =
+        if let crate::client::InterjectPollOutcome::Deny { text, attachments } =
             crate::client::report_agent_event_with_poll(msg)
         {
-            print_deny_json(intended, &text);
+            print_deny_json(intended, &text, &attachments);
         }
     } else {
         crate::client::report_agent_event(msg);
@@ -122,7 +115,7 @@ pub(super) fn report_simple_event(
     if session_id.trim().is_empty() {
         return;
     }
-    let hint_pid = Some(unsafe { libc::getppid() } as u32);
+    let hint_pid = detect::parent_pid(std::process::id());
     crate::client::report_agent_event(ClientMsg::AgentEvent {
         agent: intended.as_str().to_string(),
         event: event.as_str().to_string(),
@@ -130,6 +123,9 @@ pub(super) fn report_simple_event(
         pid: None,
         hint_pid,
         cwd,
+        transcript_path: std::env::var("PI_SESSION_FILE")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
         launch_id: std::env::var(crate::integrations::agent_launch::LAUNCH_ID_ENV).ok(),
         prompt_sha256: None,
         ts: 0,
@@ -149,8 +145,8 @@ fn initial_prompt(value: Option<&Value>) -> Option<&str> {
 
 /// 输出各家 PreToolUse 的 deny JSON（stdout，随后调用方 exit 0；spec agent-interject D3）。
 /// 消息经 `prompts::interject_deny_reason` 包装（`[USER INTERJECTION]` 协议文案）。
-fn print_deny_json(kind: AgentKind, message: &str) {
-    let json = deny_json(kind, message);
+fn print_deny_json(kind: AgentKind, message: &str, attachments: &[crate::models::FileAttachment]) {
+    let json = deny_json(kind, message, attachments);
     println!("{json}");
 }
 
@@ -160,13 +156,21 @@ fn print_deny_json(kind: AgentKind, message: &str) {
 /// 取自 `user_message`**（`agent_message` 仅透传 protobuf、未见进模型的消费点，与官方文档
 /// 「fed back to the agent」不符）；两字段都放完整协议文本，兼容未来 Cursor 按文档语义改用
 /// `agent_message`。代价：UI 拦截提示显示整段协议文本（内含用户原话），可接受。
-fn deny_json(kind: AgentKind, message: &str) -> Value {
-    let reason = crate::prompts::interject_deny_reason(message);
+fn deny_json(
+    kind: AgentKind,
+    message: &str,
+    attachments: &[crate::models::FileAttachment],
+) -> Value {
+    let reason = crate::prompts::interject_deny_reason(message, attachments);
     match kind {
         AgentKind::Cursor => serde_json::json!({
             "permission": "deny",
             "agent_message": reason.clone(),
             "user_message": reason,
+        }),
+        AgentKind::Pi => serde_json::json!({
+            "block": true,
+            "reason": reason,
         }),
         // Claude / Codex（Grok 不会走到：上游已排除）。
         _ => serde_json::json!({
@@ -243,7 +247,7 @@ fn detect_phase(v: &Value) -> Option<ToolPhase> {
 }
 
 /// 取工具名（各家字段兼容）。
-fn tool_name(v: &Value) -> Option<String> {
+pub(super) fn tool_name(v: &Value) -> Option<String> {
     for k in ["tool_name", "toolName", "tool"] {
         if let Some(s) = v.get(k).and_then(|x| x.as_str()) {
             let s = s.trim();
@@ -256,7 +260,7 @@ fn tool_name(v: &Value) -> Option<String> {
 }
 
 /// 取工具输入（对象或原始 JSON 字符串，`classify_tool` 内部再 `parse_args`）。
-fn tool_input(v: &Value) -> Option<Value> {
+pub(super) fn tool_input(v: &Value) -> Option<Value> {
     for k in ["tool_input", "toolInput", "input", "arguments"] {
         if let Some(x) = v.get(k) {
             if !x.is_null() {
@@ -297,7 +301,7 @@ pub(super) fn resolve_session_id(
 }
 
 /// 解析工作目录：stdin JSON `cwd` → env 工程目录 → 当前目录。
-pub(super) fn resolve_cwd(env: &HashMap<String, String>, stdin: Option<&Value>) -> Option<String> {
+pub(crate) fn resolve_cwd(env: &HashMap<String, String>, stdin: Option<&Value>) -> Option<String> {
     if let Some(v) = stdin {
         if let Some(s) = v.get("cwd").and_then(|x| x.as_str()) {
             if !s.trim().is_empty() {
@@ -319,6 +323,29 @@ pub(super) fn resolve_cwd(env: &HashMap<String, String>, stdin: Option<&Value>) 
     std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string())
+}
+
+fn resolve_transcript_path(env: &HashMap<String, String>, stdin: Option<&Value>) -> Option<String> {
+    if let Some(value) = env
+        .get("PI_SESSION_FILE")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value.to_string());
+    }
+    let value = stdin?;
+    [
+        "transcript_path",
+        "transcriptPath",
+        "session_file",
+        "sessionFile",
+    ]
+    .into_iter()
+    .find_map(|key| value.get(key).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_string)
 }
 
 /// Read JSON delivered to a hook over stdin.
@@ -401,6 +428,8 @@ struct HookInputSummary {
     #[serde(default, rename = "hookEventName")]
     hook_event_name_camel: Option<String>,
     #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
     tool_name: Option<String>,
     #[serde(default, rename = "toolName")]
     tool_name_camel: Option<String>,
@@ -456,6 +485,7 @@ impl HookInputSummary {
             "hook_event_name",
             self.hook_event_name.or(self.hook_event_name_camel),
         );
+        insert_summary_string(&mut map, "source", self.source);
         insert_summary_string(
             &mut map,
             "tool_name",
@@ -479,6 +509,7 @@ impl HookInputSummary {
         .any(|field| field.is_some())
         {
             map.insert("tool_input".to_string(), Value::Object(Default::default()));
+            map.insert("toolInputTruncated".to_string(), Value::Bool(true));
         }
         if [
             self.tool_response,
@@ -643,7 +674,7 @@ mod tests {
     #[test]
     fn deny_json_claude_codex_shape() {
         for kind in [AgentKind::Claude, AgentKind::Codex] {
-            let v = deny_json(kind, "改用方案 B");
+            let v = deny_json(kind, "改用方案 B", &[]);
             let out = &v["hookSpecificOutput"];
             assert_eq!(out["hookEventName"], "PreToolUse");
             assert_eq!(out["permissionDecision"], "deny");
@@ -656,7 +687,7 @@ mod tests {
 
     #[test]
     fn deny_json_cursor_shape() {
-        let v = deny_json(AgentKind::Cursor, "停一下");
+        let v = deny_json(AgentKind::Cursor, "停一下", &[]);
         assert_eq!(v["permission"], "deny");
         // live 实测：Cursor 喂回模型的拒绝理由取自 user_message（agent_message 未见消费）——
         // 两字段须同为完整协议文本，缺一即丢话。
@@ -668,5 +699,15 @@ mod tests {
             v.get("hookSpecificOutput").is_none(),
             "不应混入 Claude 字段"
         );
+    }
+
+    #[test]
+    fn deny_json_pi_extension_shape() {
+        let value = deny_json(AgentKind::Pi, "change direction", &[]);
+        assert_eq!(value["block"], true);
+        let reason = value["reason"].as_str().unwrap();
+        assert!(reason.starts_with("[USER INTERJECTION]"));
+        assert!(reason.contains("change direction"));
+        assert!(value.get("hookSpecificOutput").is_none());
     }
 }

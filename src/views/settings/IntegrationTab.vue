@@ -17,12 +17,16 @@ const {
   saveCustomCollaborationText,
   AGENTS,
   modes,
+  integrationLoading,
+  piVersionLoading,
   modeBusy,
   modeMessage,
   modeError,
   setMode,
   togglePermission,
+  toggleLifecycle,
   toggleStop,
+  toggleAskQuestion,
   permissionBlockedText,
   updateArtifact,
   updateSummary,
@@ -124,6 +128,7 @@ const {
   <div class="integration-manual">
   <!-- 手动集成：参考提示词（CLI / MCP 双版本 + MCP 配置示例） -->
   <p class="section-title">{{ t("settings.integration.manualTitle") }}</p>
+  <p class="section-intro">{{ t("settings.integration.manualLifecycleHint") }}</p>
   <div class="card">
     <div class="row">
       <p class="card-title">{{ t("settings.integration.promptTitle") }}</p>
@@ -206,6 +211,12 @@ const {
   <!-- 自动集成：每个 Agent 一张卡，CLI | MCP | 未集成 三态切换 -->
   <p class="section-title">{{ t("settings.integration.autoTitle") }}</p>
 
+  <div v-if="integrationLoading" class="card settings-section-loading">
+    <span class="permission-state-spinner" aria-hidden="true"></span>
+    <p>{{ t("common.loading") }}</p>
+  </div>
+
+  <template v-else>
   <!-- 待更新总览（跨所有 Agent）：有任意产物过期/缺失时出现，附「全部更新」按钮 -->
   <div v-if="updateSummary.total > 0" class="card update-overview">
     <div class="row">
@@ -272,6 +283,7 @@ const {
           }}</span>
         </button>
         <button
+          v-if="a.hasMcp"
           type="button"
           class="seg"
           :class="{ active: modes[a.id].mode === 'mcp' }"
@@ -295,8 +307,49 @@ const {
       </div>
     </div>
 
+    <div
+      v-if="modes[a.id].mode === 'none' && modes[a.id].lifecycle.cleanupRequired"
+      :id="`lifecycle-${a.id}`"
+      class="result err lifecycle-cleanup row"
+      :class="{ 'settings-target-highlight': settingsTargetHighlight === `lifecycle-${a.id}` }"
+    >
+      <span>{{ t("settings.integration.lifecycleCleanupHint") }}</span>
+      <span class="spacer"></span>
+      <button
+        class="btn btn-update"
+        type="button"
+        :disabled="modeBusy[a.id]"
+        @click="updateArtifact(a.id, 'hook')"
+      >
+        {{ t("settings.integration.update") }}
+      </button>
+    </div>
+
     <template v-if="modes[a.id].mode !== 'none'">
       <hr class="divider" />
+
+      <p
+        v-if="a.id === 'pi' && piVersionLoading"
+        class="card-desc settings-inline-loading"
+      >
+        <span class="permission-state-spinner" aria-hidden="true"></span>
+        {{ t("common.loading") }}
+      </p>
+      <p
+        v-else-if="a.id === 'pi' && !modes[a.id].versionSupported"
+        class="result err"
+      >
+        {{
+          modes[a.id].agentVersion
+            ? t("settings.integration.piVersionUnsupported", {
+                version: modes[a.id].agentVersion,
+                minimum: modes[a.id].minimumVersion,
+              })
+            : t("settings.integration.piVersionMissing", {
+                minimum: modes[a.id].minimumVersion,
+              })
+        }}
+      </p>
 
       <!-- Rules / Skill（CLI / MCP 共有；Grok 为 skill） -->
       <div class="row agent-row">
@@ -369,7 +422,9 @@ const {
         <template v-if="a.hasTimeoutHook">
           <div class="row agent-row">
             <span class="label">{{
-              t("settings.integration.hookLabel")
+              modes[a.id].runtimeArtifactKind === "extension"
+                ? t("settings.integration.extensionLabel")
+                : t("settings.integration.hookLabel")
             }}</span>
             <span class="badge">
               <span
@@ -384,7 +439,7 @@ const {
             </span>
             <span class="spacer"></span>
             <button
-              v-if="modes[a.id].timeoutHookNeedsUpdate"
+              v-if="modes[a.id].hookNeedsUpdate && !modes[a.id].lifecycle.needsUpdate"
               class="btn btn-update"
               type="button"
               :disabled="modeBusy[a.id]"
@@ -420,22 +475,55 @@ const {
             </div>
           </div>
           <p class="card-desc agent-hint">
-            {{ t("settings.integration.hookShort") }}
+            {{
+              modes[a.id].runtimeArtifactKind === "extension"
+                ? t("settings.integration.piExtensionHint")
+                : t("settings.integration.hookShort")
+            }}
           </p>
           <p
             v-if="!modes[a.id].timeoutHookSupported"
             class="result err"
           >
-            {{ t("settings.integration.windowsUnsupported") }}
+            {{ t("settings.integration.hookUnsupported") }}
           </p>
         </template>
-        <p v-else class="card-desc agent-hint">
-          {{ t("settings.integration.codexNoHook") }}
-        </p>
+        <template v-else>
+          <div class="row agent-row">
+            <span class="label">{{
+              t("settings.integration.contextRecoveryHookLabel")
+            }}</span>
+            <span class="badge">
+              <span
+                class="dot"
+                :class="modes[a.id].recoveryHookInstalled ? 'on' : 'off'"
+              ></span>
+              {{
+                modes[a.id].recoveryHookInstalled
+                  ? t("settings.integration.installed")
+                  : t("settings.integration.notInstalled")
+              }}
+            </span>
+            <span class="spacer"></span>
+            <button
+              v-if="modes[a.id].hookNeedsUpdate && !modes[a.id].lifecycle.needsUpdate"
+              class="btn btn-update"
+              type="button"
+              :disabled="modeBusy[a.id]"
+              @click="updateArtifact(a.id, 'hook')"
+            >
+              <span class="dot-update"></span
+              >{{ t("settings.integration.update") }}
+            </button>
+          </div>
+          <p class="card-desc agent-hint">
+            {{ t("settings.integration.codexRecoveryHookHint") }}
+          </p>
+        </template>
       </template>
 
       <!-- MCP 模式：MCP 配置 -->
-      <template v-if="modes[a.id].mode === 'mcp'">
+      <template v-if="modes[a.id].mode === 'mcp' && modes[a.id].mcpSupported">
         <hr class="divider" />
         <div class="row agent-row">
           <span class="label">{{
@@ -499,80 +587,214 @@ const {
 
     </template>
 
-    <hr class="divider" />
-    <template v-if="modes[a.id].stop.supported">
-      <div class="row agent-row">
-        <span class="label">{{ t("settings.integration.stopTitle") }}</span>
-        <span class="badge">
-          <span
-            class="dot"
-            :class="modes[a.id].stop.installed ? 'on' : 'off'"
-          ></span>
-          {{
-            modes[a.id].stop.installed
-              ? t("settings.integration.configured")
-              : t("settings.integration.notConfigured")
-          }}
-        </span>
-        <span class="spacer"></span>
-        <button
-          v-if="modes[a.id].stop.outdated"
-          class="btn btn-update"
-          type="button"
-          :disabled="modeBusy[a.id]"
-          @click="toggleStop(a.id, true)"
-        >
-          <span class="dot-update"></span>{{ t("settings.integration.update") }}
-        </button>
-        <label class="switch">
-          <input
-            type="checkbox"
-            :checked="modes[a.id].stop.enabled"
+    <template v-if="modes[a.id].mode !== 'none'">
+      <hr class="divider" />
+      <template v-if="modes[a.id].stop.supported">
+        <div class="row agent-row">
+          <span class="label">{{ t("settings.integration.stopTitle") }}</span>
+          <span class="badge">
+            <span
+              class="dot"
+              :class="modes[a.id].stop.installed ? 'on' : 'off'"
+            ></span>
+            {{
+              modes[a.id].stop.installed
+                ? t("settings.integration.configured")
+                : t("settings.integration.notConfigured")
+            }}
+          </span>
+          <span class="spacer"></span>
+          <button
+            v-if="modes[a.id].stop.outdated"
+            class="btn btn-update"
+            type="button"
             :disabled="modeBusy[a.id]"
-            @change="
-              toggleStop(
-                a.id,
-                ($event.target as HTMLInputElement).checked
-              )
-            "
-          />
-          <span class="track"></span>
-        </label>
-      </div>
-      <p class="card-desc agent-hint">
-        {{ t("settings.integration.stopHint") }}
+            @click="toggleStop(a.id, true)"
+          >
+            <span class="dot-update"></span
+            >{{ t("settings.integration.update") }}
+          </button>
+          <label class="switch">
+            <input
+              type="checkbox"
+              :checked="modes[a.id].stop.enabled"
+              :disabled="modeBusy[a.id]"
+              @change="
+                toggleStop(
+                  a.id,
+                  ($event.target as HTMLInputElement).checked
+                )
+              "
+            />
+            <span class="track"></span>
+          </label>
+        </div>
+        <p class="card-desc agent-hint">
+          {{ t("settings.integration.stopHint") }}
+        </p>
+        <p
+          v-if="modes[a.id].stop.otherHandlersDetected"
+          class="result err"
+        >
+          {{ t("settings.integration.stopCoexist") }}
+        </p>
+      </template>
+      <p v-else class="card-desc agent-hint">
+        {{ t("settings.integration.stopUnsupported") }}
       </p>
-      <p
-        v-if="modes[a.id].stop.otherHandlersDetected"
-        class="result err"
-      >
-        {{ t("settings.integration.stopCoexist") }}
-      </p>
-    </template>
-    <p v-else class="card-desc agent-hint">
-      {{ t("settings.integration.stopUnsupported") }}
-    </p>
 
-    <hr class="divider" />
-    <template v-if="modes[a.id].permission.supported">
-      <div class="row agent-row">
-        <span class="label">{{
-          t("settings.integration.permissionTitle")
-        }}</span>
+      <!-- 接管 Claude 内置的 AskUserQuestion（仅 Claude Code 有这个工具） -->
+      <template v-if="modes[a.id].askQuestion.supported">
+        <hr class="divider" />
+        <div class="row agent-row">
+          <span class="label">{{
+            t("settings.integration.askQuestionTitle")
+          }}</span>
+          <span class="badge">
+            <span
+              class="dot"
+              :class="modes[a.id].askQuestion.installed ? 'on' : 'off'"
+            ></span>
+            {{
+              modes[a.id].askQuestion.installed
+                ? t("settings.integration.configured")
+                : t("settings.integration.notConfigured")
+            }}
+          </span>
+          <span class="spacer"></span>
+          <button
+            v-if="modes[a.id].askQuestion.outdated"
+            class="btn btn-update"
+            type="button"
+            :disabled="modeBusy[a.id]"
+            @click="toggleAskQuestion(a.id, true)"
+          >
+            <span class="dot-update"></span
+            >{{ t("settings.integration.update") }}
+          </button>
+          <label class="switch">
+            <input
+              type="checkbox"
+              :checked="modes[a.id].askQuestion.enabled"
+              :disabled="modeBusy[a.id]"
+              @change="
+                toggleAskQuestion(
+                  a.id,
+                  ($event.target as HTMLInputElement).checked
+                )
+              "
+            />
+            <span class="track"></span>
+          </label>
+        </div>
+        <p class="card-desc agent-hint">
+          {{ t("settings.integration.askQuestionHint") }}
+        </p>
+      </template>
+
+      <hr class="divider" />
+      <template v-if="modes[a.id].permission.supported">
+        <div class="row agent-row">
+          <span class="label">{{
+            t("settings.integration.permissionTitle")
+          }}</span>
+          <span class="badge">
+            <span
+              class="dot"
+              :class="modes[a.id].permission.configured ? 'on' : 'off'"
+            ></span>
+            {{
+              modes[a.id].permission.configured
+                ? t("settings.integration.configured")
+                : t("settings.integration.notConfigured")
+            }}
+          </span>
+          <span class="spacer"></span>
+          <button
+            v-if="modes[a.id].permissionNeedsUpdate"
+            class="btn btn-update"
+            type="button"
+            :disabled="modeBusy[a.id]"
+            @click="updateArtifact(a.id, 'hook')"
+          >
+            <span class="dot-update"></span
+            >{{ t("settings.integration.update") }}
+          </button>
+          <label class="switch">
+            <input
+              type="checkbox"
+              :checked="modes[a.id].permission.enabled"
+              :disabled="modeBusy[a.id]"
+              @change="
+                togglePermission(
+                  a.id,
+                  ($event.target as HTMLInputElement).checked
+                )
+              "
+            />
+            <span class="track"></span>
+          </label>
+        </div>
+        <p class="card-desc agent-hint">
+          {{
+            a.id === 'claude'
+              ? t("settings.integration.permissionClaudeHint")
+              : t("settings.integration.permissionCodexHint")
+          }}
+        </p>
+        <p class="card-desc agent-hint">
+          {{ t("settings.integration.permissionInflightHint") }}
+        </p>
+        <p
+          v-if="modes[a.id].permission.knownBlockedReason"
+          class="result err"
+        >
+          {{
+            permissionBlockedText(
+              modes[a.id].permission.knownBlockedReason as string
+            )
+          }}
+        </p>
+        <p
+          v-if="modes[a.id].permission.otherHandlersDetected"
+          class="result err"
+        >
+          {{
+            a.id === 'claude'
+              ? t("settings.integration.permissionClaudeCoexist")
+              : t("settings.integration.permissionCodexCoexist")
+          }}
+        </p>
+      </template>
+      <p v-else class="card-desc agent-hint">
+        {{
+          a.id === 'pi'
+            ? t("settings.integration.piPermissionUnsupported")
+            : t("settings.integration.permissionUnsupported")
+        }}
+      </p>
+
+      <hr class="divider" />
+      <div
+        :id="`lifecycle-${a.id}`"
+        class="row agent-row readiness-target-row"
+        :class="{ 'settings-target-highlight': settingsTargetHighlight === `lifecycle-${a.id}` }"
+      >
+        <span class="label">{{ t("settings.integration.lifecycleTitle") }}</span>
         <span class="badge">
           <span
             class="dot"
-            :class="modes[a.id].permission.configured ? 'on' : 'off'"
+            :class="modes[a.id].lifecycle.installed ? 'on' : 'off'"
           ></span>
           {{
-            modes[a.id].permission.configured
+            modes[a.id].lifecycle.installed
               ? t("settings.integration.configured")
               : t("settings.integration.notConfigured")
           }}
         </span>
         <span class="spacer"></span>
         <button
-          v-if="modes[a.id].permissionNeedsUpdate"
+          v-if="modes[a.id].lifecycle.needsUpdate"
           class="btn btn-update"
           type="button"
           :disabled="modeBusy[a.id]"
@@ -584,10 +806,10 @@ const {
         <label class="switch">
           <input
             type="checkbox"
-            :checked="modes[a.id].permission.enabled"
-            :disabled="modeBusy[a.id]"
+            :checked="modes[a.id].lifecycle.enabled"
+            :disabled="modeBusy[a.id] || !modes[a.id].lifecycle.supported"
             @change="
-              togglePermission(
+              toggleLifecycle(
                 a.id,
                 ($event.target as HTMLInputElement).checked
               )
@@ -597,44 +819,9 @@ const {
         </label>
       </div>
       <p class="card-desc agent-hint">
-        {{
-          a.id === 'claude'
-            ? t("settings.integration.permissionClaudeHint")
-            : t("settings.integration.permissionCodexHint")
-        }}
-      </p>
-      <p class="card-desc agent-hint">
-        {{ t("settings.integration.permissionInflightHint") }}
-      </p>
-      <p
-        v-if="modes[a.id].permission.knownBlockedReason"
-        class="result err"
-      >
-        {{
-          permissionBlockedText(
-            modes[a.id].permission.knownBlockedReason as string
-          )
-        }}
-      </p>
-      <p
-        v-if="modes[a.id].permission.otherHandlersDetected"
-        class="result err"
-      >
-        {{
-          a.id === 'claude'
-            ? t("settings.integration.permissionClaudeCoexist")
-            : t("settings.integration.permissionCodexCoexist")
-        }}
+        {{ t("settings.integration.lifecycleHint") }}
       </p>
     </template>
-    <p v-else class="card-desc agent-hint">
-      {{
-        modes[a.id].permission.unsupportedReason ===
-        'windows_daemon_unsupported'
-          ? t("settings.integration.permissionWindowsUnsupported")
-          : t("settings.integration.permissionUnsupported")
-      }}
-    </p>
 
     <p
       v-if="modeMessage[a.id]"
@@ -644,5 +831,6 @@ const {
       {{ modeMessage[a.id] }}
     </p>
   </div>
+  </template>
   </div>
 </template>

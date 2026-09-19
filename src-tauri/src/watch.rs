@@ -120,6 +120,8 @@ pub struct WatchFrame {
     pub seq: u64,
     /// 家族展示名（Cursor / Claude Code / …）。
     pub kind_label: String,
+    /// Short direct-parent session id for lightweight lineage display.
+    pub forked_from: Option<String>,
     /// 会话标题（无则 None）。
     pub title: Option<String>,
     /// 项目名（cwd 末段；无则 None）。
@@ -147,6 +149,7 @@ pub fn build_frame(seq: u64, rec: Option<&Value>, waiting: bool) -> WatchFrame {
         return WatchFrame {
             seq,
             kind_label: String::new(),
+            forked_from: None,
             title: None,
             project: None,
             phase: WatchPhase::Ended,
@@ -179,12 +182,18 @@ pub fn build_frame(seq: u64, rec: Option<&Value>, waiting: bool) -> WatchFrame {
         "working" => WatchPhase::Working,
         _ => WatchPhase::Idle,
     };
+    let forked_from = rec
+        .get("forkedFromSessionId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(8).collect());
     // 已结束的会话不再读 transcript（内容定格在结束前最后一帧的签名上无意义——终态卡会展示
     // 最后已知活动；这里仍解析一次，让终态卡带上收尾内容）。
     let parts = autochannel::activity_parts(rec);
     WatchFrame {
         seq,
         kind_label,
+        forked_from,
         title,
         project,
         phase,
@@ -250,7 +259,7 @@ pub fn signature(f: &WatchFrame) -> String {
     for td in &f.todos {
         let _ = write!(s, "{:?};{}\u{1f}", td.state, td.content);
     }
-    let _ = write!(s, "|{}", f.seq);
+    let _ = write!(s, "|{}|{}", f.seq, f.forked_from.as_deref().unwrap_or(""));
     s
 }
 
@@ -292,6 +301,10 @@ pub fn state_line_text(f: &WatchFrame, _now: u64, lang: Lang) -> String {
                     .replace("{t}", &fmt_duration(elapsed, lang)),
             );
         }
+    }
+    if let Some(parent) = f.forked_from.as_deref() {
+        state_line.push_str(" · ");
+        state_line.push_str(&i18n::tr(lang, "watch.forkedFrom").replace("{id}", parent));
     }
     state_line
 }
@@ -466,37 +479,11 @@ pub fn fmt_duration(secs: u64, lang: Lang) -> String {
 }
 
 /// 本地时区绝对时刻：与 `now` 同日 → `HH:MM:SS`；跨日 → `MM-DD HH:MM`。
-#[cfg(unix)]
 pub fn fmt_local_time(epoch: u64, now: u64) -> String {
-    fn local_tm(t: u64) -> Option<libc::tm> {
-        let secs = t as libc::time_t;
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        let ok = unsafe { !libc::localtime_r(&secs, &mut tm).is_null() };
-        ok.then_some(tm)
-    }
-    let (Some(tm), Some(tm_now)) = (local_tm(epoch), local_tm(now)) else {
-        return fmt_utc_time(epoch, now);
-    };
-    if tm.tm_year == tm_now.tm_year && tm.tm_yday == tm_now.tm_yday {
-        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
-    } else {
-        format!(
-            "{:02}-{:02} {:02}:{:02}",
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min
-        )
-    }
+    crate::local_time::compact(epoch, now).unwrap_or_else(|| fmt_utc_time(epoch, now))
 }
 
-/// 非 unix 兜底（daemon 仅 unix，此分支只为编译完整）。
-#[cfg(not(unix))]
-pub fn fmt_local_time(epoch: u64, now: u64) -> String {
-    fmt_utc_time(epoch, now)
-}
-
-/// UTC 兜底格式化（`localtime_r` 不可用时）。
+/// UTC fallback for timestamps outside the maintained timezone backend's range.
 fn fmt_utc_time(epoch: u64, now: u64) -> String {
     let (h, m, s) = ((epoch / 3600) % 24, (epoch / 60) % 60, epoch % 60);
     if epoch / 86400 == now / 86400 {
@@ -581,6 +568,20 @@ mod tests {
         // 内容变化仍触发。
         b.text = Some("新输出".into());
         assert_ne!(signature(&a), signature(&b));
+    }
+
+    #[test]
+    fn lineage_is_visible_and_part_of_the_card_signature() {
+        let mut child = rec("working");
+        child["forkedFromSessionId"] = Value::String("parent-session-123".into());
+        let frame = build_frame(3, Some(&child), false);
+        assert_eq!(frame.forked_from.as_deref(), Some("parent-s"));
+        assert_eq!(
+            state_line_text(&frame, 1_700_000_000, Lang::Zh),
+            "🟢 工作中 · 从 parent-s 分叉"
+        );
+        let without_parent = build_frame(3, Some(&rec("working")), false);
+        assert_ne!(signature(&frame), signature(&without_parent));
     }
 
     #[test]

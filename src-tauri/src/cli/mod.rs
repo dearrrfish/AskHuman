@@ -11,9 +11,24 @@ pub mod help;
 pub mod image_writer;
 pub mod output;
 pub mod todo_cmd;
+pub mod update_cmd;
 
 use crate::i18n::{self, Lang};
+use std::collections::HashMap;
 use std::process::exit;
+
+pub(crate) const FROM_MCP_ENV: &str = "ASKHUMAN_FROM_MCP";
+pub(crate) const MCP_INSTANCE_ID_ENV: &str = "ASKHUMAN_MCP_INSTANCE_ID";
+pub(crate) const MCP_AGENT_KIND_ENV: &str = "ASKHUMAN_MCP_AGENT_KIND";
+pub(crate) const MCP_AGENT_SESSION_ID_ENV: &str = "ASKHUMAN_MCP_AGENT_SESSION_ID";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CallerContext {
+    pub agent_kind: Option<String>,
+    pub agent_session_id: Option<String>,
+    pub mcp_instance_id: Option<String>,
+    pub from_mcp: bool,
+}
 
 /// 向 stdout 输出一行文本，并把 BrokenPipe（读端提前关闭，如 `AskHuman --agent-help | head`）
 /// 视为正常结束：写失败一律静默忽略，退出码由调用方决定（纯输出命令随后 exit(0)，错误分支 exit(1)）。
@@ -63,47 +78,97 @@ pub fn dispatch() {
             print_line(&help::agent_help_text(lang));
             exit(0);
         }
+        "--show-last" => {
+            let count = match argv.get(2).map(String::as_str) {
+                None => 1usize,
+                Some(raw) if argv.len() == 3 => match crate::show_last::parse_count(Some(raw)) {
+                    Ok(n) => n,
+                    Err(error) => {
+                        eprintln!("{}{error}", i18n::err_prefix(lang));
+                        exit(1);
+                    }
+                },
+                _ => {
+                    eprintln!(
+                        "{}{}",
+                        i18n::err_prefix(lang),
+                        crate::show_last::Error::InvalidCount
+                    );
+                    exit(1);
+                }
+            };
+            let context = caller_context();
+            let transcript = match (&context.agent_kind, &context.agent_session_id) {
+                (Some(agent_kind), Some(session_id)) => Some(crate::show_last::TranscriptHint {
+                    agent_kind: agent_kind.clone(),
+                    session_id: session_id.clone(),
+                }),
+                _ => None,
+            };
+            let scope = match show_last_cli_scope(
+                context.agent_kind,
+                context.agent_session_id,
+                crate::project::detect(),
+            ) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    eprintln!("{}{error}", i18n::err_prefix(lang));
+                    exit(1);
+                }
+            };
+            match crate::show_last::recover(
+                &scope,
+                count,
+                crate::show_last::Surface::Cli,
+                transcript.as_ref(),
+            ) {
+                Ok(output) => {
+                    print_line(&output);
+                    exit(0);
+                }
+                Err(error) => {
+                    eprintln!("{}{error}", i18n::err_prefix(lang));
+                    exit(1);
+                }
+            }
+        }
         "--scripting-help" => {
             print_line(&help::scripting_help_text(lang));
             exit(0);
         }
         // 设置/历史窗口只需 general(主题)；密钥的「已保存」判定由前端 `get_settings` 单独读取。
         // 故用 load_without_secrets()，避免打开这两个窗口时无谓读钥匙串。
-        // unix：彻底路由到统一 GUI 宿主（全局单窗，spec D3）——宿主在则聚焦/新建、不在则拉起；
+        // Route every desktop platform through the unified GUI Host (global single windows).
         // 失败（极端：宿主起不来）兜底本进程直接建窗，保证窗口至少能打开。
         "--settings" => {
-            #[cfg(unix)]
+            if crate::gui_host::host_open(
+                crate::gui_host::WindowKind::Settings,
+                false,
+                None,
+                None,
+                None,
+            )
+            .is_ok()
             {
-                if crate::gui_host::host_open(
-                    crate::gui_host::WindowKind::Settings,
-                    false,
-                    None,
-                    None,
-                )
-                .is_ok()
-                {
-                    exit(0);
-                }
+                exit(0);
             }
             crate::app::run_settings(crate::config::AppConfig::load_without_secrets());
         }
         // 独立历史窗口：默认当前项目（向上找 .git 根、回退 cwd）；`--all` 默认展示全部项目。
         "--history" => {
             let all = argv[2..].iter().any(|a| a == "--all");
-            #[cfg(unix)]
+            // 项目过滤随请求经宿主 IPC 传递（宿主自身 cwd 无意义）。
+            let project = crate::project::detect();
+            if crate::gui_host::host_open(
+                crate::gui_host::WindowKind::History,
+                all,
+                Some(project),
+                None,
+                None,
+            )
+            .is_ok()
             {
-                // 项目过滤随请求经宿主 IPC 传递（宿主自身 cwd 无意义）。
-                let project = crate::project::detect();
-                if crate::gui_host::host_open(
-                    crate::gui_host::WindowKind::History,
-                    all,
-                    Some(project),
-                    None,
-                )
-                .is_ok()
-                {
-                    exit(0);
-                }
+                exit(0);
             }
             crate::app::run_history(
                 crate::project::detect(),
@@ -113,74 +178,51 @@ pub fn dispatch() {
         }
         // 独立待办窗口：预选当前项目（与 `--history` 同探测规则）；窗内仍可切换项目。
         "--todos" => {
-            #[cfg(unix)]
+            let project = crate::project::detect();
+            if crate::gui_host::host_open(
+                crate::gui_host::WindowKind::Todos,
+                false,
+                Some(project.clone()),
+                None,
+                None,
+            )
+            .is_ok()
             {
-                let project = crate::project::detect();
-                if crate::gui_host::host_open(
-                    crate::gui_host::WindowKind::Todos,
-                    false,
-                    Some(project.clone()),
-                    None,
-                )
-                .is_ok()
-                {
-                    exit(0);
-                }
-                crate::app::run_todos(project, crate::config::AppConfig::load_without_secrets());
+                exit(0);
             }
-            #[cfg(not(unix))]
-            {
-                eprintln!("--todos is not supported on this platform");
-                exit(1);
-            }
+            crate::app::run_todos(project, crate::config::AppConfig::load_without_secrets());
         }
         // 隐藏的统一 GUI 宿主角色（spec D2）：单实例托盘 + 设置/历史/Agent 窗口宿主。
         // 由 CLI 路由 / daemon 按需 spawn；抢宿主单实例锁失败即直接退出（已有宿主在跑）。
         "--gui-host" => {
-            #[cfg(unix)]
-            {
-                crate::app::run_gui_host(crate::config::AppConfig::load_without_secrets());
-            }
-            #[cfg(not(unix))]
-            {
-                eprintln!("--gui-host is not supported on this platform");
-                exit(1);
-            }
+            crate::app::run_gui_host(crate::config::AppConfig::load_without_secrets());
         }
         // 隐藏的 GUI Helper 角色：由 Daemon spawn（`--popup --endpoint <sock> --token <tok>`）。
         "--popup" => {
-            #[cfg(unix)]
-            {
-                let mut endpoint = String::new();
-                let mut token = String::new();
-                // 方案6：预热模式由 daemon 以 `--popup --warm` 拉起（无 token），先建窗挂载、隐藏待命，
-                // 入 daemon「热池」，来请求时由 daemon 喂 Show 领用上屏。
-                let mut warm = false;
-                let mut i = 2;
-                while i < argv.len() {
-                    match argv[i].as_str() {
-                        "--endpoint" if i + 1 < argv.len() => {
-                            endpoint = argv[i + 1].clone();
-                            i += 2;
-                        }
-                        "--token" if i + 1 < argv.len() => {
-                            token = argv[i + 1].clone();
-                            i += 2;
-                        }
-                        "--warm" => {
-                            warm = true;
-                            i += 1;
-                        }
-                        _ => i += 1,
+            let mut endpoint = String::new();
+            let mut token = String::new();
+            // 方案6：预热模式由 daemon 以 `--popup --warm` 拉起（无 token），先建窗挂载、隐藏待命，
+            // 入 daemon「热池」，来请求时由 daemon 喂 Show 领用上屏。
+            let mut warm = false;
+            let mut i = 2;
+            while i < argv.len() {
+                match argv[i].as_str() {
+                    "--endpoint" if i + 1 < argv.len() => {
+                        endpoint = argv[i + 1].clone();
+                        i += 2;
                     }
+                    "--token" if i + 1 < argv.len() => {
+                        token = argv[i + 1].clone();
+                        i += 2;
+                    }
+                    "--warm" => {
+                        warm = true;
+                        i += 1;
+                    }
+                    _ => i += 1,
                 }
-                crate::app::run_gui_helper(endpoint, token, warm);
             }
-            #[cfg(not(unix))]
-            {
-                eprintln!("--popup is not supported on this platform");
-                exit(1);
-            }
+            crate::app::run_gui_helper(endpoint, token, warm);
         }
         // Dev Instance：enable/disable/status/preset（多 WorkTree 并行开发隔离）。
         "dev" => {
@@ -191,6 +233,11 @@ pub fn dispatch() {
         "daemon" => {
             crate::daemon::dispatch(&argv[2..]);
         }
+        // Manual Windows update preparation: gracefully drain the daemon and close the GUI Host
+        // so the user can replace the running executable from their terminal.
+        "update" => {
+            exit(update_cmd::dispatch(&argv[2..]));
+        }
         // MCP server 角色：以 STDIO 暴露 ask / whats_next / todo_add，供 Codex / Claude Code / Cursor 等 MCP 客户端调用。
         // 每次工具调用都 spawn 一个 `AskHuman --output json …` 子进程复用既有 ask 流程（见 mcp 模块）。
         // 极端歧义（问题正好是 "mcp"）可用 `AskHuman -q mcp` 规避。
@@ -200,10 +247,13 @@ pub fn dispatch() {
         // 隐藏的生命周期上报器：由三家 Agent 的用户级 hook 调用
         // （`AskHuman __agent-hook <agent> <event>`，spec D20）。即发即走、静默退出。
         "__agent-hook" => {
-            #[cfg(unix)]
-            {
-                crate::agents::report::run(&argv[2..]);
-            }
+            crate::agents::report::run(&argv[2..]);
+            exit(0);
+        }
+        // Hidden context-compaction/session-binding hook. It is mode-owned and separate from the
+        // optional lifecycle capability inside the same automatic integration.
+        "__context-recovery-hook" => {
+            crate::agents::context_recovery::run(&argv[2..]);
             exit(0);
         }
         // Hidden SubagentStart context hook for Claude Code and Codex.
@@ -215,54 +265,60 @@ pub fn dispatch() {
             }
             exit(0);
         }
-        // Hidden one-time bridge used only by a newly opened Terminal.app window.
+        // Hidden one-time bridge used only by a newly opened platform terminal.
         "__agent-launch" => {
-            #[cfg(unix)]
             if let Err(error) = crate::integrations::agent_launch::run_helper(&argv[2..]) {
                 eprintln!("AskHuman: {error:#}");
                 exit(1);
             }
-            #[cfg(not(unix))]
-            exit(1);
+            exit(0);
+        }
+        // Hidden transactional Windows self-update worker.
+        "__update-worker" => {
+            if let Err(error) = crate::update::direct::run_windows_worker(&argv[2..]) {
+                eprintln!("AskHuman update worker: {error:#}");
+                exit(1);
+            }
+            exit(0);
+        }
+        // Hidden Windows npm updater copied outside the package being replaced.
+        "__npm-update-worker" => {
+            if let Err(error) = crate::update::npm::run_windows_worker(&argv[2..]) {
+                eprintln!("AskHuman npm update worker: {error:#}");
+                exit(1);
+            }
+            exit(0);
         }
         // Hidden Stop confirmation hook. Failures emit `{}` so the agent can stop normally.
         "__stop-hook" => {
-            #[cfg(unix)]
-            {
-                crate::agents::stop::run(&argv[2..]);
-            }
-            #[cfg(not(unix))]
-            print_line("{}");
+            crate::agents::stop::run(&argv[2..]);
             exit(0);
         }
         // Hidden PermissionRequest adapter. All infrastructure and validation failures produce no
         // stdout so the agent falls back to its native approval prompt.
         "__permission-hook" => {
-            #[cfg(unix)]
-            {
-                if let Some(output) = crate::permissions::run(argv.get(2).map(String::as_str)) {
-                    print_line(&output);
-                }
+            if let Some(output) = crate::permissions::run(argv.get(2).map(String::as_str)) {
+                print_line(&output);
             }
+            exit(0);
+        }
+        // Hidden PreToolUse adapter for Claude's built-in AskUserQuestion: the questions are
+        // answered through AskHuman instead of Claude's own picker.
+        "__ask-question-hook" => {
+            crate::ask_question::run(argv.get(2).map(String::as_str));
             exit(0);
         }
         // Hidden short-lived file snapshot worker used only by the local permission popup.
         "__permission-diff-worker" => {
-            #[cfg(unix)]
-            {
-                if let Some(output) = crate::permission_diff::worker::run_stdio() {
-                    print_line(&output);
-                }
+            if let Some(output) = crate::permission_diff::worker::run_stdio() {
+                print_line(&output);
             }
             exit(0);
         }
         // Hidden short-lived shell policy analysis worker (codex-permission-remember D27).
         "__permission-shell-worker" => {
-            #[cfg(unix)]
-            {
-                if let Some(output) = crate::permission_shell::run_stdio() {
-                    print_line(&output);
-                }
+            if let Some(output) = crate::permission_shell::run_stdio() {
+                print_line(&output);
             }
             exit(0);
         }
@@ -362,62 +418,51 @@ pub fn dispatch() {
                         })
                         .collect()
                 };
-                // unix：瘦客户端经 Daemon + GUI Helper（A11：上送 source name 与解析好的 lang）。
-                #[cfg(unix)]
-                {
-                    // 性能埋点（spec popup-launch-performance §7）：仅 `ASKHUMAN_PERF` 开启时铸 id，
-                    // 经 TaskRequest 透传到 daemon/helper/前端串联整条时间线；关闭则恒空、零开销。
-                    let perf_id = if crate::perf::enabled() {
-                        format!("{}-{}", std::process::id(), crate::perf::now_ms())
-                    } else {
-                        String::new()
-                    };
-                    crate::perf::mark_at(&perf_id, "cli.start", crate::perf::start_ms());
-                    // harness 注入的 spawn 时刻（含进程创建 / 加载，main 之前不可见的开销）。
-                    crate::perf::mark_spawn(&perf_id);
-                    // 顺带探测调用方 Agent 身份（生命周期追踪 spec D21）：仅 env 读取（家族 + 会话 ID，零 ps）。
-                    // 方案5(b)：进程树 walk（数十 ms 的 ps 游走）移到 daemon 异步进行——这里只带 CLI 自身 pid。
-                    let (agent_kind, agent_session_id) = detect_caller_agent();
-                    crate::perf::mark(&perf_id, "cli.detect_done");
-                    // 来源名解析：未定制 `ASKHUMAN_ENV_SOURCE_NAME` 时，用探测到的 Agent 名
-                    // （Claude Code / Codex / Cursor）替代默认 "the Loop"；供渠道消息头 + 历史共用
-                    // （弹窗标题另由前端按胶囊内联渲染）。MCP 模式 env 判不出家族 → 回退 "the Loop"。
-                    let resolved_agent_kind = agent_kind
-                        .as_deref()
-                        .and_then(crate::agents::AgentKind::parse);
-                    let task = crate::ipc::TaskRequest {
-                        message,
-                        questions,
-                        // Markdown 渲染恒开（`--no-markdown` 已移除）；弹窗内可临时切换为源码视图。
-                        is_markdown: true,
-                        source: crate::models::source_name_for_agent(resolved_agent_kind),
-                        lang: lang.code().to_string(),
-                        project,
-                        select_only: parsed.select_only,
-                        single: parsed.single,
-                        output_format: parsed.output_format,
-                        record_history: true,
-                        agent_kind,
-                        agent_session_id,
-                        agent_pid: None,
-                        caller_pid: std::process::id(),
-                        from_mcp: from_mcp_env(),
-                        perf_id,
-                        perf_autodismiss: crate::perf::autodismiss(),
-                        whats_next: parsed.whats_next,
-                    };
-                    crate::client::run_ask(task);
-                }
-                // 非 unix：暂无 Daemon，沿用单进程内运行（Windows named pipe 待后续 Phase）。
-                #[cfg(not(unix))]
-                {
-                    let mut request = crate::models::AskRequest::new(message, questions, true);
-                    request.select_only = parsed.select_only;
-                    request.single = parsed.single;
-                    request.output_format = parsed.output_format;
-                    request.whats_next = parsed.whats_next;
-                    crate::app::run_ask(request, crate::config::AppConfig::load());
-                }
+                // Thin client through the shared daemon + GUI Helper on every desktop platform.
+                // 性能埋点（spec popup-launch-performance §7）：仅 `ASKHUMAN_PERF` 开启时铸 id，
+                // 经 TaskRequest 透传到 daemon/helper/前端串联整条时间线；关闭则恒空、零开销。
+                let perf_id = if crate::perf::enabled() {
+                    format!("{}-{}", std::process::id(), crate::perf::now_ms())
+                } else {
+                    String::new()
+                };
+                crate::perf::mark_at(&perf_id, "cli.start", crate::perf::start_ms());
+                // harness 注入的 spawn 时刻（含进程创建 / 加载，main 之前不可见的开销）。
+                crate::perf::mark_spawn(&perf_id);
+                // 顺带探测调用方 Agent 身份（生命周期追踪 spec D21）：仅 env 读取（家族 + 会话 ID，零 ps）。
+                // 方案5(b)：进程树 walk（数十 ms 的 ps 游走）移到 daemon 异步进行——这里只带 CLI 自身 pid。
+                let context = caller_context();
+                crate::perf::mark(&perf_id, "cli.detect_done");
+                // 来源名解析：未定制 `ASKHUMAN_ENV_SOURCE_NAME` 时，用探测到的 Agent 名
+                // （Claude Code / Codex / Cursor）替代默认 "the Loop"；供渠道消息头 + 历史共用
+                // （弹窗标题另由前端按胶囊内联渲染）。MCP 模式 env 判不出家族 → 回退 "the Loop"。
+                let resolved_agent_kind = context
+                    .agent_kind
+                    .as_deref()
+                    .and_then(crate::agents::AgentKind::parse);
+                let task = crate::ipc::TaskRequest {
+                    message,
+                    questions,
+                    // Markdown 渲染恒开（`--no-markdown` 已移除）；弹窗内可临时切换为源码视图。
+                    is_markdown: true,
+                    source: crate::models::source_name_for_agent(resolved_agent_kind),
+                    lang: lang.code().to_string(),
+                    project,
+                    select_only: parsed.select_only,
+                    single: parsed.single,
+                    output_format: parsed.output_format,
+                    record_history: true,
+                    agent_kind: context.agent_kind,
+                    agent_session_id: context.agent_session_id,
+                    mcp_instance_id: context.mcp_instance_id,
+                    agent_pid: None,
+                    caller_pid: std::process::id(),
+                    from_mcp: context.from_mcp,
+                    perf_id,
+                    perf_autodismiss: crate::perf::autodismiss(),
+                    whats_next: parsed.whats_next,
+                };
+                crate::client::run_ask(task);
             }
             Err(e) => {
                 eprintln!("{}{}\n", i18n::err_prefix(lang), e);
@@ -434,22 +479,29 @@ fn try_whats_next_auto(project: &str, message: &crate::models::MessagePrompt, la
     let Some(entry) = crate::todos::first_auto(project) else {
         return false;
     };
+    let delivery_request_id = uuid::Uuid::new_v4().to_string();
+    let expected: Vec<_> = entry.attachments.iter().map(|a| a.snapshot()).collect();
+    let delivery = crate::todos::prepare_delivery_consistent(
+        project,
+        &entry.id,
+        &expected,
+        &delivery_request_id,
+    );
     // 出队即历史记录点（take 落待办执行历史）；被并发拿走 → 回落正常提问。
     let Some(entry) = crate::todos::take(project, std::slice::from_ref(&entry.id))
         .into_iter()
         .next()
     else {
+        crate::todo_attachments::cleanup_delivery(&delivery_request_id);
         return false;
     };
     let limit = crate::config::AppConfig::load_without_secrets()
         .general
         .history_limit;
     if limit > 0 {
-        #[cfg(unix)]
-        let (agent_kind, _sid) = detect_caller_agent();
-        #[cfg(not(unix))]
-        let agent_kind: Option<String> = None;
-        let resolved = agent_kind
+        let context = caller_context();
+        let resolved = context
+            .agent_kind
             .as_deref()
             .and_then(crate::agents::AgentKind::parse);
         let prefix = i18n::tr(lang, "whatsNext.todoPrefix");
@@ -459,7 +511,9 @@ fn try_whats_next_auto(project: &str, message: &crate::models::MessagePrompt, la
                 timestamp_ms: crate::history::now_ms(),
                 project: project.to_string(),
                 source: crate::models::source_name_for_agent(resolved),
-                agent_kind,
+                agent_kind: context.agent_kind,
+                agent_session_id: context.agent_session_id,
+                mcp_instance_id: context.mcp_instance_id,
                 channel: "auto".to_string(),
                 action: crate::models::ChannelAction::Send,
                 is_markdown: true,
@@ -472,16 +526,20 @@ fn try_whats_next_auto(project: &str, message: &crate::models::MessagePrompt, la
                     selected_options: vec![format!("{}{}", prefix, entry.text)],
                     user_input: None,
                     images: Vec::new(),
-                    files: Vec::new(),
+                    files: delivery.files.clone(),
                 }],
             },
             limit,
         );
     }
     // 与人工路径同构（第 19 轮定案：复用 Ask 标准区块）：派活 → `[user_input]` + 任务文本。
+    let task = match crate::todo_attachments::warning_block(&delivery.warnings) {
+        Some(warning) => format!("{}\n\n{warning}", entry.text),
+        None => entry.text.clone(),
+    };
     print_line(&crate::cli::output::whats_next_output(
-        &crate::cli::output::WhatsNextReply::Task(entry.text.clone()),
-        &[],
+        &crate::cli::output::WhatsNextReply::Task(task),
+        &delivery.files,
         lang,
     ));
     true
@@ -579,7 +637,6 @@ fn whats_next_question_from_entries(
     entries: Vec<crate::todos::TodoEntry>,
     lang: Lang,
 ) -> crate::models::Question {
-    let prefix = i18n::tr(lang, "whatsNext.todoPrefix");
     let total = entries.len();
     let task_slots = WHATS_NEXT_MAX_OPTIONS - 1;
     let mut options: Vec<crate::models::OptionItem> = suggestions
@@ -591,7 +648,7 @@ fn whats_next_question_from_entries(
     let todo_slots = task_slots - options.len();
     let shown_todos = total.min(todo_slots);
     options.extend(entries.into_iter().take(todo_slots).map(|entry| {
-        crate::models::OptionItem::with_todo(format!("{}{}", prefix, entry.text), entry.id)
+        crate::models::OptionItem::with_todo_entry(crate::todos::option_label(lang, &entry), &entry)
     }));
     options.push(crate::models::OptionItem::new(
         i18n::tr(lang, "whatsNext.endOption"),
@@ -608,29 +665,59 @@ fn whats_next_question_from_entries(
     crate::models::Question::new(message, options)
 }
 
-/// 探测发起 `AskHuman` 调用的 Agent 身份的**快速部分**（家族 + 会话 ID，仅读 env，零 ps）。
-/// 方案5(b)：进程树 walk（拿 agent pid，数十 ms 的 ps 游走）不在此做——改由 daemon 从 `caller_pid`
-/// 异步进行（含 env 判不出家族的 **MCP 兜底**：daemon walk_any_agent）。env 判不出则两者皆 None。
-#[cfg(unix)]
-fn detect_caller_agent() -> (Option<String>, Option<String>) {
-    use crate::agents::detect;
-    if let Some(kind) = detect::detect_running_agent() {
-        let sid = detect::session_id_from_env(kind);
-        return (Some(kind.as_str().to_string()), sid);
-    }
-    (None, None)
+/// Resolve the calling Agent with environment-only work so it is safe on the ask hot path and
+/// available to daemon-backed Unix and Windows builds.
+pub(crate) fn caller_context() -> CallerContext {
+    caller_context_from_env(&std::env::vars().collect())
 }
 
-/// 是否经 MCP 模式发起（`AskHuman mcp` spawn 子进程时设 env `ASKHUMAN_FROM_MCP`）。
-/// 非空且非 `0` 即视为真（沿用本项目 env 开关惯例）。daemon 据此对该次 ask「只刷新、不新建」session。
-#[cfg(unix)]
-fn from_mcp_env() -> bool {
-    std::env::var("ASKHUMAN_FROM_MCP")
-        .map(|v| {
-            let v = v.trim();
-            !v.is_empty() && v != "0"
-        })
-        .unwrap_or(false)
+fn caller_context_from_env(env: &HashMap<String, String>) -> CallerContext {
+    let nonempty = |name: &str| {
+        env.get(name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let from_mcp = nonempty(FROM_MCP_ENV).is_some_and(|value| value != "0");
+    if from_mcp {
+        let kind = nonempty(MCP_AGENT_KIND_ENV)
+            .filter(|value| crate::agents::AgentKind::parse(value).is_some());
+        let session_id = nonempty(MCP_AGENT_SESSION_ID_ENV);
+        let (agent_kind, agent_session_id) = match (kind, session_id) {
+            (Some(kind), Some(session_id)) => (Some(kind), Some(session_id)),
+            _ => (None, None),
+        };
+        return CallerContext {
+            agent_kind,
+            agent_session_id,
+            mcp_instance_id: nonempty(MCP_INSTANCE_ID_ENV),
+            from_mcp: true,
+        };
+    }
+    let kind = crate::agents::detect::detect_running_agent_from(env);
+    CallerContext {
+        agent_kind: kind.map(|kind| kind.as_str().to_string()),
+        agent_session_id: kind
+            .and_then(|kind| crate::agents::detect::session_id_from_env_map(kind, env)),
+        mcp_instance_id: None,
+        from_mcp: false,
+    }
+}
+
+fn show_last_cli_scope(
+    agent_kind: Option<String>,
+    agent_session_id: Option<String>,
+    project: String,
+) -> Result<crate::show_last::Scope, &'static str> {
+    match (agent_kind, agent_session_id) {
+        (Some(agent_kind), Some(session_id)) => Ok(crate::show_last::Scope::AgentSession {
+            agent_kind,
+            session_id,
+        }),
+        (None, None) => Ok(crate::show_last::Scope::Project(project)),
+        _ => Err(
+            "AskHuman detected an Agent caller but no trustworthy session id; refusing an unsafe project-wide fallback",
+        ),
+    }
 }
 
 /// 提问解析的入口包装：仅当出现 `--stdin` 时读取标准输入作为 Message，
@@ -693,7 +780,88 @@ mod tests {
             created_at_ms: index as u64,
             agent_kind: None,
             auto: false,
+            attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn show_last_project_fallback_requires_a_non_agent_caller() {
+        assert!(matches!(
+            show_last_cli_scope(None, None, "/project".into()).unwrap(),
+            crate::show_last::Scope::Project(project) if project == "/project"
+        ));
+        assert!(show_last_cli_scope(Some("codex".into()), None, "/project".into()).is_err());
+        assert!(show_last_cli_scope(None, Some("session".into()), "/project".into()).is_err());
+        assert!(matches!(
+            show_last_cli_scope(
+                Some("codex".into()),
+                Some("session".into()),
+                "/project".into()
+            )
+            .unwrap(),
+            crate::show_last::Scope::AgentSession { agent_kind, session_id }
+                if agent_kind == "codex" && session_id == "session"
+        ));
+    }
+
+    #[test]
+    fn caller_context_prefers_trusted_mcp_binding_and_ignores_stale_native_env() {
+        let env = HashMap::from([
+            (FROM_MCP_ENV.into(), "1".into()),
+            (MCP_INSTANCE_ID_ENV.into(), "  instance  ".into()),
+            (MCP_AGENT_KIND_ENV.into(), "cursor".into()),
+            (MCP_AGENT_SESSION_ID_ENV.into(), " conversation ".into()),
+            ("CODEX_THREAD_ID".into(), "stale-codex".into()),
+        ]);
+        assert_eq!(
+            caller_context_from_env(&env),
+            CallerContext {
+                agent_kind: Some("cursor".into()),
+                agent_session_id: Some("conversation".into()),
+                mcp_instance_id: Some("instance".into()),
+                from_mcp: true,
+            }
+        );
+
+        for env in [
+            HashMap::from([
+                (FROM_MCP_ENV.into(), "1".into()),
+                (MCP_AGENT_KIND_ENV.into(), "unknown".into()),
+                (MCP_AGENT_SESSION_ID_ENV.into(), "session".into()),
+            ]),
+            HashMap::from([
+                (FROM_MCP_ENV.into(), "true".into()),
+                (MCP_AGENT_KIND_ENV.into(), "codex".into()),
+            ]),
+        ] {
+            let context = caller_context_from_env(&env);
+            assert!(context.from_mcp);
+            assert!(context.agent_kind.is_none());
+            assert!(context.agent_session_id.is_none());
+        }
+    }
+
+    #[test]
+    fn caller_context_detects_direct_agent_and_never_assigns_mcp_partition() {
+        let env = HashMap::from([
+            ("CURSOR_AGENT".into(), "1".into()),
+            ("CURSOR_CONVERSATION_ID".into(), " conversation ".into()),
+            (FROM_MCP_ENV.into(), "0".into()),
+            (MCP_INSTANCE_ID_ENV.into(), "ignored".into()),
+        ]);
+        assert_eq!(
+            caller_context_from_env(&env),
+            CallerContext {
+                agent_kind: Some("cursor".into()),
+                agent_session_id: Some("conversation".into()),
+                mcp_instance_id: None,
+                from_mcp: false,
+            }
+        );
+        assert_eq!(
+            caller_context_from_env(&HashMap::new()),
+            CallerContext::default()
+        );
     }
 
     #[test]

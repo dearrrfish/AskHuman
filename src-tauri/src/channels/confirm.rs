@@ -48,13 +48,10 @@ fn input_limit_warning(request: &crate::models::ConfirmRequest, lang: Lang) -> S
 fn final_status(entry: &ConfirmEntry, lang: Lang) -> String {
     match entry.coordinator.terminal_kind() {
         Some(ConfirmTerminalKind::Decision(result)) => {
-            let denied = entry
-                .request
-                .choices
-                .iter()
-                .find(|choice| choice.id == result.action_id)
-                .map(|choice| choice.role == crate::confirm::ActionRole::Destructive)
-                .unwrap_or(false);
+            // Denied = the dismiss action, not any Destructive-styled choice: broad
+            // grants (full disk, relaxed mode) reuse Destructive purely for danger
+            // styling and must not read as a denial.
+            let denied = result.action_id == entry.request.dismiss_action_id;
             let source = source_name(&result.source_channel_id, lang);
             let task_input = entry
                 .request
@@ -79,6 +76,13 @@ fn final_status(entry: &ConfirmEntry, lang: Lang) -> String {
                 status.push_str(match lang {
                     Lang::Zh => "（本次已允许，但未能保存授权）",
                     Lang::En => " (allowed this time, but saving the grant failed)",
+                });
+            } else if result.action_id == "remember_yolo" {
+                // YOLO enabled from an IM card (D53): the session stops popping up, so the
+                // finalized card is the last surface — attach the off hint here.
+                status.push_str(match lang {
+                    Lang::Zh => "（YOLO 已开启，发送 /yolo 可随时关闭）",
+                    Lang::En => " (YOLO on; send /yolo to turn it off anytime)",
                 });
             }
             status
@@ -226,17 +230,27 @@ async fn keep_dingtalk_tombstone(
 }
 
 fn dingtalk_param_map(request: &crate::models::ConfirmRequest, lang: Lang) -> serde_json::Value {
-    let task_input = request
-        .presentation
-        .input()
-        .is_some_and(|input| input.max_chars > 1000);
+    let task_input = choice_cards::is_task_input_form(request);
+    // Card option ids are positions in this visible list; dingtalk_wire_index translates
+    // them back to wire indices on submit (D51: hidden variants are skipped).
+    let task_choice_indices = choice_cards::task_choice_indices(request);
     let options: Vec<crate::models::OptionItem> = if task_input {
-        Vec::new()
-    } else {
-        request
-            .choices
+        task_choice_indices
             .iter()
-            .map(|choice| {
+            .map(|index| {
+                let choice = &request.choices[*index];
+                if choice.id.starts_with("todo:") {
+                    crate::models::OptionItem::with_todo(choice.label.clone(), choice.id.clone())
+                } else {
+                    crate::models::OptionItem::new(choice.label.clone(), *index == 0)
+                }
+            })
+            .collect()
+    } else {
+        task_choice_indices
+            .iter()
+            .map(|index| {
+                let choice = &request.choices[*index];
                 let text = if choice.description.trim().is_empty() {
                     choice.label.clone()
                 } else {
@@ -271,7 +285,7 @@ fn dingtalk_param_map(request: &crate::models::ConfirmRequest, lang: Lang) -> se
     } else {
         choice_cards::compact_tool_markdown(request, 12_000, lang)
     };
-    let mut public = crate::dingtalk::card::build_card_param_map(
+    let mut public = crate::dingtalk::card::build_card_param_map_with_todo(
         &request.title,
         &markdown,
         &options,
@@ -282,6 +296,8 @@ fn dingtalk_param_map(request: &crate::models::ConfirmRequest, lang: Lang) -> se
         } else {
             "[Recommended]"
         },
+        crate::i18n::tr(lang, "whatsNext.todoPrefix"),
+        crate::i18n::tr(lang, "channel.dingtalkTodo"),
     );
     if let Some(map) = public.as_object_mut() {
         if !task_input {
@@ -289,7 +305,15 @@ fn dingtalk_param_map(request: &crate::models::ConfirmRequest, lang: Lang) -> se
             map.remove("allow_input");
         }
     }
-    public["deny_index"] = serde_json::Value::String(request.dismiss_index().to_string());
+    // The template compares selected option ids (positions in the visible list) against
+    // deny_index, so translate the dismiss wire index to its visible position. Task
+    // cards exclude the dismiss action from options; keep the wire index there (no
+    // position can match, same as before).
+    let deny_index = task_choice_indices
+        .iter()
+        .position(|index| *index == request.dismiss_index())
+        .unwrap_or_else(|| request.dismiss_index());
+    public["deny_index"] = serde_json::Value::String(deny_index.to_string());
     let input = request.presentation.input();
     public["reason_label"] = serde_json::Value::String(
         input
@@ -338,11 +362,7 @@ pub fn start_dingtalk(
             }
         };
         let target = client.user_id().to_string();
-        let task_input = entry
-            .request
-            .presentation
-            .input()
-            .is_some_and(|input| input.max_chars > 1000);
+        let task_input = choice_cards::is_task_input_form(&entry.request);
         let template = if task_input {
             crate::channels::dingding::effective_template_id(&config)
         } else {
@@ -402,7 +422,11 @@ pub fn start_dingtalk(
                             let _ = ack.send(serde_json::json!({}));
                             continue;
                         }
-                        let index = submit.selected_indices.first().copied()
+                        // Card option ids are positions in the visible list sent by
+                        // dingtalk_param_map; translate back to wire indices (D51).
+                        let visible = choice_cards::task_choice_indices(&entry.request);
+                        let index = submit.selected_indices.first()
+                            .and_then(|position| visible.get(*position).copied())
                             .or_else(|| entry.request.choice_form_view().default_index);
                         let Some(index) = index else {
                             let _ = ack.send(serde_json::json!({}));
@@ -651,10 +675,13 @@ pub fn start_slack(
                         let thread = event.get("thread_ts").and_then(|value| value.as_str()).unwrap_or("");
                         let text = event.get("text").and_then(|value| value.as_str()).unwrap_or("").trim();
                         if actor == target && thread == message_id && !text.is_empty() {
-                            let input_index = entry.request.choice_form_view().default_index
+                            let input_index = entry.request.presentation.input()
+                                .filter(|input| input.always_visible)
+                                .and(selected)
+                                .or_else(|| entry.request.choice_form_view().default_index)
                                 .unwrap_or_else(|| entry.request.dismiss_index());
-                            let max_chars = entry.request.presentation.input()
-                                .map(|input| input.max_chars).unwrap_or(1000);
+                            let max_chars = entry.request.input_max_chars_for_choice(input_index)
+                                .unwrap_or(1000);
                             let extra = usize::from(!comment.is_empty());
                             if comment.chars().count() + extra + text.chars().count() <= max_chars {
                                 if !comment.is_empty() { comment.push('\n'); }
@@ -713,11 +740,13 @@ pub fn start_telegram(
         let mut comment = String::new();
         let mut events = router.register();
         let initial = choice_cards::telegram_html(&entry.request, selected, &comment, None, lang);
-        let force_reply = entry
-            .request
-            .presentation
-            .input()
-            .is_some_and(|input| input.max_chars > 1000);
+        let force_reply = choice_cards::is_task_input_form(&entry.request)
+            && entry
+                .request
+                .presentation
+                .input()
+                .is_some_and(|input| input.requires_value());
+        let direct_task_confirmation = choice_cards::is_direct_task_confirmation(&entry.request);
         let keyboard = if force_reply {
             serde_json::json!({
                 "force_reply": true,
@@ -803,7 +832,7 @@ pub fn start_telegram(
                             // is the dedicated cancel escape hatch, which stays one-tap.
                             Some(choice_cards::TelegramAction::Select(index)) if index < entry.request.choices.len() => {
                                 client.answer_callback_query(callback_id).await;
-                                if force_reply {
+                                if force_reply || direct_task_confirmation {
                                     selected = Some(index);
                                     if entry.coordinator.submit_wire(index, Some(comment.clone()), channel).is_ok() { break; }
                                 } else if selected != Some(index) {
@@ -830,14 +859,17 @@ pub fn start_telegram(
                     Some(crate::telegram::router::TgInbound::Text { text, reply_to_message_id, .. }) => {
                         if reply_to_message_id == Some(message_id) {
                             let text = text.trim();
-                            let max_chars = entry.request.presentation.input()
-                                .map(|input| input.max_chars).unwrap_or(1000);
+                            let input_index = entry.request.presentation.input()
+                                .filter(|input| input.always_visible)
+                                .and(selected)
+                                .or_else(|| entry.request.choice_form_view().default_index)
+                                .unwrap_or_else(|| entry.request.dismiss_index());
+                            let max_chars = entry.request.input_max_chars_for_choice(input_index)
+                                .unwrap_or(1000);
                             let extra = usize::from(!comment.is_empty());
                             if !text.is_empty() && comment.chars().count() + extra + text.chars().count() <= max_chars {
                                 if !comment.is_empty() { comment.push('\n'); }
                                 comment.push_str(text);
-                                let input_index = entry.request.choice_form_view().default_index
-                                    .unwrap_or_else(|| entry.request.dismiss_index());
                                 selected = Some(input_index);
                                 if force_reply {
                                     if entry.coordinator.submit_wire(input_index, Some(comment.clone()), channel).is_ok() { break; }
@@ -923,18 +955,21 @@ mod tests {
                     label: "Approve once".into(),
                     description: String::new(),
                     role: crate::confirm::ActionRole::Primary,
+                    variant: None,
                 },
                 ConfirmChoice {
                     id: "permission_suggestion_0".into(),
                     label: "Update permission".into(),
                     description: "Session".into(),
                     role: crate::confirm::ActionRole::Default,
+                    variant: None,
                 },
                 ConfirmChoice {
                     id: "deny".into(),
                     label: "Deny".into(),
                     description: String::new(),
                     role: crate::confirm::ActionRole::Destructive,
+                    variant: None,
                 },
             ],
             presentation: ConfirmPresentation::SingleSelectSubmit {
@@ -994,18 +1029,23 @@ mod tests {
                     label: "Start".into(),
                     description: String::new(),
                     role: crate::confirm::ActionRole::Primary,
+                    variant: None,
                 },
                 ConfirmChoice {
                     id: "cancel".into(),
                     label: "Cancel".into(),
                     description: String::new(),
                     role: crate::confirm::ActionRole::Destructive,
+                    variant: None,
                 },
             ],
             presentation: ConfirmPresentation::SingleSelectSubmit {
                 input: Some(ConfirmInput {
                     id: "task".into(),
                     visible_when_action_id: "start".into(),
+                    always_visible: false,
+                    required: true,
+                    prefix_chars_by_action_id: Default::default(),
                     label: "Task".into(),
                     placeholder: "Describe".into(),
                     max_chars: 3000,
@@ -1032,5 +1072,30 @@ mod tests {
         assert!(markdown.contains(
             "\n- <font sizeToken=common_footnote_text_style__font_size>**Agent:** Codex</font>"
         ));
+
+        let mut todo_request = request.clone();
+        todo_request.choices.insert(
+            1,
+            ConfirmChoice {
+                id: "todo:1".into(),
+                label: "Run todo: ⚡ Project TODO".into(),
+                description: String::new(),
+                role: crate::confirm::ActionRole::Default,
+                variant: None,
+            },
+        );
+        let input = match &mut todo_request.presentation {
+            ConfirmPresentation::SingleSelectSubmit { input, .. } => input.as_mut().unwrap(),
+        };
+        input.always_visible = true;
+        let todo_payload = dingtalk_param_map(&todo_request, Lang::En);
+        let options: serde_json::Value =
+            serde_json::from_str(todo_payload["options"].as_str().unwrap()).unwrap();
+        assert_eq!(options.as_array().unwrap().len(), 2);
+        assert!(options[0]["md"].as_str().unwrap().contains("Recommended"));
+        assert!(options[1]["md"].as_str().unwrap().contains("Project TODO"));
+        assert!(options[1]["md"].as_str().unwrap().contains("【TODO】"));
+        assert!(!options[1]["md"].as_str().unwrap().contains("Run todo:"));
+        assert!(!todo_payload["options"].as_str().unwrap().contains("Cancel"));
     }
 }

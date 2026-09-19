@@ -3,7 +3,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Ref } from "vue";
 import { useI18n } from "vue-i18n";
 import type { AppConfig } from "../../lib/types";
-import { isMac, isWindows } from "../../lib/platform";
+import { isMac, supportsAgentTasks } from "../../lib/platform";
 import type { Tab } from "./context";
 
 // 静态索引：每条 = 一个设置项（tab + 展示/锚定标题 + 参与匹配的额外文案）。标题文本
@@ -21,7 +21,7 @@ export function useSettingsSearch(deps: {
   activeTab: Ref<Tab>;
 }) {
   const { t } = useI18n();
-  const { config, activeTab } = deps;
+  const { activeTab } = deps;
 
   // 搜索态：点放大镜进入（隐藏 tab、显示输入框并聚焦），Esc/✕/选中结果退出。
   const searchActive = ref(false);
@@ -129,6 +129,11 @@ export function useSettingsSearch(deps: {
       lit("integration", "Codex", ["Agent"]),
       lit("integration", "Cursor", ["Agent"]),
       lit("integration", "Grok", ["Agent"]),
+      lit("integration", "Pi", ["Agent"]),
+      e("integration", "settings.integration.lifecycleTitle", [
+        "settings.integration.lifecycleHint",
+        "settings.integration.manualLifecycleHint",
+      ]),
       // 通信渠道
       e("channel", "settings.channels.popupTitle", [
         "settings.channels.rememberSize",
@@ -154,9 +159,9 @@ export function useSettingsSearch(deps: {
         "settings.channels.slackUserId",
       ]),
     ];
+    list.push(e("general", "settings.popupBehavior.sound"));
     if (isMac) {
       list.push(
-        e("general", "settings.popupBehavior.sound"),
         e("general", "settings.popupBehavior.appearAnimation"),
         e("general", "settings.speech.title", [
           "settings.speech.language",
@@ -167,37 +172,30 @@ export function useSettingsSearch(deps: {
     if (isMac) {
       list.push(e("general", "settings.popupBehavior.windowEffect"));
     }
-    if (!isWindows) {
+    list.push(
+      e("general", "settings.menuBar.title", [
+        "settings.menuBar.icon",
+        "settings.menuBar.hint",
+      ]),
+      e("advanced", "settings.experimental.daemonLifecycleTitle", [
+        "settings.experimental.daemonLifecycleLabel",
+        "settings.experimental.daemonLifecycleActivity",
+        "settings.experimental.daemonLifecycleKeepalive",
+      ]),
+      e("advanced", "settings.channels.autoActivationTitle", [
+        "settings.channels.autoActivationDesc",
+      ]),
+      e("advanced", "settings.channels.autoEndWatchTitle", [
+        "settings.channels.autoEndWatchDesc",
+      ]),
+      // Permission details are loaded on demand; the static title/description remain searchable.
+      e("advanced", "settings.permissionRules.title", [
+        "settings.permissionRules.desc",
+      ]),
+    );
+    if (supportsAgentTasks) {
       list.push(
-        e("general", "settings.menuBar.title", [
-          "settings.menuBar.icon",
-          "settings.menuBar.hint",
-        ]),
-        // 高级
-        e("advanced", "settings.experimental.lifecycleTitle", [
-          "settings.experimental.lifecycleDesc",
-        ]),
-        e("advanced", "settings.experimental.daemonLifecycleTitle", [
-          "settings.experimental.daemonLifecycleLabel",
-          "settings.experimental.daemonLifecycleActivity",
-          "settings.experimental.daemonLifecycleKeepalive",
-        ]),
-        e("advanced", "settings.channels.autoActivationTitle", [
-          "settings.channels.autoActivationDesc",
-        ]),
-        e("advanced", "settings.channels.autoEndWatchTitle", [
-          "settings.channels.autoEndWatchDesc",
-        ]),
-        // 授权管理面板内容按需从 daemon 拉取，搜索只索引静态标题/描述（D48）。
-        e("advanced", "settings.permissionRules.title", [
-          "settings.permissionRules.desc",
-        ]),
-      );
-    }
-    // 实验 tab 仅在开启实验性功能后可见（其内容目前仅 macOS 的 Agent 任务卡）。
-    if (!isWindows && isMac && config.value?.experimental.enabled) {
-      list.push(
-        e("experimental", "settings.agentTasks.title", [
+        e("advanced", "settings.agentTasks.title", [
           "settings.agentTasks.description",
           "settings.agentTasks.permission",
           "settings.agentTasks.readiness",

@@ -103,7 +103,14 @@ pub enum ToolLabel {
 }
 
 /// 解析某家 agent 某 session 的「当前活动」。取不到（文件缺失 / 无文字也无工具）返回 `None`。
+/// Cursor 先试 IDE 的 vscdb 实时源（jsonl 在 IDE 长回合内会冻结数小时，spec gui-agent-console
+/// 反馈记录 2026-07-25）；未命中（CLI 会话 / 库缺失 / schema 变化）回退 jsonl。
 pub fn resolve_activity(kind: AgentKind, session_id: &str) -> Option<Activity> {
+    if kind == AgentKind::Cursor {
+        if let Some(a) = super::cursor_vscdb::resolve_activity(session_id) {
+            return Some(a);
+        }
+    }
     let path = transcript_path(kind, session_id)?;
     let lines = read_tail(&path, MAX_TAIL_BYTES);
     let mut activity = analyze(kind, &lines)?;
@@ -190,8 +197,10 @@ fn read_tail(path: &Path, max_bytes: u64) -> Vec<String> {
     lines
 }
 
-/// 尾部窗口内的一条「有意义事件」。
-enum Ev {
+/// 尾部窗口内的一条「有意义事件」。`pub(super)`：Cursor IDE 的 vscdb 适配器
+/// （`cursor_vscdb.rs`）把 bubble 转成同一事件流复用 `aggregate` 聚合。
+#[derive(Clone)]
+pub(super) enum Ev {
     /// 助手自然语言文字。
     Text(String),
     /// 工具调用。
@@ -219,7 +228,14 @@ fn analyze(kind: AgentKind, lines: &[String]) -> Option<Activity> {
         };
         push_events(kind, &v, &mut evs);
     }
+    // Cursor jsonl 的调用**跑完后**才落盘且从不写 tool_result（见 aggregate 注释）→ 全部收敛；
+    // vscdb 源自带真实状态，不走此收敛。
+    aggregate(&evs, kind == AgentKind::Cursor)
+}
 
+/// 事件流 → 「当前活动」聚合（jsonl 与 vscdb 两源共用）。`settle_all`：结尾把所有仍在跑的
+/// 步收敛为已完成（Cursor jsonl 语义——落盘即已结束；其它源维持末步真实状态）。
+pub(super) fn aggregate(evs: &[Ev], settle_all: bool) -> Option<Activity> {
     let mut last_text: Option<String> = None;
     let mut steps: Vec<ToolStep> = Vec::new();
     // 文字之后被挤出时间线的调用数（「省略 N 步」标注）。
@@ -234,7 +250,7 @@ fn analyze(kind: AgentKind, lines: &[String]) -> Option<Activity> {
             }
         }
     }
-    for ev in &evs {
+    for ev in evs {
         match ev {
             Ev::Text(t) => {
                 last_text = Some(t.clone());
@@ -270,31 +286,16 @@ fn analyze(kind: AgentKind, lines: &[String]) -> Option<Activity> {
                 // TODO 更新本身也是一次工具调用（不入时间线）：证明此前的步已结束。
                 // 其后续 tool_result（Claude 会写）落到无 Running 步上自然 no-op。
                 settle_running(&mut steps);
-                if *replace {
-                    todo_list = items.clone();
-                } else {
-                    // Cursor merge=true：按 id 就地更新，未知 id 追加（保持原有顺序）。
-                    for (id, item) in items {
-                        let hit = id.as_deref().and_then(|id| {
-                            todo_list
-                                .iter_mut()
-                                .find(|(eid, _)| eid.as_deref() == Some(id))
-                        });
-                        match hit {
-                            Some((_, existing)) => *existing = item.clone(),
-                            None => todo_list.push((id.clone(), item.clone())),
-                        }
-                    }
-                }
+                apply_todo_update(&mut todo_list, *replace, items);
             }
         }
     }
 
-    // Cursor 的 transcript 只在工具**跑完后**才落盘该次调用（实测 in-flight 探针不可见），
+    // Cursor jsonl 的 transcript 只在工具**跑完后**才落盘该次调用（实测 in-flight 探针不可见），
     // 且从不写 tool_result 事件：出现在 transcript 里的步必已结束 → 全部收敛为已完成。
     // 「进行中」只能来自实时 hook（`activity_parts` 并入的 `currentTool` 末步）。
-    // Claude / Codex / Grok 则在调用**开始**时即写盘 → 末步无结果 = 真在跑，维持进行中。
-    if kind == AgentKind::Cursor {
+    // Claude / Codex / Grok 在调用**开始**时即写盘、vscdb 源自带真实状态 → 维持进行中。
+    if settle_all {
         settle_running(&mut steps);
     }
 
@@ -317,11 +318,88 @@ fn analyze(kind: AgentKind, lines: &[String]) -> Option<Activity> {
     })
 }
 
+/// TODO 重放一步（jsonl 聚合与 vscdb 适配器共用）：`replace` 整表替换；否则按 id 就地
+/// 更新、未知 id 追加（保持原有顺序，Cursor merge=true 语义）。
+pub(super) fn apply_todo_update(
+    ledger: &mut Vec<(Option<String>, TodoItem)>,
+    replace: bool,
+    items: &[(Option<String>, TodoItem)],
+) {
+    if replace {
+        *ledger = items.to_vec();
+        return;
+    }
+    for (id, item) in items {
+        let hit = id.as_deref().and_then(|id| {
+            ledger
+                .iter_mut()
+                .find(|(eid, _)| eid.as_deref() == Some(id))
+        });
+        match hit {
+            Some((_, existing)) => *existing = item.clone(),
+            None => ledger.push((id.clone(), item.clone())),
+        }
+    }
+}
+
 fn push_events(kind: AgentKind, v: &Value, out: &mut Vec<Ev>) {
     match kind {
         AgentKind::Cursor | AgentKind::Claude => push_events_msg(v, out),
         AgentKind::Codex => push_events_codex(v, out),
         AgentKind::Grok => push_events_grok(v, out),
+        AgentKind::Pi => push_events_pi(v, out),
+    }
+}
+
+/// Pi v3 JSONL wraps every conversational message in `{ type: "message", message: ... }`.
+fn push_events_pi(v: &Value, out: &mut Vec<Ev>) {
+    if v.get("type").and_then(Value::as_str) != Some("message") {
+        return;
+    }
+    let Some(message) = v.get("message") else {
+        return;
+    };
+    let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+    if role == "toolResult" {
+        out.push(Ev::ToolResult(
+            message
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ));
+        return;
+    }
+    let Some(content) = message.get("content") else {
+        return;
+    };
+    if role == "assistant" {
+        let Some(parts) = content.as_array() else {
+            return;
+        };
+        for part in parts {
+            match part.get("type").and_then(Value::as_str).unwrap_or("") {
+                "text" => {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        let text = text.trim();
+                        if !text.is_empty() {
+                            out.push(Ev::Text(text.to_string()));
+                        }
+                    }
+                }
+                "toolCall" => {
+                    let name = part.get("name").and_then(Value::as_str).unwrap_or("");
+                    let arguments = part.get("arguments");
+                    if is_todo_tool(name) {
+                        if let Some(event) = parse_todos(arguments) {
+                            out.push(event);
+                        }
+                    } else {
+                        out.push(Ev::Tool(classify_tool(name, arguments)));
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -370,7 +448,8 @@ fn push_events_msg(v: &Value, out: &mut Vec<Ev>) {
 
 /// Codex rollout：`response_item.payload` 的 `message`(assistant output_text) / `function_call` /
 /// `function_call_output`，以及 Code Mode 的 `custom_tool_call` / `custom_tool_call_output`；
-/// `event_msg.payload` 的 `agent_message` 与 `patch_apply_end`。reasoning / token_count 忽略。
+/// `event_msg.payload` 的 `agent_message` 与 `patch_apply_end`；paginated 会话另有
+/// `item_completed` 的 `AgentMessage` / `FileChange`。reasoning / token_count 忽略。
 fn push_events_codex(v: &Value, out: &mut Vec<Ev>) {
     let ttype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let Some(payload) = v.get("payload") else {
@@ -434,7 +513,52 @@ fn push_events_codex(v: &Value, out: &mut Vec<Ev>) {
                 }
             }
         }
+        // Codex 0.148 paginated history: legacy completion events are replaced by
+        // `item_completed` + TurnItem. FileChange is the Write footprint; AgentMessage
+        // is last-assistant text when no `response_item` assistant copy is present.
+        ("event_msg", "item_completed") => {
+            push_codex_item_completed(payload.get("item"), out);
+        }
         _ => {}
+    }
+}
+
+fn push_codex_item_completed(item: Option<&Value>, out: &mut Vec<Ev>) {
+    let Some(item) = item else {
+        return;
+    };
+    match item.get("type").and_then(Value::as_str).unwrap_or("") {
+        "FileChange" => {
+            out.push(Ev::Tool(ToolDisplay {
+                label: ToolLabel::Write,
+                object: patch_changes_object(item.get("changes")),
+            }));
+            out.push(Ev::ToolResult(codex_file_change_failed(item)));
+        }
+        "AgentMessage" => {
+            if let Some(text) = value_text(item.get("content")) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    out.push(Ev::Text(text.to_string()));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn codex_file_change_failed(item: &Value) -> bool {
+    match item.get("status") {
+        Some(Value::Bool(success)) => !success,
+        Some(Value::String(status)) => {
+            let status = status.to_ascii_lowercase();
+            status != "completed" && status != "success" && status != "ok"
+        }
+        Some(Value::Object(status)) => !status
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        _ => false,
     }
 }
 
@@ -518,7 +642,7 @@ fn custom_tool_output_failed(payload: &Value) -> bool {
 }
 
 /// `patch_apply_end.changes` 的路径表 → `首文件名 +N`。只展示 basename，不读取 diff/stdout。
-fn patch_changes_object(changes: Option<&Value>) -> Option<String> {
+pub(super) fn patch_changes_object(changes: Option<&Value>) -> Option<String> {
     let mut names: Vec<String> = changes?
         .as_object()?
         .keys()
@@ -587,8 +711,8 @@ pub(crate) fn is_todo_tool(name: &str) -> bool {
 /// 解析 TodoWrite / update_plan 参数为 TODO 更新事件。
 /// Cursor：`{merge, todos:[{id,content,status}]}`（merge=true 按 id 增量合并）；
 /// Claude：`{todos:[{content,status}]}`（恒整表）；Codex：`{plan:[{step,status}]}`（恒整表）。
-/// 空列表 / 无法解析 → None（忽略，不清空既有清单）。
-fn parse_todos(args: Option<&Value>) -> Option<Ev> {
+/// 空列表 / 无法解析 → None（忽略，不清空既有清单）。`pub(super)`：vscdb 适配器复用。
+pub(super) fn parse_todos(args: Option<&Value>) -> Option<Ev> {
     let o = parse_args(args)?;
     let arr = o.get("todos").or_else(|| o.get("plan"))?.as_array()?;
     let replace = !o.get("merge").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -652,12 +776,20 @@ pub(crate) fn classify_tool(name: &str, args: Option<&Value>) -> ToolDisplay {
 fn is_run(n: &str) -> bool {
     matches!(
         n,
-        "bash" | "shell" | "run_terminal_cmd" | "local_shell" | "local_shell_call" | "exec" | "run"
+        "bash"
+            | "shell"
+            | "run_terminal_cmd"
+            // Cursor IDE（vscdb 源）的工具名。
+            | "run_terminal_command_v2"
+            | "local_shell"
+            | "local_shell_call"
+            | "exec"
+            | "run"
     )
 }
 
 fn is_read(n: &str) -> bool {
-    matches!(n, "read" | "read_file" | "view" | "cat")
+    matches!(n, "read" | "read_file" | "read_file_v2" | "view" | "cat")
 }
 
 fn is_write(n: &str) -> bool {
@@ -665,6 +797,8 @@ fn is_write(n: &str) -> bool {
         n,
         "write"
             | "edit"
+            // Cursor IDE（vscdb 源）的工具名。
+            | "edit_file_v2"
             | "multiedit"
             | "str_replace"
             | "str_replace_editor"
@@ -711,6 +845,8 @@ fn arg_filename(args: Option<&Value>) -> Option<String> {
         "filename",
         "file",
         "notebook_path",
+        // Cursor IDE（vscdb 源）edit_file_v2 的参数键。
+        "relativeWorkspacePath",
     ] {
         if let Some(s) = o.get(k).and_then(|v| v.as_str()) {
             let seg = s.trim_end_matches('/').rsplit('/').next().unwrap_or(s);
@@ -1107,6 +1243,20 @@ mod tests {
     }
 
     #[test]
+    fn pi_v3_text_and_tool_result_are_replayed() {
+        let ls = lines(&[
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"检查文件"},{"type":"toolCall","id":"tool-1","name":"read","arguments":{"path":"/x/src/main.rs"}}]}}"#,
+            r#"{"type":"message","message":{"role":"toolResult","toolCallId":"tool-1","content":[{"type":"text","text":"ok"}],"isError":false}}"#,
+        ]);
+        let activity = analyze(AgentKind::Pi, &ls).unwrap();
+        assert_eq!(activity.text.as_deref(), Some("检查文件"));
+        let step = activity.steps.last().unwrap();
+        assert_eq!(step.tool.label, ToolLabel::Read);
+        assert_eq!(step.tool.object.as_deref(), Some("main.rs"));
+        assert_eq!(step.state, StepState::Done);
+    }
+
+    #[test]
     fn other_tool_keeps_raw_name_and_arg() {
         let ls = lines(&[
             r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Grep","input":{"pattern":"AgentRecord"}}]}}"#,
@@ -1239,5 +1389,79 @@ mod tests {
         let text = resolve_last_assistant_text_from_path(AgentKind::Cursor, &path, 2_000).unwrap();
         assert_eq!(text.matches('你').count(), 2_000);
         assert!(text.ends_with("… [truncated]"));
+    }
+
+    #[test]
+    fn paginated_item_completed_file_change_is_completed_write_step() {
+        // Codex 0.148 paginated exec writes FileChange instead of patch_apply_end.
+        let ls = lines(&[
+            r#"{"timestamp":"t","ordinal":15,"type":"event_msg","payload":{"type":"item_completed","thread_id":"t","turn_id":"u","item":{"type":"FileChange","id":"exec-1","changes":{"/tmp/probe.txt":{"type":"add","content":"PING\n"}},"status":"completed","stdout":"Success.","stderr":""}}}"#,
+        ]);
+        let a = analyze(AgentKind::Codex, &ls).unwrap();
+        assert_eq!(a.steps.len(), 1);
+        let step = &a.steps[0];
+        assert_eq!(step.tool.label, ToolLabel::Write);
+        assert_eq!(step.tool.object.as_deref(), Some("probe.txt"));
+        assert_eq!(step.state, StepState::Done);
+    }
+
+    #[test]
+    fn paginated_item_completed_agent_message_is_last_text() {
+        let ls = lines(&[
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"m1","content":[{"type":"Text","text":"ASKHUMAN_PAGINATED_PROBE_20260820"}],"phase":"final_answer"}}}"#,
+        ]);
+        let a = analyze(AgentKind::Codex, &ls).unwrap();
+        assert_eq!(a.text.as_deref(), Some("ASKHUMAN_PAGINATED_PROBE_20260820"));
+        assert!(a.steps.is_empty());
+    }
+
+    #[test]
+    fn paginated_codex_148_real_session_activity_when_present() {
+        let sid = "01a01ec8-3867-7730-8acf-8911ef19b587";
+        if transcript_path(AgentKind::Codex, sid).is_none() {
+            eprintln!("skip: paginated probe session not on disk");
+            return;
+        }
+        let activity = resolve_activity(AgentKind::Codex, sid);
+        eprintln!("real paginated activity={activity:?}");
+        let Some(activity) = activity else {
+            panic!("expected activity from assistant response_item");
+        };
+        assert!(
+            activity
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("ASKHUMAN_PAGINATED_PROBE_20260820")),
+            "expected last assistant text, got {:?}",
+            activity.text
+        );
+    }
+
+    #[test]
+    fn paginated_codex_148_write_session_activity_when_present() {
+        let sid = "01a01ecc-4f91-7740-8354-494eea787be6";
+        let Some(path) = super::transcript_path(AgentKind::Codex, sid) else {
+            eprintln!("skip: paginated write-session probe not on disk");
+            return;
+        };
+        let activity = resolve_activity(AgentKind::Codex, sid);
+        eprintln!("write-session activity={activity:?} path={path:?}");
+        assert!(
+            activity.is_some(),
+            "expected activity from the write session"
+        );
+        // Later exec/whats_next steps can push FileChange out of the 3-step window;
+        // the TurnItem itself must still parse as a Write.
+        let file_change: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("\"FileChange\""))
+            .map(str::to_string)
+            .collect();
+        let write = analyze(AgentKind::Codex, &file_change).expect("FileChange");
+        assert_eq!(write.steps.len(), 1);
+        assert_eq!(write.steps[0].tool.label, ToolLabel::Write);
+        assert_eq!(write.steps[0].tool.object.as_deref(), Some("probe.txt"));
+        assert_eq!(write.steps[0].state, StepState::Done);
     }
 }

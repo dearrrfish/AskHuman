@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // 共享 Message 区（描述 + AI→人附件 + 复制/源码工具条），顶部常驻、不随题切换。
 import { useI18n } from "vue-i18n";
+import MarkdownContent from "../../components/MarkdownContent.vue";
 import { usePopupContext } from "./context";
 
 const { t } = useI18n();
@@ -9,11 +10,9 @@ const {
   request,
   showDescription,
   messageText,
-  messageHtml,
   viewSource,
   copiedMessage,
   copyMessage,
-  onContentClick,
   attachments,
   selectedFile,
   thumbs,
@@ -29,16 +28,19 @@ const {
 <template>
   <!-- 共享 Message 区（描述 + 附件），仅在有内容时展示，顶部常驻 -->
   <template v-if="showDescription">
-    <div
+    <MarkdownContent
       v-if="messageText && request?.isMarkdown && !viewSource"
-      class="markdown-body"
-      v-html="messageHtml"
-      @click="onContentClick"
-    ></div>
-    <pre v-else-if="messageText" class="plain-body">{{ messageText }}</pre>
+      :source="messageText"
+      data-find-seg="message"
+    />
+    <pre
+      v-else-if="messageText"
+      class="plain-body"
+      data-find-seg="message"
+    >{{ messageText }}</pre>
 
     <div v-if="attachments.length" class="attachments">
-      <div class="att-caption">
+      <div class="att-caption" data-find-skip>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
         </svg>
@@ -59,7 +61,7 @@ const {
           @dragstart="onAttachmentDragStart(file, $event)"
           @contextmenu="onAttachmentContextMenu(file, i, $event)"
         >
-          <span class="att-icon" :class="{ 'is-image': file.isImage && thumbs[file.path] }">
+          <span class="att-icon" :class="{ 'is-image': file.isImage && thumbs[file.path] }" data-find-skip>
             <img v-if="file.isImage && thumbs[file.path]" :src="thumbs[file.path]" alt="" />
             <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
               <path d="M14 3v4a1 1 0 0 0 1 1h4" />
@@ -67,8 +69,8 @@ const {
             </svg>
           </span>
           <span class="att-meta">
-            <span class="att-name">{{ file.name }}</span>
-            <span class="att-size">{{ formatBytes(file.size) }}</span>
+            <span class="att-name" :data-find-seg="`att-${i}`">{{ file.name }}</span>
+            <span class="att-size" data-find-skip>{{ formatBytes(file.size) }}</span>
           </span>
         </div>
       </div>

@@ -32,6 +32,13 @@ pub enum Exiter {
     Ipc(UnboundedSender<RenderOutcome>),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HistoryBinding {
+    pub agent_kind: Option<String>,
+    pub agent_session_id: Option<String>,
+    pub mcp_instance_id: Option<String>,
+}
+
 pub struct Coordinator {
     inner: Mutex<Inner>,
     terminal: FirstTerminalGate<()>,
@@ -45,12 +52,19 @@ pub struct Coordinator {
     /// 内部可变：daemon 异步 walk 进程树解析完成后经 `set_agent_kind` 回填
     /// （MCP 模式 env 判不出家族，只有这条路能拿到），`finish` 落历史时取最新值。
     agent_kind: Mutex<Option<String>>,
+    /// Native Agent session/conversation id used for exact history recovery.
+    agent_session_id: Option<String>,
+    /// Process-scoped MCP instance fallback partition.
+    mcp_instance_id: Option<String>,
     /// 仍在收尾的落败「消息渠道」数（弹窗瞬时关闭，不计入）。
     pending: Arc<AtomicUsize>,
     /// 已采纳的终态结果（首个 submit 写入）。
     result: Mutex<Option<ChannelResult>>,
     /// 赢家渠道 id（首个 submit 写入；与 `result` 不同，`finish` 不会取走，供作答后更新活跃槽读取）。
     winner: Mutex<Option<String>>,
+    /// 终态动作（首个 submit 写入，`finish` 不取走）：只有真实作答才允许进重放缓存
+    /// （spec duplicate-ask-coalescing D6）。
+    winner_action: Mutex<Option<ChannelAction>>,
     /// 是否已进入收尾阶段（首个 submit 后置位）。GUI 据此拦下「关窗即退出」，
     /// 仅放行协调器自身的 `app.exit`，确保结果先输出；收尾前不拦（Cmd+Q 等照常退出）。
     finalizing: AtomicBool,
@@ -58,6 +72,12 @@ pub struct Coordinator {
     emitted: AtomicBool,
     /// Whether this request should be recorded in ordinary reply history.
     record_history_enabled: bool,
+    /// Set once the request handler has finished attaching every surface it intends to use.
+    /// Before that, an empty channel list only means "not attached yet", not "nobody left".
+    surfaces_settled: AtomicBool,
+    /// Why the most recent surface disappeared (`"<id>: <reason>"`), surfaced on stderr when the
+    /// last one goes away.
+    last_surface_loss: Mutex<Option<String>>,
 }
 
 struct Inner {
@@ -77,6 +97,8 @@ impl Coordinator {
         source: String,
         agent_kind: Option<String>,
     ) -> Arc<Self> {
+        let caller = crate::cli::caller_context();
+        let binding = merged_caller_binding(agent_kind, caller);
         Self::build(
             Exiter::Gui(app),
             request,
@@ -84,7 +106,9 @@ impl Coordinator {
             Lang::current(),
             project,
             source,
-            agent_kind,
+            binding.agent_kind,
+            binding.agent_session_id,
+            binding.mcp_instance_id,
             true,
         )
     }
@@ -98,6 +122,8 @@ impl Coordinator {
         project: String,
         source: String,
     ) -> Arc<Self> {
+        let caller = crate::cli::caller_context();
+        let binding = merged_caller_binding(None, caller);
         Self::build(
             Exiter::Process,
             request,
@@ -105,7 +131,9 @@ impl Coordinator {
             Lang::current(),
             project,
             source,
-            None,
+            binding.agent_kind,
+            binding.agent_session_id,
+            binding.mcp_instance_id,
             true,
         )
     }
@@ -118,7 +146,7 @@ impl Coordinator {
         tx: UnboundedSender<RenderOutcome>,
         project: String,
         source: String,
-        agent_kind: Option<String>,
+        binding: HistoryBinding,
         record_history_enabled: bool,
     ) -> Arc<Self> {
         Self::build(
@@ -128,7 +156,9 @@ impl Coordinator {
             lang,
             project,
             source,
-            agent_kind,
+            binding.agent_kind,
+            binding.agent_session_id,
+            binding.mcp_instance_id,
             record_history_enabled,
         )
     }
@@ -142,6 +172,8 @@ impl Coordinator {
         project: String,
         source: String,
         agent_kind: Option<String>,
+        agent_session_id: Option<String>,
+        mcp_instance_id: Option<String>,
         record_history_enabled: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -156,12 +188,17 @@ impl Coordinator {
             project,
             source,
             agent_kind: Mutex::new(agent_kind),
+            agent_session_id,
+            mcp_instance_id,
             pending: Arc::new(AtomicUsize::new(0)),
             result: Mutex::new(None),
             winner: Mutex::new(None),
+            winner_action: Mutex::new(None),
             finalizing: AtomicBool::new(false),
             emitted: AtomicBool::new(false),
             record_history_enabled,
+            surfaces_settled: AtomicBool::new(false),
+            last_surface_loss: Mutex::new(None),
         })
     }
 
@@ -173,6 +210,15 @@ impl Coordinator {
     /// 回填调用方 agent 家族（daemon 异步 walk 解析完成后调用；覆盖 env 探测值或 None）。
     pub fn set_agent_kind(&self, kind: String) {
         *self.agent_kind.lock().unwrap() = Some(kind);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recovery_binding(&self) -> (Option<String>, Option<String>, Option<String>) {
+        (
+            self.agent_kind.lock().unwrap().clone(),
+            self.agent_session_id.clone(),
+            self.mcp_instance_id.clone(),
+        )
     }
 
     pub fn register(&self, channel: Arc<dyn Channel>) {
@@ -189,16 +235,88 @@ impl Coordinator {
             .any(|c| c.id() == id)
     }
 
+    /// A delivery surface disappeared without a human decision: the popup helper died, an IM
+    /// session could not open, the question could not be delivered, or the long connection was
+    /// closed for good. This is **not** a cancel — the surface is simply dropped from the race so
+    /// a later interrupt does not wait on it, `has_channel` lets the daemon re-attach it, and the
+    /// request keeps waiting on whatever remains. Once every surface is gone (and the handler has
+    /// finished attaching, see [`Self::mark_surfaces_settled`]) the request ends with
+    /// `EXIT_NO_CHANNEL` plus a stderr explanation instead of hanging forever or pretending the
+    /// user cancelled.
+    pub fn surface_lost(&self, id: &str, reason: &str) {
+        let remaining = {
+            let mut inner = self.inner.lock().unwrap();
+            let before = inner.channels.len();
+            inner.channels.retain(|c| c.id() != id);
+            if inner.channels.len() == before {
+                // Unknown or already-removed surface: nothing changes, do not touch the reason.
+                return;
+            }
+            inner.channels.len()
+        };
+        *self.last_surface_loss.lock().unwrap() = Some(format!("{id}: {reason}"));
+        if remaining == 0 && self.surfaces_settled.load(Ordering::SeqCst) {
+            self.fail_without_surface();
+        }
+    }
+
+    /// The request handler attached every surface it is going to. From now on an empty channel
+    /// list means nobody can answer, so the request fails fast rather than waiting for a reply
+    /// that cannot arrive.
+    pub fn mark_surfaces_settled(&self) {
+        self.surfaces_settled.store(true, Ordering::SeqCst);
+        let empty = self.inner.lock().unwrap().channels.is_empty();
+        if empty {
+            self.fail_without_surface();
+        }
+    }
+
+    /// Terminate with `EXIT_NO_CHANNEL`: no surface can deliver this question anymore. No history
+    /// entry is written (nothing happened on the human side) and no card is touched (the lost
+    /// surfaces already left on their own).
+    fn fail_without_surface(&self) {
+        if !self.terminal.try_set(()) {
+            return;
+        }
+        self.finalizing.store(true, Ordering::SeqCst);
+        let reason = self
+            .last_surface_loss
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "no delivery channel".to_string());
+        let outcome = RenderOutcome {
+            stdout: String::new(),
+            stderr: Some(format!(
+                "{}{}",
+                i18n::err_prefix(self.lang),
+                i18n::tr(self.lang, "channel.noSurfaceLeft").replace("{reason}", &reason)
+            )),
+            exit_code: super::EXIT_NO_CHANNEL,
+        };
+        self.emit(outcome);
+    }
+
     /// 赢家渠道 id（终态结果的来源；未作答 / 系统取消时为 None）。供作答后把活跃槽更新为该渠道。
     pub fn winner_channel_id(&self) -> Option<String> {
         self.winner.lock().unwrap().clone()
     }
 
+    /// 终态是不是「用户真的答了」。取消 / 系统收尾均为 false（spec duplicate-ask-coalescing D6）。
+    pub fn answered(&self) -> bool {
+        matches!(
+            *self.winner_action.lock().unwrap(),
+            Some(ChannelAction::Send)
+        )
+    }
+
     /// 投递终态结果：仅首个生效；随后取消其余 Channel 并启动收尾窗口，到时输出并退出。
-    pub fn submit(self: &Arc<Self>, result: ChannelResult) {
+    pub fn submit(self: &Arc<Self>, mut result: ChannelResult) {
         if !self.terminal.try_set(()) {
             return;
         }
+        let request = { self.inner.lock().unwrap().request.clone() };
+        crate::todos::apply_todo_deliveries(&request, &mut result, &self.project);
         let (exiter, pending_count, dequeue_ids) = {
             let inner = self.inner.lock().unwrap();
             // 进入收尾：此后 GUI 拦下关窗退出，独占由协调器主动 `app.exit`。
@@ -209,6 +327,7 @@ impl Coordinator {
             // 锁外 best-effort 出队（whats-next / Stop 卡 chip + 弹窗折叠待办区）。
             let dequeue_ids = crate::todos::ids_to_dequeue(&inner.request, &result);
             *self.winner.lock().unwrap() = Some(source.clone());
+            *self.winner_action.lock().unwrap() = Some(action);
             *self.result.lock().unwrap() = Some(result);
 
             let lang = self.lang;
@@ -260,12 +379,8 @@ impl Coordinator {
 
         // 收尾窗口：等落败端收尾完成（pending 归零）或 2s 超时后输出并退出。
         let me = Arc::clone(self);
-        let pending = self.pending.clone();
         let waiter = async move {
-            let deadline = Instant::now() + FINALIZE_TIMEOUT;
-            while pending.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+            me.wait_for_finalizers().await;
             me.finish();
         };
         match exiter {
@@ -288,6 +403,18 @@ impl Coordinator {
             return;
         }
         let inner = self.inner.lock().unwrap();
+        let pending_count = match &inner.headless {
+            Some((_, count)) => *count,
+            None => inner
+                .channels
+                .iter()
+                .filter(|channel| channel.id() != "popup")
+                .count(),
+        };
+        // Caller disconnect cancellation has no result waiter to keep the request handler alive.
+        // Count IM finalizers before interrupting them so the daemon can retain the coordinator
+        // until every card reaches a terminal state (or the bounded timeout expires).
+        self.pending.store(pending_count, Ordering::SeqCst);
         let reason = Interruption::Cancelled(source);
         match &inner.headless {
             Some((preempt, _)) => preempt.interrupt(reason),
@@ -304,6 +431,18 @@ impl Coordinator {
             &ChannelResult::cancel(source_channel_id),
             &[],
         );
+    }
+
+    /// Wait for interrupted IM channels to finish their terminal card updates.
+    ///
+    /// This is shared by normal first-answer finalization and caller-disconnect cancellation.
+    /// The timeout keeps a broken network integration from retaining a daemon request forever.
+    pub async fn wait_for_finalizers(&self) -> bool {
+        let deadline = Instant::now() + FINALIZE_TIMEOUT;
+        while self.pending.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.pending.load(Ordering::SeqCst) == 0
     }
 
     /// 一个落败渠道完成收尾时调用：未归零则减一（用于提前结束收尾窗口）。
@@ -337,6 +476,20 @@ impl Coordinator {
         let (outcome, image_paths) = super::render_result(&request, &result, self.lang);
         // 旁路写回复历史：最佳努力，绝不影响主流程（stdout / 退出码）。
         self.record_history(&request, &result, &image_paths);
+        self.deliver(exiter, outcome);
+    }
+
+    /// Emit an already-rendered outcome exactly once (shared by `finish` and the no-surface
+    /// failure path).
+    fn emit(&self, outcome: RenderOutcome) {
+        if self.emitted.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let exiter = self.inner.lock().unwrap().exiter.clone();
+        self.deliver(exiter, outcome);
+    }
+
+    fn deliver(&self, exiter: Exiter, outcome: RenderOutcome) {
         // Daemon 模式：回传连接处理器，不打印、不退出（进程常驻）。
         if let Exiter::Ipc(tx) = &exiter {
             let _ = tx.send(outcome);
@@ -376,6 +529,17 @@ impl Coordinator {
         if limit == 0 {
             return;
         }
+        let entry = self.history_entry(request, result, image_paths, crate::history::now_ms());
+        crate::history::record(entry, limit);
+    }
+
+    fn history_entry(
+        &self,
+        request: &AskRequest,
+        result: &ChannelResult,
+        image_paths: &[Vec<String>],
+        timestamp_ms: i64,
+    ) -> crate::history::HistoryEntry {
         let answers = match result.action {
             ChannelAction::Cancel => Vec::new(),
             ChannelAction::Send => result
@@ -390,20 +554,32 @@ impl Coordinator {
                 })
                 .collect(),
         };
-        let entry = crate::history::HistoryEntry {
+        crate::history::HistoryEntry {
             id: request.id.clone(),
-            timestamp_ms: crate::history::now_ms(),
+            timestamp_ms,
             project: self.project.clone(),
             source: self.source.clone(),
             agent_kind: self.agent_kind.lock().unwrap().clone(),
+            agent_session_id: self.agent_session_id.clone(),
+            mcp_instance_id: self.mcp_instance_id.clone(),
             channel: result.source_channel_id.clone(),
             action: result.action,
             is_markdown: request.is_markdown,
             message: request.message.clone(),
             questions: request.questions.clone(),
             answers,
-        };
-        crate::history::record(entry, limit);
+        }
+    }
+}
+
+fn merged_caller_binding(
+    explicit_agent_kind: Option<String>,
+    caller: crate::cli::CallerContext,
+) -> HistoryBinding {
+    HistoryBinding {
+        agent_kind: explicit_agent_kind.or(caller.agent_kind),
+        agent_session_id: caller.agent_session_id,
+        mcp_instance_id: caller.mcp_instance_id,
     }
 }
 
@@ -416,5 +592,286 @@ fn display_name(id: &str, lang: Lang) -> String {
         "feishu" => i18n::tr(lang, "channel.sourceFeishu").to_string(),
         "slack" => i18n::tr(lang, "channel.sourceSlack").to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channels::ConversationOrigin;
+    use crate::models::{MessagePrompt, Question, QuestionAnswer};
+
+    struct InterruptChannel {
+        id: &'static str,
+        interrupted: Arc<AtomicBool>,
+    }
+
+    impl Channel for InterruptChannel {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn start(
+            &self,
+            _request: &AskRequest,
+            _origin: &ConversationOrigin,
+            _sink: Arc<Coordinator>,
+        ) {
+        }
+
+        fn interrupt(&self, _reason: &Interruption) {
+            self.interrupted.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn coordinator() -> Arc<Coordinator> {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        Coordinator::new_ipc(
+            AskRequest::new(
+                MessagePrompt::new("context".into(), Vec::new()),
+                vec![Question::new("question".into(), Vec::new())],
+                true,
+            ),
+            Lang::En,
+            tx,
+            "/project".into(),
+            "Codex".into(),
+            HistoryBinding {
+                agent_kind: Some("codex".into()),
+                agent_session_id: Some("session-1".into()),
+                mcp_instance_id: Some("instance-1".into()),
+            },
+            true,
+        )
+    }
+
+    #[test]
+    fn history_entry_preserves_exact_agent_and_mcp_binding() {
+        let coordinator = coordinator();
+        let request = coordinator.inner.lock().unwrap().request.clone();
+        let result = ChannelResult {
+            action: ChannelAction::Send,
+            answers: vec![QuestionAnswer {
+                selected_options: vec!["Yes".into()],
+                user_input: Some("details".into()),
+                images: Vec::new(),
+                files: vec!["/tmp/file.txt".into()],
+                todo_ids: Vec::new(),
+                todo_selections: Vec::new(),
+            }],
+            source_channel_id: "popup".into(),
+        };
+        let entry =
+            coordinator.history_entry(&request, &result, &[vec!["/tmp/image.png".into()]], 123);
+        assert_eq!(entry.timestamp_ms, 123);
+        assert_eq!(entry.agent_kind.as_deref(), Some("codex"));
+        assert_eq!(entry.agent_session_id.as_deref(), Some("session-1"));
+        assert_eq!(entry.mcp_instance_id.as_deref(), Some("instance-1"));
+        assert_eq!(entry.answers[0].selected_options, ["Yes"]);
+        assert_eq!(entry.answers[0].images, ["/tmp/image.png"]);
+        assert_eq!(entry.answers[0].files, ["/tmp/file.txt"]);
+
+        coordinator.set_agent_kind("cursor".into());
+        let updated = coordinator.history_entry(&request, &result, &[], 124);
+        assert_eq!(updated.agent_kind.as_deref(), Some("cursor"));
+        assert_eq!(updated.agent_session_id.as_deref(), Some("session-1"));
+    }
+
+    #[test]
+    fn cancelled_history_entry_keeps_binding_but_never_answers() {
+        let coordinator = coordinator();
+        let request = coordinator.inner.lock().unwrap().request.clone();
+        let mut result = ChannelResult::cancel("popup");
+        result.answers.push(QuestionAnswer::default());
+        let entry = coordinator.history_entry(&request, &result, &[], 123);
+        assert_eq!(entry.action, ChannelAction::Cancel);
+        assert!(entry.answers.is_empty());
+        assert_eq!(entry.agent_session_id.as_deref(), Some("session-1"));
+        assert_eq!(entry.mcp_instance_id.as_deref(), Some("instance-1"));
+    }
+
+    #[test]
+    fn coordinator_bindings_keep_cross_platform_caller_context() {
+        let caller = crate::cli::CallerContext {
+            agent_kind: Some("codex".into()),
+            agent_session_id: Some("thread".into()),
+            mcp_instance_id: Some("instance".into()),
+            from_mcp: true,
+        };
+        assert_eq!(
+            merged_caller_binding(None, caller.clone()),
+            HistoryBinding {
+                agent_kind: Some("codex".into()),
+                agent_session_id: Some("thread".into()),
+                mcp_instance_id: Some("instance".into()),
+            }
+        );
+        assert_eq!(
+            merged_caller_binding(Some("cursor".into()), caller),
+            HistoryBinding {
+                agent_kind: Some("cursor".into()),
+                agent_session_id: Some("thread".into()),
+                mcp_instance_id: Some("instance".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_waits_for_im_finalizers_but_not_popup() {
+        let coordinator = coordinator();
+        let popup_interrupted = Arc::new(AtomicBool::new(false));
+        let im_interrupted = Arc::new(AtomicBool::new(false));
+        coordinator.register(Arc::new(InterruptChannel {
+            id: "popup",
+            interrupted: popup_interrupted.clone(),
+        }));
+        coordinator.register(Arc::new(InterruptChannel {
+            id: "feishu",
+            interrupted: im_interrupted.clone(),
+        }));
+
+        coordinator.cancel_request("Caller".into(), "caller");
+
+        assert!(popup_interrupted.load(Ordering::SeqCst));
+        assert!(im_interrupted.load(Ordering::SeqCst));
+        assert_eq!(coordinator.pending.load(Ordering::SeqCst), 1);
+        coordinator.notify_finalized();
+        assert!(coordinator.wait_for_finalizers().await);
+    }
+
+    /// Coordinator whose rendered outcomes are observable and which never touches reply history
+    /// (`record_history_enabled = false`, so these tests cannot pollute `~/.askhuman`).
+    fn observable_coordinator() -> (
+        Arc<Coordinator>,
+        tokio::sync::mpsc::UnboundedReceiver<RenderOutcome>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let coordinator = Coordinator::new_ipc(
+            AskRequest::new(
+                MessagePrompt::new("context".into(), Vec::new()),
+                vec![Question::new("question".into(), Vec::new())],
+                true,
+            ),
+            Lang::En,
+            tx,
+            "/project".into(),
+            "Codex".into(),
+            HistoryBinding::default(),
+            false,
+        );
+        (coordinator, rx)
+    }
+
+    fn surface(id: &'static str) -> (Arc<dyn Channel>, Arc<AtomicBool>) {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let channel: Arc<dyn Channel> = Arc::new(InterruptChannel {
+            id,
+            interrupted: interrupted.clone(),
+        });
+        (channel, interrupted)
+    }
+
+    #[test]
+    fn losing_one_surface_keeps_the_request_waiting_on_the_others() {
+        let (coordinator, mut rx) = observable_coordinator();
+        let (popup, popup_interrupted) = surface("popup");
+        let (feishu, _) = surface("feishu");
+        coordinator.register(popup);
+        coordinator.register(feishu);
+        coordinator.mark_surfaces_settled();
+
+        coordinator.surface_lost("popup", "popup closed unexpectedly");
+
+        assert!(!coordinator.has_channel("popup"));
+        assert!(coordinator.has_channel("feishu"));
+        assert!(!coordinator.is_finalizing());
+        assert!(rx.try_recv().is_err(), "no outcome while a surface remains");
+        // A lost surface is not a loser to interrupt or wait for later.
+        coordinator.cancel_request("Caller".into(), "caller");
+        assert!(!popup_interrupted.load(Ordering::SeqCst));
+        assert_eq!(coordinator.pending.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn losing_the_last_surface_fails_with_exit_3_and_a_reason_instead_of_hanging() {
+        let (coordinator, mut rx) = observable_coordinator();
+        let (popup, _) = surface("popup");
+        let (feishu, _) = surface("feishu");
+        coordinator.register(popup);
+        coordinator.register(feishu);
+        coordinator.mark_surfaces_settled();
+
+        coordinator.surface_lost("feishu", "connection closed");
+        assert!(rx.try_recv().is_err());
+        coordinator.surface_lost(
+            "popup",
+            "popup closed unexpectedly before an answer was given",
+        );
+
+        let outcome = rx.try_recv().expect("last surface gone → terminal outcome");
+        assert_eq!(outcome.exit_code, super::super::EXIT_NO_CHANNEL);
+        assert!(outcome.stdout.is_empty());
+        let stderr = outcome.stderr.expect("stderr explains the failure");
+        assert!(
+            stderr.contains("popup: popup closed unexpectedly"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("nobody answered"), "{stderr}");
+        assert!(coordinator.is_finalizing());
+        assert!(!coordinator.answered(), "never enters the replay cache");
+        // Terminal: a late answer or cancel changes nothing.
+        coordinator.submit(ChannelResult::cancel("popup"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn surfaces_lost_before_attach_finished_do_not_fail_early() {
+        let (coordinator, mut rx) = observable_coordinator();
+        let (popup, _) = surface("popup");
+        coordinator.register(popup);
+        // Popup could not be spawned while IM routers are still connecting.
+        coordinator.surface_lost("popup", "failed to spawn popup");
+        assert!(rx.try_recv().is_err(), "attach not settled yet");
+        assert!(!coordinator.is_finalizing());
+
+        let (slack, _) = surface("slack");
+        coordinator.register(slack);
+        coordinator.mark_surfaces_settled();
+        assert!(rx.try_recv().is_err(), "slack keeps the request alive");
+    }
+
+    #[test]
+    fn settling_with_no_surface_at_all_fails_immediately() {
+        let (coordinator, mut rx) = observable_coordinator();
+        let (popup, _) = surface("popup");
+        coordinator.register(popup);
+        coordinator.surface_lost("popup", "popup disabled or no display available");
+        coordinator.mark_surfaces_settled();
+        let outcome = rx.try_recv().expect("nothing attached → fail fast");
+        assert_eq!(outcome.exit_code, super::super::EXIT_NO_CHANNEL);
+        assert!(outcome
+            .stderr
+            .as_deref()
+            .unwrap_or_default()
+            .contains("popup disabled or no display available"));
+    }
+
+    #[test]
+    fn unknown_or_repeated_surface_ids_are_ignored() {
+        let (coordinator, mut rx) = observable_coordinator();
+        let (popup, _) = surface("popup");
+        coordinator.register(popup);
+        coordinator.mark_surfaces_settled();
+        coordinator.surface_lost("telegram", "never attached");
+        assert!(coordinator.has_channel("popup"));
+        assert!(rx.try_recv().is_err());
+        coordinator.surface_lost("popup", "first");
+        let first = rx.try_recv().expect("popup was the last surface");
+        assert!(first.stderr.unwrap_or_default().contains("popup: first"));
+        coordinator.surface_lost("popup", "second");
+        assert!(
+            rx.try_recv().is_err(),
+            "already terminal; no second outcome"
+        );
     }
 }

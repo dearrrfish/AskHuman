@@ -1,0 +1,160 @@
+# 需求：Agent 状态窗口改版为双栏「Agent 控制台」（集成 Watch）
+
+> 状态：已实现（2026-07-25）。
+> 实现计划：`docs/plans/gui-agent-console.md`。
+> 视觉/交互基准：`src/prototype/agent-console.html`（浏览器直跑原型，迭代先行；
+> 运行方式见 `docs/development.md`「UI prototyping」）。
+> 复用 / 依赖：`docs/specs/im-watch.md`（WatchFrame / 签名引擎 / 活动解析）、
+> `docs/specs/agent-lifecycle-tracking.md`（registry 快照与 GUI 订阅）、
+> `docs/specs/agent-interject.md`（插话队列）、
+> `docs/specs/gui-agent-task-launch.md`（新建任务表单与启动链路）、
+> `docs/specs/menu-bar-tray.md`（GUI Host 承载）。
+> 平台：macOS / Linux / Windows 共享 GUI Host + daemon；「＋」新建任务支持 macOS 与 Windows。
+> 聚焦终端支持 macOS Terminal.app/iTerm2 的 pid+TTY 精确匹配，以及 AskHuman 启动的 Windows
+> Terminal 任务的登记 launch UUID 精确匹配。
+
+## 1. 背景与目标
+
+现有 Agent 状态窗口（`AgentsView.vue`）是单栏卡片列表，只有生命周期元数据；会话「正在做什么」
+的实时视图（最后一段助手文字 / 足迹时间线 / TODO）目前只在 IM `/watch` 卡上有。本需求把窗口
+改造成 Codex / Claude 桌面客户端式的**双栏布局**：
+
+1. 边栏＝最近项目 + 各项目下的会话（工作中 / 等待回答 / 空闲 / 已结束）；
+2. 点选会话，右侧详情区显示该会话的 Watch 实时状态（与 IM Watch 同帧，就地刷新）；
+3. 会话工作中时详情区底部有输入框，可给 agent 发带文件/图片附件的插话消息；
+4. 项目组头「＋」在右栏打开新建任务表单，启动后自动选中新会话。
+
+## 2. 已确认决策（用户经 AskHuman 定案，2026-07-24）
+
+| 编号 | 决策项 | 结论 |
+|---|---|---|
+| C1 | 整体形态 | 改造现有 Agent 状态窗口为**双栏**（边栏 + 详情区），不新增第二个窗口 |
+| C2 | 详情深度 | **与 IM Watch 同帧**：复用 `WatchFrame`（状态行 + 最后一段助手文字 + 足迹时间线 ≤3 步 + TODO + 累计工作时长），就地刷新。GUI 侧放宽文字截断上限并用 **Markdown 渲染**；显式 Mermaid fence 共用本地图表组件，同源 frame 不重复渲染，新源使旧异步结果失效。不做前端累积活动流，不做完整会话回放（列入后续候选） |
+| C3 | 输入框语义 | **追加**（同 IM `/msg`）：文本、源文件引用和粘贴图片可组合或仅附件发送；待送达消息显示为输入框上方可撤回的气泡，同时显示条目数与附件数，再次发送即追加队列；不采用 composer 的整体覆盖语义。附件生命周期见 `agent-interject.md` D2 |
+| C4 | 「＋」新建任务形态 | **嵌入右栏**：点组头「＋」右栏切换为任务表单（项目已选定），完整复用新建任务窗口的表单逻辑与启动链路（readiness / LaunchRecord / Terminal.app / 待办来源 / 权限三态）；启动成功后 best-effort **自动选中新出现的会话**（按 cwd + 启动时间匹配） |
+| C5 | 边栏范围 | 有会话的项目 + **「最近项目」折叠区**（来自 workspace 索引 `agents/workspaces.rs`，过滤 hidden / 不存在路径）；无活跃会话的项目也能点「＋」 |
+| C6 | 视图维度 | **移除**现有「状态 / 类型 / 项目」三维切换：固定按项目分组，顶部加「全部 / 工作中 / 空闲」过滤，会话行带家族标识 |
+| C7 | 等待回答（Waiting） | 纳入设计：边栏会话行显示 🙋 态；详情区顶部横幅「正在等待你的回答」+「去回答」按钮聚焦待答弹窗（复用托盘同款能力）。daemon 推给 GUI 的快照需补 waiting 标志（数据源 `RequestRegistry` 已有） |
+| C8 | 数据链路 | agents GUI 订阅协议新增**「焦点会话」子订阅**：窗口告知 daemon 当前选中的 session，daemon 复用 IM Watch 引擎（事件 Notify + 2s/10s tick + 签名门控）推结构化帧。**不占** IM watch 每渠道 5 个名额、**不持久化**、切换选中 / 关窗即停。刷新粒度与 IM 相同（变化驱动的最新一帧，非 token 级） |
+| C9 | 插话可用性 | 输入框仅对**工作中且非 Grok**的会话显示（包括 Pi Extension 会话，与现有插话约束一致）；空闲 / 已结束显示灰色提示，macOS 与 Windows 上空闲会话可附「在此项目新建任务」快捷入口 |
+| C10 | 现有入口调整 | 卡片「发消息」按钮（原弹独立 composer 窗口）改为：选中该会话 + 聚焦底部输入框；**托盘的插话入口暂保留**独立 composer 窗口，后续再议 |
+| C11 | Dev 环境 | 本功能在独立 worktree（`feat/gui-agent-console`）+ popup-only Dev Instance 开发，不挂 IM 测试渠道 |
+| C12 | 前瞻预留 | 为未来「提问收进控制台内联作答」的设想预留 5 个结构点（R1–R5，见 §5），**只选形状、不写功能代码**；弹窗集成本身未定案、不在本 spec 范围 |
+| C13 | 状态指示器视觉系统（原型定稿 2026-07-25） | 工作中＝移植 Cursor 的 `ui-ascii-loading-indicator`（sine_3x3：3×3 点阵、8 帧位掩码 `[189,220,90,78,45,291,306,433]`、175ms/帧，所有工作中行共用同一帧同步动画）；颜色低饱和且随主题（深色＝42% 绿混白、浅色＝70% 深绿混深灰，CSS 变量统一，详情页状态文字同色）；等待回答＝🙋（轻微浮动）；空闲＝同一点阵**静态 4 点**（中行 3 点＋右上 1 点）灰色（「动停了」隐喻）；已结束＝无指示物、整行灰显。不用彩色圆点区分状态 |
+| C14 | 完整会话视图（原型定稿 2026-07-25） | 详情区默认「最近动态」，标题行右侧按钮切「完整会话」（同位置变「返回」；切换会话自动回默认）；进入即定位最新，**每页 200 条向上分页**（顶部按钮加载更早，滚动位置锚定），标题行 sticky 显示已加载/总数；渲染：用户消息＝蓝底气泡、助手文字＝Markdown、工具调用＝足迹同款紧凑行；助手文字与 AskHuman message 的显式 Mermaid fence 安全渲染，每个 body 最多 10 图，并用 IntersectionObserver 调度可见区附近内容；图表异步变高时保持底部跟随或旧内容阅读锚点。**AskHuman 为一等问答卡**（🙋 徽标＋提问＋蓝底「你」的回答；未回答显示占位）；多问题＝message 下 Q1/Q2/Qn 子块各带回答；长 message 4 行截断＋展开全文/收起。实现须把 `transcript_full::AskHumanBlock` 扩展为结构化 `{kind, message, questions[{text, answer}]}`（MCP `ask` 读 `questions` 参数；MCP `whats_next` 与 CLI `--whats-next` 标为独立 kind，由前端按界面语言显示固定问题「接下来做什么？」；两种 MCP 工具都从 Codex content block 解出与 CLI 相同的文本区块，答案按 `# Qn` 分组回填；普通 CLI 解析 `-q`），daemon 侧按游标分页 |
+| C15 | 项目 diff 状态条 + stage（原型定稿 2026-07-25） | 输入框上方一条**项目级**「未暂存变更」状态条（文件数/新增数/±行数；无变更不显示）；展开＝文件列表（M/A/D 徽标＋每文件 ±行数＋行内「暂存」），再点单文件展开 hunk 视图（红绿底色、面板内滚动 ≤300px）；**单文件暂存直接执行、「全部暂存」行内二次确认**——GUI 点按钮已是明确意图，不走跨渠道 Confirm（IM `/stage` 的 Confirm 不变量不变）；复用 `gitutil::DiffModel`，GUI Host 直调不经 daemon；需补单文件 `git add <path>`（现仅 stage_all） |
+| C16 | diff 刷新时机（性能，用户强调） | 大仓库 git 可能很慢，**不频繁调用**：两级懒加载——状态条只跑 `numstat`，hunk 在单文件展开时才跑 `git diff -- <path>`；刷新触发＝选中会话 / 展开面板 / 焦点会话帧变化且含编辑-写入步（防抖合并 ≥2s）/ 窗口重获焦点；调用互斥（上次未返回不重发）、带超时；**不做常驻轮询** |
+| C17 | Popup 反向快捷入口（2026-07-25） | 普通 ask、whats-next 与 Agent 权限确认共用的 Popup 顶栏，在 daemon 能把调用方 `(agent_kind, agent_session_id)` **精确命中活动 AgentRegistry 记录**时显示「在 Agent 窗口中查看」；按钮位于右侧动作区的**置顶右侧、待办左侧**。五家 Agent 与桌面平台统一口径，不按 pid / cwd / 家族模糊猜测。点击保持 Popup 打开，经 GUI Host 打开或聚焦全局唯一 Agent Window 并定位该 session；未追踪或无可信绑定时隐藏。左侧 Agent badge 的「聚焦终端」语义不变 |
+
+## 3. 布局示意
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│ ⬤⬤⬤  Agents                     [全部|工作中|空闲] (过滤)      │
+├────────────────────┬──────────────────────────────────────────┤
+│ HumanInLoop    ２🟢 ＋ │  Cursor ·「重构 daemon 空闲退出」        │
+│  🟢 重构空闲退出     │  🟢 工作中 · 累计 6 分钟   [终端][待办][⏸] │
+│  🙋 权限记忆对拍     │ ──────────────────────────────────────── │
+│ WebApp         １⚪ ＋ │  最近动态（14:32:05）                    │
+│  ⚪ 修复登录跳转     │  我已经完成 registry 的改动，现在开始…      │
+│                    │  ● 读取: registry.rs                      │
+│ ▸ 最近项目（无会话） │  ● 编辑: mod.rs                           │
+│    ProjX       ＋   │  ● 运行命令: cargo test（进行中）          │
+│    ProjY       ＋   │  ▸ 📋 TODO 4/7 · 当前：跑单测              │
+│                    │ ──────────────────────────────────────── │
+│                    │  ⏳ 待送达 1 条：「先别改 config」 [撤回]    │
+│                    │  ┌────────────────────────────┐          │
+│                    │  │ 给这个 agent 发消息…        │ [发送⌘↵] │
+│                    │  └────────────────────────────┘          │
+└────────────────────┴──────────────────────────────────────────┘
+```
+
+- **边栏**：按项目（git 根 / cwd 末段）分组，组按组内最近活动倒序；组头＝项目名 + 工作中数量
+  徽标 + hover「＋」（门控同新建任务窗口：macOS + Terminal.app，或 Windows + Windows Terminal）。会话行＝状态点
+  （🟢 工作中 / 🙋 等待回答 / ⚪ 空闲 / 灰＝已结束）+ 家族标识 + 标题 + 相对时间；组内排序
+  工作中 → 等待 → 空闲 → 已结束，各按时间倒序。已结束会话灰显保留（跟随 registry 语义）。
+- **详情区头部**：家族 + 标题 + 项目路径；状态行同 Watch 卡（四态 + 累计工作时长）；动作按钮
+  ＝聚焦终端 / 项目待办 / 手动置空闲（现有能力平移）。
+- **详情区正文**：Watch 帧（C2）；TODO 面板 GUI 可展开全清单。
+
+## 4. 额外纳入的优化点（随定案一并确认）
+
+1. 等待回答横幅 +「去回答」聚焦弹窗（C7）；
+2. 项目组头带待办数徽标；「＋」表单里待办可直接选为任务来源（新建任务窗口已支持）；
+3. Popup 在严格匹配会话时提供反向入口，形成「控制台 → 去回答」与「Popup → 查看会话」双向寻址（C17）；
+4. 键盘导航：↑↓ 切会话、⌘N 新任务、⌘↵ 发送；窗口记住尺寸。
+
+## 5. 前瞻预留（C12，用户定案 2026-07-24）
+
+未来设想（未定案）：提问弹窗可收进控制台内联作答——有提问时激活窗口、边栏打点、逐个处理，
+多 agent 并发时不再多浮窗乱弹。为让届时是「加内容」而非「改结构」，v1 采纳以下形状决策：
+
+- **R1 交互区插槽**：详情区底部不是写死的插话输入框，而是按优先级切换内容的「交互区」组件
+  （插话文本与附件输入 / 灰色提示 / 新建任务快捷入口 / 等待横幅）；未来提问卡是该插槽的最高优先级内容。
+- **R2 waiting 带请求 id**：快照的等待标志做成 `waitingRequestId`（在途提问请求 id），
+  v1「去回答」即可精确聚焦对应弹窗，未来内联作答寻址同一 id。
+- **R3 通用分组模型**：边栏分组用 `{key, label, kind, items}` 通用形状；未来「其它提问」
+  （归不到会话的提问）是新增一种组，不改渲染结构。
+- **R4 可寻址的窗口打开**：`open_agents(session?)` 携带可选目标会话（C10 本就需要）；
+  C17 的 Popup 反向入口已复用该能力；未来「有提问 → 自动激活窗口并定位会话」仍可复用。
+- **R5 可扩展的子订阅消息**：焦点会话推送用带类型标签的 detail 消息（非裸 `WatchFrame`），
+  未来在同一订阅上附加提问负载只是加字段/变体。
+
+明确**不**预留：抢答/渠道机制（未来复用 popup 渠道身份）、弹窗组件抽象（同一 Vue 代码库，
+届时直接复用）、接管模式/激活策略等纯未来决策（v1 不写开关或死代码）。
+
+## 6. 复用与新增触点（实现地图，供计划阶段展开）
+
+- 复用：`watch.rs`（`WatchFrame` / `build_frame` / `signature`）、`autochannel::activity_parts`、
+  `agents/registry.rs::snapshot`、`daemon/runtime/watch.rs` 引擎节奏、
+  `daemon/runtime/subs.rs`（agents 订阅 + interject IPC）、`agents/workspaces.rs`、
+  `NewTaskView.vue` 表单域逻辑与 `new_task_*` 命令、托盘「聚焦待答 Popup」能力。
+- 新增（预估）：agents 订阅协议的焦点会话子订阅消息（tagged detail 消息，R5）+ GUI 侧对应
+  事件；快照补 `waitingRequestId`（R2；前端 `AgentRecord` 另补 `activeElapsedSecs` 类型声明）；
+  `AgentsView.vue` 双栏重构（边栏 / 详情 / 交互区插槽（R1）/ 内嵌任务表单组件化）。
+
+## 7. 非目标
+
+- 不做 token 级流式输出（transcript 数据源决定）；
+- 不做内联回答提问（前瞻预留见 C12/R1–R5）；
+- 不改 IM Watch 的行为与名额；不改插话队列的追加语义；IM `/msg` 仍为纯文本；
+- 不在本窗口内管理 workspace（pin / hide 仍在设置「高级 → 从 IM 创建 Agent 任务」面板）。
+
+（原列为后续候选的「完整会话回放」「查看变更 /diff」已在原型阶段定案纳入 v1，见 C14/C15。）
+
+## 8. 反馈记录
+
+- **2026-07-24**：初版定案（C1–C11）：双栏改造；详情与 IM Watch 同帧 + Markdown；输入框追加
+  语义；「＋」嵌入右栏；边栏含最近项目折叠区；移除三维切换改顶部过滤。
+- **2026-07-24（第二轮）**：为未来「提问收进控制台」畅想补前瞻预留 C12 / R1–R5（只选结构
+  形状，不写功能代码）；弹窗集成的接管模式、激活策略等保持未定案、不入本 spec。
+- **2026-07-24/25（原型迭代）**：以可运行原型（`src/prototype/agent-console.html`，浏览器直跑
+  + mock 数据）逐项验收视觉与交互，定案 C13–C16：状态指示器（Cursor sine_3x3 点阵、低饱和
+  主题色、空闲静态 4 点、已结束无指示物）；完整会话视图（200 条向上分页、AskHuman 结构化
+  问答卡、多问题 Q1/Qn 子块、长 message 折叠）；项目 diff 状态条（两级懒加载、单文件直接
+  暂存、全部暂存行内确认）；diff 刷新时机以性能优先（防抖/互斥/不轮询）。
+- **2026-07-25（真机验收微调）**：diff 面板内文件头 sticky 置顶（长 diff 深处可随时收起）；
+  标题解析剥 Cursor `<timestamp>`/`<user_query>` 包装（否则回退路径全被当注入块滤掉）；
+  托盘 Agent 区独立成组——「打开 Agent 状态窗口」直达项 + 忙闲概览子菜单
+  （标签即「工作中 w · 空闲 i」；agent-interject spec D7 已同步修订）；边栏项目头待办
+  徽标可点击（打开该项目待办窗口）。
+- **2026-07-25（最近动态数据源根治）**：用户实证「文字数小时不更新 + 工具一闪而过」。
+  根因：① Cursor IDE（Agent Window）的 agent-transcripts jsonl 在长回合内冻结（AskHuman
+  协议下回合永不结束 → 等于永不落盘；CLI 形态逐工具落盘不受影响）；② 实时 `currentTool`
+  与 transcript **文件 mtime** 比时刻，被无关写入秒级挤掉。根治：新增
+  `agents/cursor_vscdb.rs` 直读 Cursor 全局 `state.vscdb`（`composerData`/`bubbleId` 键，
+  实时明文：官方标题 + 逐条文字 + 工具真实状态），activity/标题/完整会话三处路由优先走它、
+  失败回退 jsonl；融合改按内容收敛（详见 im-watch spec 状态行小节）。
+- **2026-07-25（Codex MCP 完整会话修正）**：Codex rollout 的 MCP 工具名是短名
+  `ask` / `whats_next`，结果按 `call_id` 关联，并在 `Output:` 后包装为 MCP text content
+  block；其内文本才是与 CLI 一致的结果区块。完整会话改为按 `call_id` 配对，解开 content
+  block 后解析 `# Qn` / `[selected_options]` / `[user_input]`，两种交互工具都呈现为
+  AskHuman 问答卡；MCP 与 CLI 的 whats-next 卡由前端本地化补出固定问题「接下来做什么？」；
+  低成本兼容旧 `answers[]` JSON。`show_last` / `todo_add` 保持普通工具行。
+- **2026-07-25（Popup 反向入口）**：Popup 顶栏新增条件 Agent Window 入口。daemon 只在
+  `agent_kind + agent_session_id` 命中活动 registry 记录时下发可寻址 session；Codex `_meta.threadId`、
+  Claude/Cursor 一次性 token、Grok 唯一 claim 与 CLI env 都进入同一门控，不做 pid/project 猜测。
+  入口覆盖 ask、whats-next 和权限确认，保持原 Agent badge 聚焦终端行为；打开窗口时沿用 Popup
+  置顶层级并通过 URL / `agents-goto` 定位会话。
+- **2026-08-02（插话附件）**：交互区支持文件选择、拖入、粘贴图片与仅附件发送；待送达气泡增加
+  附件计数。普通文件引用源路径，剪贴板图片使用 24 小时请求临时目录；IM 仍为纯文本。

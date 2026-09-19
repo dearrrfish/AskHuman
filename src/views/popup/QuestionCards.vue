@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // 纵向模式（实验开关 + 多题）：所有问题纵向平铺成卡片，scroll-spy 定位当前题。
 import { useI18n } from "vue-i18n";
+import MarkdownContent from "../../components/MarkdownContent.vue";
 import { usePopupContext } from "./context";
 import AnswerComposer from "./AnswerComposer.vue";
 import { optionDisplayText } from "./optionDisplay";
@@ -11,8 +12,6 @@ const {
   questions,
   total,
   viewSource,
-  questionHtml,
-  onContentClick,
   chosenByQ,
   single,
   selectOnly,
@@ -21,6 +20,7 @@ const {
   setActive,
   setCardRef,
   setSentinelRef,
+  dropTargetQ,
 } = usePopupContext();
 </script>
 
@@ -30,6 +30,7 @@ const {
     :key="qi"
     :ref="(el) => setCardRef(el as HTMLElement | null, qi)"
     class="q-card"
+    :class="{ 'drop-target': dropTargetQ === qi }"
     :data-q-index="qi"
     @mousedown="setActive(qi, false)"
   >
@@ -47,13 +48,16 @@ const {
       }}</span>
     </div>
 
-    <div
+    <MarkdownContent
       v-if="request?.isMarkdown && !viewSource && q.message"
-      class="markdown-body"
-      v-html="questionHtml(q)"
-      @click="onContentClick"
-    ></div>
-    <pre v-else-if="q.message" class="plain-body">{{ q.message }}</pre>
+      :source="q.message"
+      :data-find-seg="`q-${qi}-msg`"
+    />
+    <pre
+      v-else-if="q.message"
+      class="plain-body"
+      :data-find-seg="`q-${qi}-msg`"
+    >{{ q.message }}</pre>
 
     <div v-if="q.predefinedOptions.length" class="options">
       <div
@@ -63,9 +67,18 @@ const {
         :class="{ selected: (chosenByQ[qi] ?? []).includes(opt.text), single }"
         @click="toggle(qi, opt.text)"
       >
-        <span class="check" :class="{ radio: single }">{{ single ? "" : ((chosenByQ[qi] ?? []).includes(opt.text) ? "✓" : "") }}</span>
-        <span class="label"><span v-if="request?.whatsNext && opt.todoId" class="todo-option-badge">TODO</span><span v-if="opt.recommended" class="rec-badge"><span class="rec-badge-pill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3z"></path><path d="M7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg>{{ t("popup.recommended") }}</span></span>{{ optionDisplayText(opt, Boolean(request?.whatsNext), t("popup.todos.optionPrefix")) }}</span>
-        <kbd v-if="cardOptionHotkey(qi, i)" class="opt-sc">{{ cardOptionHotkey(qi, i) }}</kbd>
+        <span class="check" :class="{ radio: single }" data-find-skip>{{ single ? "" : ((chosenByQ[qi] ?? []).includes(opt.text) ? "✓" : "") }}</span>
+        <span class="label">
+          <span v-if="request?.whatsNext && opt.todoId" class="todo-option-badge" data-find-skip>TODO</span>
+          <span v-if="opt.recommended" class="rec-badge" data-find-skip><span class="rec-badge-pill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3z"></path><path d="M7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg>{{ t("popup.recommended") }}</span></span>
+          <span :data-find-seg="`q-${qi}-opt-${i}`">{{ optionDisplayText(opt, Boolean(request?.whatsNext), t("popup.todos.optionPrefix")) }}</span>
+          <span
+            v-if="request?.whatsNext && opt.todoId && opt.todoAttachments?.length"
+            class="todo-attachment-badge"
+            data-find-skip
+          >{{ t("common.attachmentBadge", { n: opt.todoAttachments.length }) }}</span>
+        </span>
+        <kbd v-if="cardOptionHotkey(qi, i)" class="opt-sc" data-find-skip>{{ cardOptionHotkey(qi, i) }}</kbd>
       </div>
     </div>
 

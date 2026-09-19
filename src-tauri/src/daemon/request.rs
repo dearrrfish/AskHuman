@@ -11,7 +11,7 @@ use crate::i18n::Lang;
 use crate::ipc::{ConfirmTask, PendingRequestInfo, ServerMsg, ShowPayload, TaskRequest};
 use crate::models::{AskRequest, ConfirmDeliveryState, ConfirmRequest, InteractionRequest};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
@@ -25,6 +25,7 @@ pub type GuiSlot = Arc<Mutex<Option<UnboundedSender<ServerMsg>>>>;
 pub struct ResolvedAgent {
     pub kind: Option<String>,
     pub pid: Option<u32>,
+    pub launch_id: Option<String>,
 }
 
 /// 一个活动请求的共享状态。
@@ -38,16 +39,28 @@ pub struct RequestEntry {
     pub coordinator: Arc<Coordinator>,
     /// 给 GUI Helper 的题目下发负载。
     pub show: ShowPayload,
-    /// 调用方 agent 会话 ID（CLI 从 env 探测、`TaskRequest.agent_session_id` 透传；MCP `env_clear`
-    /// 时为 None）。供 daemon「在途 AskHuman 豁免」按 session_id 刷新——覆盖无 pid 的 agent
+    /// 调用方 agent 会话 ID（CLI 从 env 探测；MCP 仅在每次调用取得可信绑定时透传）。
+    /// 供 daemon「在途 AskHuman 豁免」按 session_id 刷新——覆盖无 pid 的 agent
     /// （Codex 共享 app-server / Claude 被 scrub），使其等待人类回答期间不被「工作中兜底超时」降级。
     pub agent_session_id: Option<String>,
+    /// 重复提问收敛用的会话键与提问指纹（spec duplicate-ask-coalescing D1/D2）：
+    /// 同键同指纹的后续调用合流到本请求，不再弹第二张卡。会话键为 None 时不参与收敛。
+    pub session_key: Option<String>,
+    pub fingerprint: String,
+    /// 等待本请求结果的调用方个数（原始 CLI + 各 follower）。归零才允许取消整个请求。
+    waiters: AtomicUsize,
+    /// 等待者归零时唤醒提交连接去做取消收尾（最后离场的可能是 follower）。
+    pub waiters_gone: Arc<Notify>,
+    /// 合流上来的调用方的结果发送端；终态产生时逐个投递（spec D3/D4）。
+    followers: Mutex<Vec<UnboundedSender<RenderOutcome>>>,
     /// GUI 发送端槽位（adapter 与连接处理器共享）。
     pub gui: GuiSlot,
     /// 调用方 agent 异步解析结果（方案5/b）：daemon walk 完成后填入，helper 连接握手时若已就绪则补发。
     pub resolved_agent: Arc<Mutex<Option<ResolvedAgent>>>,
     /// GUI Helper 是否已连上（用于看门狗判定弹窗是否成功拉起）。
     pub gui_connected: AtomicBool,
+    /// GUI content and its hidden native window reached the presentation handshake.
+    pub gui_ready: AtomicBool,
     /// CLI 断开 / 请求结束时通知 GUI 连接处理器收尾。
     pub cancel: Arc<Notify>,
     /// 渲染结果发送端（协调器 finish 与看门狗共用；连接处理器从对应 rx 取）。
@@ -60,6 +73,35 @@ impl RequestEntry {
             .interaction
             .ask()
             .expect("ask entry must carry an ask interaction")
+    }
+
+    /// 当前等待者个数。
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.load(Ordering::SeqCst)
+    }
+
+    /// 一个调用方离场（连接断开或已拿到结果）：返回剩余等待者个数。
+    /// 归零意味着没人再消费结果，由提交连接走取消收尾（spec D4）——最后离场的可能是
+    /// 合流上来的调用方，故这里唤醒提交连接，不在各自的任务里各做各的收尾。
+    pub fn release_waiter(&self) -> usize {
+        let left = self
+            .waiters
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .map(|prev| prev.saturating_sub(1))
+            .unwrap_or(0);
+        if left == 0 {
+            self.waiters_gone.notify_waiters();
+        }
+        left
+    }
+
+    /// 把终态结果投递给所有合流上来的调用方（各自写自己的 IPC `final`）。
+    pub fn broadcast_outcome(&self, outcome: &RenderOutcome) {
+        for tx in self.followers.lock().unwrap().drain(..) {
+            let _ = tx.send(outcome.clone());
+        }
     }
 }
 
@@ -107,6 +149,13 @@ impl InteractionEntry {
         match self {
             Self::Ask(entry) => &entry.token,
             Self::Confirm(entry) => &entry.token,
+        }
+    }
+
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::Ask(entry) => entry.seq,
+            Self::Confirm(entry) => entry.seq,
         }
     }
 
@@ -225,7 +274,10 @@ pub fn create_internal_confirm(
         lang: lang.to_string(),
         project: project.to_string(),
         agent_kind: Some(agent_kind.to_string()),
+        agent_session_id: None,
+        mcp_instance_id: None,
         agent_pid: None,
+        agent_console_session_id: None,
         perf_id: String::new(),
         perf_autodismiss: false,
         created_at_ms,
@@ -348,6 +400,7 @@ impl RequestRegistry {
     pub fn create(
         &self,
         task: TaskRequest,
+        agent_console_session_id: Option<String>,
     ) -> (Arc<RequestEntry>, UnboundedReceiver<RenderOutcome>) {
         let request_id = uuid::Uuid::new_v4().to_string();
         let token = uuid::Uuid::new_v4().to_string();
@@ -357,6 +410,9 @@ impl RequestRegistry {
             .agent_session_id
             .clone()
             .filter(|s| !s.trim().is_empty());
+        // 收敛键一并算好存下，后续合流查找不必重算（spec duplicate-ask-coalescing D1/D2）。
+        let session_key = super::ask_dedup::session_key(&task);
+        let fingerprint = super::ask_dedup::fingerprint(&task);
 
         // Daemon 分配权威 request_id（用于临时目录）。
         let mut request = AskRequest::new(task.message, task.questions, task.is_markdown);
@@ -373,7 +429,11 @@ impl RequestRegistry {
             final_tx.clone(),
             task.project.clone(),
             task.source.clone(),
-            task.agent_kind.clone(),
+            crate::app::coordinator::HistoryBinding {
+                agent_kind: task.agent_kind.clone(),
+                agent_session_id: task.agent_session_id.clone(),
+                mcp_instance_id: task.mcp_instance_id.clone(),
+            },
             task.record_history,
         );
 
@@ -383,6 +443,8 @@ impl RequestRegistry {
             gui.clone(),
         )));
 
+        let show_agent_session_id = task.agent_session_id.clone();
+        let show_mcp_instance_id = task.mcp_instance_id.clone();
         let show = ShowPayload {
             request_id: request_id.clone(),
             interaction: InteractionRequest::Ask(request),
@@ -391,7 +453,10 @@ impl RequestRegistry {
             lang: task.lang,
             project: task.project,
             agent_kind: task.agent_kind,
+            agent_session_id: show_agent_session_id,
+            mcp_instance_id: show_mcp_instance_id,
             agent_pid: task.agent_pid,
+            agent_console_session_id,
             // 方案6：透传 perf 上下文，热 helper 领用时据此开启埋点（无 env 也能量化热路径）。
             perf_id: task.perf_id,
             perf_autodismiss: task.perf_autodismiss,
@@ -406,9 +471,15 @@ impl RequestRegistry {
             coordinator,
             show,
             agent_session_id,
+            session_key,
+            fingerprint,
+            waiters: AtomicUsize::new(1),
+            waiters_gone: Arc::new(Notify::new()),
+            followers: Mutex::new(Vec::new()),
             gui,
             resolved_agent: Arc::new(Mutex::new(None)),
             gui_connected: AtomicBool::new(false),
+            gui_ready: AtomicBool::new(false),
             cancel: Arc::new(Notify::new()),
             final_tx,
         });
@@ -420,9 +491,32 @@ impl RequestRegistry {
     }
 
     /// Build a validated structured confirmation with daemon-owned identity and 24h deadline.
+    /// 合流查找（spec duplicate-ask-coalescing D3/D9）：同会话键 + 同指纹且**仍在等人回答**的
+    /// 在途请求存在时，把调用方登记为 follower，返回其结果接收端。
+    ///
+    /// 查找、收尾判定与登记必须在同一把锁内完成：已进入收尾（终态已产生）的请求视为不在途，
+    /// 否则 follower 会挂在一个永远不再投递的请求上。在途请求是个位数，直接遍历即可，不建索引。
+    pub fn try_attach(
+        &self,
+        session_key: &str,
+        fingerprint: &str,
+    ) -> Option<(Arc<RequestEntry>, UnboundedReceiver<RenderOutcome>)> {
+        let inner = self.inner.lock().unwrap();
+        let entry = inner.by_id.values().find(|entry| {
+            entry.session_key.as_deref() == Some(session_key)
+                && entry.fingerprint == fingerprint
+                && !entry.coordinator.is_finalizing()
+        })?;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        entry.followers.lock().unwrap().push(tx);
+        entry.waiters.fetch_add(1, Ordering::SeqCst);
+        Some((entry.clone(), rx))
+    }
+
     pub fn create_confirm(
         &self,
         task: ConfirmTask,
+        agent_console_session_id: Option<String>,
     ) -> Result<(Arc<ConfirmEntry>, UnboundedReceiver<ConfirmOutcome>), String> {
         const REQUIRED_CONTEXT: [&str; 6] = [
             "agent",
@@ -486,7 +580,10 @@ impl RequestRegistry {
             lang: task.lang.clone(),
             project: task.project.clone(),
             agent_kind: Some(task.agent_kind.clone()),
+            agent_session_id: Some(task.agent_session_id.clone()),
+            mcp_instance_id: None,
             agent_pid: None,
+            agent_console_session_id,
             perf_id: String::new(),
             perf_autodismiss: false,
             created_at_ms,
@@ -619,6 +716,62 @@ impl RequestRegistry {
         ids
     }
 
+    /// 在途请求的 `(agent session_id, request_id, 预览)` 映射（同 session 多请求取最早登记的）。
+    /// 供状态窗口快照注入 `waitingRequestId`/`waitingPreview`（spec gui-agent-console C7/R2）：
+    /// 边栏 🙋 徽标 + 等待横幅摘要 + 「去回答」精确聚焦对应弹窗。
+    pub fn in_flight_agent_requests(&self) -> Vec<(String, String, String)> {
+        let mut rows: Vec<(u64, (String, String, String))> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .by_id
+                .values()
+                .filter_map(|entry| {
+                    entry
+                        .agent_session_id
+                        .as_ref()
+                        .filter(|sid| !sid.is_empty())
+                        .map(|sid| {
+                            (
+                                entry.seq,
+                                (
+                                    sid.clone(),
+                                    entry.request_id.clone(),
+                                    preview_of(entry.request()),
+                                ),
+                            )
+                        })
+                })
+                .chain(
+                    inner
+                        .confirm_by_id
+                        .values()
+                        .filter(|entry| !entry.agent_session_id.is_empty())
+                        .map(|entry| {
+                            (
+                                entry.seq,
+                                (
+                                    entry.agent_session_id.clone(),
+                                    entry.request_id.clone(),
+                                    truncate_chars(
+                                        &entry.request.detail.summary,
+                                        PREVIEW_MAX_CHARS,
+                                    ),
+                                ),
+                            )
+                        }),
+                )
+                .collect()
+        };
+        rows.sort_by_key(|(seq, _)| *seq);
+        let mut out: Vec<(String, String, String)> = Vec::new();
+        for (_, row) in rows {
+            if !out.iter().any(|(s, _, _)| s == &row.0) {
+                out.push(row);
+            }
+        }
+        out
+    }
+
     /// 在途请求摘要（按创建顺序，托盘「待答」子菜单用）：每条 `{id, 预览}`。
     pub fn pending_infos(&self) -> Vec<PendingRequestInfo> {
         let mut entries: Vec<(u64, PendingRequestInfo)> = {
@@ -653,8 +806,8 @@ impl RequestRegistry {
         entries.into_iter().map(|(_, info)| info).collect()
     }
 
-    /// 聚焦某请求的弹窗：向其 GUI 连接下发 `FocusPopup`。返回是否成功投递（无弹窗连接则 false）。
-    pub fn focus_popup(&self, request_id: &str) -> bool {
+    /// Send one message to a request's live popup helper.
+    pub fn send_to_gui(&self, request_id: &str, msg: ServerMsg) -> bool {
         let inner = self.inner.lock().unwrap();
         let gui = if let Some(entry) = inner.by_id.get(request_id) {
             &entry.gui
@@ -667,11 +820,7 @@ impl RequestRegistry {
             return false;
         };
         match slot.as_ref() {
-            Some(tx) => tx
-                .send(ServerMsg::FocusPopup {
-                    request_id: request_id.to_string(),
-                })
-                .is_ok(),
+            Some(tx) => tx.send(msg).is_ok(),
             None => false,
         }
     }
@@ -715,22 +864,6 @@ impl RequestRegistry {
 
 /// 看门狗等待时长：GUI Helper 在此时长内未连上即判定弹窗拉起失败。
 pub const GUI_CONNECT_TIMEOUT_SECS: u64 = 10;
-
-/// 弹窗拉起失败时给 CLI 的退出码（无可用 Channel）。
-pub const EXIT_NO_CHANNEL: i32 = crate::app::EXIT_NO_CHANNEL;
-
-/// 构造「弹窗拉起失败」的渲染结果（→ CLI stderr + 退出码 3）。
-pub fn popup_failed_outcome(lang: Lang) -> RenderOutcome {
-    RenderOutcome {
-        stdout: String::new(),
-        stderr: Some(format!(
-            "{}{}",
-            crate::i18n::err_prefix(lang),
-            "GUI popup failed to start",
-        )),
-        exit_code: EXIT_NO_CHANNEL,
-    }
-}
 
 /// 用于 ServerMsg::Show 的便捷封装。
 pub fn show_msg(entry: &RequestEntry) -> ServerMsg {
@@ -811,12 +944,14 @@ mod tests {
                         label: "Approve once".into(),
                         description: String::new(),
                         role: ActionRole::Primary,
+                        variant: None,
                     },
                     ConfirmChoice {
                         id: "deny".into(),
                         label: "Deny".into(),
                         description: String::new(),
                         role: ActionRole::Destructive,
+                        variant: None,
                     },
                 ],
                 presentation: ConfirmPresentation::SingleSelectSubmit {
@@ -838,11 +973,116 @@ mod tests {
     }
 
     #[test]
+    fn ask_registry_propagates_exact_recovery_binding_into_coordinator() {
+        let task: TaskRequest = serde_json::from_value(json!({
+            "message": {"text": "context", "files": []},
+            "questions": [{"message": "continue?", "predefinedOptions": []}],
+            "isMarkdown": true,
+            "source": "Cursor",
+            "lang": "en",
+            "project": "/tmp/project",
+            "agentKind": "cursor",
+            "agentSessionId": "conversation-1",
+            "mcpInstanceId": "instance-1",
+            "fromMcp": true
+        }))
+        .unwrap();
+        let registry = RequestRegistry::new();
+        let (entry, _rx) = registry.create(task, Some("conversation-1".into()));
+        assert_eq!(
+            entry.coordinator.recovery_binding(),
+            (
+                Some("cursor".into()),
+                Some("conversation-1".into()),
+                Some("instance-1".into())
+            )
+        );
+        assert_eq!(entry.agent_session_id.as_deref(), Some("conversation-1"));
+        assert_eq!(
+            entry.show.agent_session_id.as_deref(),
+            Some("conversation-1")
+        );
+        assert_eq!(entry.show.mcp_instance_id.as_deref(), Some("instance-1"));
+        assert_eq!(
+            entry.show.agent_console_session_id.as_deref(),
+            Some("conversation-1")
+        );
+    }
+
+    fn ask_task(session: Option<&str>, question: &str) -> TaskRequest {
+        serde_json::from_value(json!({
+            "message": {"text": "context", "files": []},
+            "questions": [{"message": question, "predefinedOptions": []}],
+            "isMarkdown": true,
+            "source": "Cursor",
+            "lang": "en",
+            "project": "/tmp/project",
+            "agentKind": "cursor",
+            "agentSessionId": session,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn identical_ask_from_same_session_attaches_to_the_live_request() {
+        let registry = RequestRegistry::new();
+        let (entry, _rx) = registry.create(ask_task(Some("s1"), "continue?"), None);
+        let key = entry.session_key.clone().unwrap();
+        assert_eq!(key, "sid:s1");
+        assert_eq!(entry.waiter_count(), 1);
+
+        // 不同会话 / 不同指纹都不合流。
+        assert!(registry
+            .try_attach("sid:other", &entry.fingerprint)
+            .is_none());
+        let different =
+            super::super::ask_dedup::fingerprint(&ask_task(Some("s1"), "something else"));
+        assert!(registry.try_attach(&key, &different).is_none());
+
+        let (same, mut rx) = registry
+            .try_attach(&key, &entry.fingerprint)
+            .expect("identical ask coalesces");
+        assert_eq!(same.request_id, entry.request_id);
+        assert_eq!(entry.waiter_count(), 2);
+
+        let outcome = RenderOutcome {
+            stdout: "[user_input]\nyes".into(),
+            stderr: None,
+            exit_code: 0,
+        };
+        entry.broadcast_outcome(&outcome);
+        assert_eq!(rx.try_recv().unwrap().stdout, "[user_input]\nyes");
+
+        assert_eq!(entry.release_waiter(), 1);
+        assert_eq!(entry.release_waiter(), 0);
+    }
+
+    #[test]
+    fn ask_without_session_never_coalesces() {
+        let registry = RequestRegistry::new();
+        let (entry, _rx) = registry.create(ask_task(None, "continue?"), None);
+        assert!(entry.session_key.is_none());
+        assert!(registry.try_attach("sid:s1", &entry.fingerprint).is_none());
+    }
+
+    #[tokio::test]
+    async fn finalizing_request_is_not_attachable() {
+        let registry = RequestRegistry::new();
+        let (entry, _rx) = registry.create(ask_task(Some("s1"), "continue?"), None);
+        let key = entry.session_key.clone().unwrap();
+        entry
+            .coordinator
+            .submit(crate::models::ChannelResult::cancel("popup"));
+        // 终态已产生：再挂上去就永远等不到结果了（spec duplicate-ask-coalescing D9）。
+        assert!(registry.try_attach(&key, &entry.fingerprint).is_none());
+    }
+
+    #[test]
     fn permission_context_is_required_before_daemon_identity_is_allocated() {
         let registry = RequestRegistry::new();
         let mut task = confirm_task();
         task.spec.context.retain(|field| field.id != "tool");
-        let error = registry.create_confirm(task).err().unwrap();
+        let error = registry.create_confirm(task, None).err().unwrap();
         assert!(error.contains("missing context: tool"));
         assert_eq!(registry.active_count(), 0);
     }
@@ -851,7 +1091,9 @@ mod tests {
     fn confirm_registry_owns_identity_deadline_and_typed_gui_token() {
         let registry = RequestRegistry::new();
         let before = tokio::time::Instant::now();
-        let (entry, _rx) = registry.create_confirm(confirm_task()).unwrap();
+        let (entry, _rx) = registry
+            .create_confirm(confirm_task(), Some("session-1".into()))
+            .unwrap();
         assert_eq!(entry.request.id, entry.request_id);
         assert_eq!(
             entry.request.expires_at_ms - entry.request.created_at_ms,
@@ -860,6 +1102,10 @@ mod tests {
         assert!(entry.deadline >= before + std::time::Duration::from_secs(86_399));
         assert_eq!(registry.in_flight_agent_pids(), vec![42]);
         assert_eq!(registry.in_flight_agent_session_ids(), vec!["session-1"]);
+        assert_eq!(
+            entry.show.agent_console_session_id.as_deref(),
+            Some("session-1")
+        );
         assert!(matches!(
             registry.attach_gui(&entry.token),
             Some(InteractionEntry::Confirm(_))
@@ -883,7 +1129,7 @@ mod tests {
         };
         task.popup_edit = Some(intent);
         let registry = RequestRegistry::new();
-        let (entry, _rx) = registry.create_confirm(task).unwrap();
+        let (entry, _rx) = registry.create_confirm(task, None).unwrap();
         assert!(entry.show.popup_edit.is_some());
         let request_json = serde_json::to_string(&entry.request).unwrap();
         assert!(!request_json.contains("popupEdit"));
@@ -908,16 +1154,52 @@ mod tests {
         intent.agent_kind = "codex".into();
         task.popup_edit = Some(intent);
         let registry = RequestRegistry::new();
-        assert!(registry.create_confirm(task).is_err());
+        assert!(registry.create_confirm(task, None).is_err());
     }
 
     #[test]
     fn late_ready_cannot_revive_a_failed_delivery() {
         let registry = RequestRegistry::new();
-        let (entry, _rx) = registry.create_confirm(confirm_task()).unwrap();
+        let (entry, _rx) = registry.create_confirm(confirm_task(), None).unwrap();
         entry.start_delivery("popup");
         assert!(entry.mark_starting_failed("popup", "timeout"));
         assert!(!entry.mark_ready("popup", String::new()));
         assert!(!entry.is_ready("popup"));
+    }
+
+    /// `in_flight_agent_requests`（spec gui-agent-console C7/R2）：session → request_id 映射，
+    /// 按登记顺序、同 session 去重取最早，ask 与 confirm 都计入。
+    #[test]
+    fn in_flight_agent_requests_maps_sessions_in_seq_order() {
+        let ask = |sid: &str| -> TaskRequest {
+            serde_json::from_value(json!({
+                "message": {"text": "q", "files": []},
+                "questions": [{"message": "continue?", "predefinedOptions": []}],
+                "isMarkdown": true,
+                "source": "Cursor",
+                "lang": "en",
+                "project": "/tmp/project",
+                "agentKind": "cursor",
+                "agentSessionId": sid,
+            }))
+            .unwrap()
+        };
+        let registry = RequestRegistry::new();
+        let (a1, _rx1) = registry.create(ask("s-ask"), None);
+        let (a2, _rx2) = registry.create(ask("s-ask"), None); // 同 session 第二条：应被去重忽略
+        let (c1, _rx3) = registry.create_confirm(confirm_task(), None).unwrap(); // session-1
+        let rows = registry.in_flight_agent_requests();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "s-ask");
+        assert_eq!(rows[0].1, a1.request_id);
+        assert!(!rows[0].2.is_empty(), "ask preview should be non-empty");
+        assert_eq!(rows[1].0, "session-1");
+        assert_eq!(rows[1].1, c1.request_id);
+        assert_ne!(rows[0].1, a2.request_id);
+        // 完结后消失。
+        registry.remove(&a1.request_id);
+        registry.remove(&a2.request_id);
+        registry.remove_confirm(&c1.request_id);
+        assert!(registry.in_flight_agent_requests().is_empty());
     }
 }

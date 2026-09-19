@@ -53,6 +53,11 @@ pub enum Command {
     /// `/new`、`/新任务`：从 IM 选择工作区和 Agent，并在电脑上打开可接续的终端任务。
     /// 带任何参数均由调用方作为用法错误处理。
     New { has_args: bool },
+    /// `/fork [编号]`：从活动/空闲原生会话立即分叉；除可选编号外不接受内联指令。
+    Fork {
+        sel: Option<u64>,
+        has_invalid_args: bool,
+    },
     /// `/here`、`/这里`：把此渠道设为活跃槽 + 补推在途 + 必回执。
     Here,
     /// `/status`、`/状态`：`None` 返回工作中/空闲 agent 列表；`Some(编号)` 返回该 agent 的当前活动详情。
@@ -82,8 +87,20 @@ pub enum Command {
     /// `/todo-auto`、`/自动待办`：无编号 → 选项目（带文本则新增自动待办）；`Some(n)` 是
     /// 兼容入口，无文本打开切换卡，带文本直接新增一条自动执行待办。
     TodoAuto(Option<u64>, Option<String>),
+    /// `/yolo [off [编号]]`：Codex YOLO 模式管理（D53）。`List` → 带关闭按钮的会话选择卡；
+    /// `Off(Some(n))` → 按 Agent 编号直关；`Off(None)` → 恰一个开着直关，多个弹卡。
+    Yolo(YoloSel),
     /// `/help`、`/帮助`、`/?`：返回动态引导文案（可发什么、可用命令）。
     Help,
+}
+
+/// `/yolo` 的子命令。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YoloSel {
+    /// 无参：列出开启中的会话（带关闭按钮的选择卡）。
+    List,
+    /// `off [编号]`：关闭（编号 = /status 的 Agent 编号；缺省时恰一个开着则直关）。
+    Off(Option<u64>),
 }
 
 /// `/unwatch` 的目标选择。
@@ -113,6 +130,7 @@ pub enum Parsed {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PhraseKind {
     New,
+    Fork,
     Here,
     Help,
     Status,
@@ -125,6 +143,7 @@ enum PhraseKind {
     Todo,
     TodoRm,
     TodoAuto,
+    Yolo,
 }
 
 /// (normalized key, command). Includes slash command names, Chinese token aliases, and
@@ -148,6 +167,12 @@ const COMMAND_PHRASES: &[(&str, PhraseKind)] = &[
     ("createnewsession", PhraseKind::New),
     ("createnewtask", PhraseKind::New),
     ("startanewtask", PhraseKind::New),
+    // /fork
+    ("fork", PhraseKind::Fork),
+    ("分叉", PhraseKind::Fork),
+    ("分叉会话", PhraseKind::Fork),
+    ("会话分叉", PhraseKind::Fork),
+    ("forksession", PhraseKind::Fork),
     // /here
     ("here", PhraseKind::Here),
     ("这里", PhraseKind::Here),
@@ -240,11 +265,23 @@ const COMMAND_PHRASES: &[(&str, PhraseKind)] = &[
     ("todoauto", PhraseKind::TodoAuto),
     ("自动待办", PhraseKind::TodoAuto),
     ("autotodo", PhraseKind::TodoAuto),
+    // /yolo（一律指向列表卡：卡上自带关闭按钮，"yolo off"/"关闭yolo" 规范化后也命中）
+    ("yolo", PhraseKind::Yolo),
+    ("yolo模式", PhraseKind::Yolo),
+    ("关闭yolo", PhraseKind::Yolo),
+    ("关yolo", PhraseKind::Yolo),
+    ("yolooff", PhraseKind::Yolo),
+    ("yolomode", PhraseKind::Yolo),
+    ("turnoffyolo", PhraseKind::Yolo),
 ];
 
 fn phrase_kind_to_command(kind: PhraseKind) -> Command {
     match kind {
         PhraseKind::New => Command::New { has_args: false },
+        PhraseKind::Fork => Command::Fork {
+            sel: None,
+            has_invalid_args: false,
+        },
         PhraseKind::Here => Command::Here,
         PhraseKind::Help => Command::Help,
         PhraseKind::Status => Command::Status(None),
@@ -257,6 +294,7 @@ fn phrase_kind_to_command(kind: PhraseKind) -> Command {
         PhraseKind::Todo => Command::Todo(None, None),
         PhraseKind::TodoRm => Command::TodoRm(None),
         PhraseKind::TodoAuto => Command::TodoAuto(None, None),
+        PhraseKind::Yolo => Command::Yolo(YoloSel::List),
     }
 }
 
@@ -315,6 +353,14 @@ fn classify_prefixed(trimmed: &str) -> Parsed {
         "new" | "新任务" => Parsed::Command(Command::New {
             has_args: !rest.trim().is_empty(),
         }),
+        "fork" | "分叉" => {
+            let values: Vec<&str> = tokens.collect();
+            let sel = values.first().and_then(|value| value.parse::<u64>().ok());
+            Parsed::Command(Command::Fork {
+                sel,
+                has_invalid_args: values.len() > 1 || (values.len() == 1 && sel.is_none()),
+            })
+        }
         "here" | "这里" => Parsed::Command(Command::Here),
         "status" | "状态" => {
             let sel = tokens.next().and_then(|s| s.parse::<u64>().ok());
@@ -408,6 +454,15 @@ fn classify_prefixed(trimmed: &str) -> Parsed {
                 }
             }
         }
+        "yolo" => {
+            let sel = match tokens.next() {
+                Some(sub) if sub.eq_ignore_ascii_case("off") || sub == "关闭" || sub == "关" => {
+                    YoloSel::Off(tokens.next().and_then(|value| value.parse::<u64>().ok()))
+                }
+                _ => YoloSel::List,
+            };
+            Parsed::Command(Command::Yolo(sel))
+        }
         "help" | "帮助" | "?" | "？" => Parsed::Command(Command::Help),
         _ if bang => Parsed::Text,
         _ => Parsed::UnknownCommand,
@@ -458,12 +513,261 @@ pub fn cmd_prefix(channel_id: &str) -> &'static str {
     }
 }
 
-/// 动态引导 / `/help` 文案（spec R3）：按开关拼装可用命令、如何作答、切槽提示。
-/// **不含「已收到」**——能回复本身即代表收到且在运行。
-/// - `auto`：自动激活是否开启（决定是否列 `/here` 与切槽提示）。
-/// - `has_active_question`：该渠道当前是否有在途提问（决定「如何作答」vs「暂无提问」）。
-/// - `watch`：该渠道是否支持 `/watch` 实时关注（见 `docs/specs/im-watch.md`）。
-/// - `prefix`：命令展示前缀（`cmd_prefix`，Slack `!` / 其余 `/`）。
+/// A channel-neutral help payload. Renderers add Markdown, HTML, cards, and list markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpView {
+    pub title: String,
+    pub intro: String,
+    pub sections: Vec<HelpSection>,
+    pub question_state: HelpQuestionState,
+    pub switch_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpSection {
+    pub title: String,
+    pub commands: Vec<HelpCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpCommand {
+    pub syntax: String,
+    pub description: String,
+    pub phrase: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelpQuestionState {
+    Active { instruction: String },
+    None { message: String },
+}
+
+pub fn help_phrase_hint(phrase: &str, lang: Lang) -> String {
+    i18n::tr(lang, "autoChannel.helpPhraseHint").replace("{phrase}", phrase)
+}
+
+/// Build dynamic `/help` content without channel-specific formatting.
+///
+/// - `auto`: controls `/here` and the channel-switch hint.
+/// - `has_active_question`: selects answering guidance vs. the idle state.
+/// - `watch`: controls both `/watch` and `/unwatch`.
+/// - `prefix`: Slack uses `!`; other channels use `/`.
+pub fn help_view(
+    auto: bool,
+    has_active_question: bool,
+    watch: bool,
+    prefix: &str,
+    lang: Lang,
+) -> HelpView {
+    let command = |name: &str,
+                   en_args: &str,
+                   zh_args: &str,
+                   description_key: &'static str,
+                   phrase_key: Option<&'static str>| {
+        let args = match lang {
+            Lang::En => en_args,
+            Lang::Zh => zh_args,
+        };
+        HelpCommand {
+            syntax: format!("{prefix}{name}{args}"),
+            description: i18n::tr(lang, description_key).to_string(),
+            phrase: phrase_key.map(|key| i18n::tr(lang, key).to_string()),
+        }
+    };
+
+    let mut agent_commands = vec![
+        command(
+            "status",
+            " [n]",
+            " [编号]",
+            "autoChannel.helpDescStatus",
+            Some("autoChannel.helpPhraseStatus"),
+        ),
+        command(
+            "new",
+            "",
+            "",
+            "autoChannel.helpDescNew",
+            Some("autoChannel.helpPhraseNew"),
+        ),
+        command(
+            "fork",
+            " [n]",
+            " [编号]",
+            "autoChannel.helpDescFork",
+            Some("autoChannel.helpPhraseFork"),
+        ),
+    ];
+    if watch {
+        agent_commands.push(command(
+            "watch",
+            " [n]",
+            " [编号]",
+            "autoChannel.helpDescWatch",
+            Some("autoChannel.helpPhraseWatch"),
+        ));
+        agent_commands.push(command(
+            "unwatch",
+            " [n|all]",
+            " [编号|all]",
+            "autoChannel.helpDescUnwatch",
+            Some("autoChannel.helpPhraseUnwatch"),
+        ));
+    }
+    agent_commands.extend([
+        command(
+            "msg",
+            " [n] [text]",
+            " [编号] [内容]",
+            "autoChannel.helpDescMsg",
+            Some("autoChannel.helpPhraseMsg"),
+        ),
+        command(
+            "msg-clear",
+            " <n>",
+            " <编号>",
+            "autoChannel.helpDescMsgClear",
+            None,
+        ),
+        command(
+            "yolo",
+            " [off [n]]",
+            " [off [编号]]",
+            "autoChannel.helpDescYolo",
+            Some("autoChannel.helpPhraseYolo"),
+        ),
+    ]);
+
+    let code_commands = vec![
+        command(
+            "diff",
+            " [n]",
+            " [编号]",
+            "autoChannel.helpDescDiff",
+            Some("autoChannel.helpPhraseDiff"),
+        ),
+        command(
+            "stage",
+            " [n]",
+            " [编号]",
+            "autoChannel.helpDescStage",
+            Some("autoChannel.helpPhraseStage"),
+        ),
+        command(
+            "transcript",
+            " [n]",
+            " [编号]",
+            "autoChannel.helpDescTranscript",
+            Some("autoChannel.helpPhraseTranscript"),
+        ),
+    ];
+
+    let todo_commands = vec![
+        command(
+            "todo",
+            " [text]",
+            " [内容]",
+            "autoChannel.helpDescTodo",
+            Some("autoChannel.helpPhraseTodo"),
+        ),
+        command(
+            "todo-rm",
+            "",
+            "",
+            "autoChannel.helpDescTodoRm",
+            Some("autoChannel.helpPhraseTodoRm"),
+        ),
+        command(
+            "todo-auto",
+            " [text]",
+            " [内容]",
+            "autoChannel.helpDescTodoAuto",
+            Some("autoChannel.helpPhraseTodoAuto"),
+        ),
+    ];
+
+    let mut channel_commands = Vec::new();
+    if auto {
+        channel_commands.push(command(
+            "here",
+            "",
+            "",
+            "autoChannel.helpDescHere",
+            Some("autoChannel.helpPhraseHere"),
+        ));
+    }
+    channel_commands.push(command(
+        "help",
+        "",
+        "",
+        "autoChannel.helpDescHelp",
+        Some("autoChannel.helpPhraseHelp"),
+    ));
+
+    HelpView {
+        title: i18n::tr(lang, "autoChannel.helpTitle").to_string(),
+        intro: i18n::tr(lang, "autoChannel.helpIntro").to_string(),
+        sections: vec![
+            HelpSection {
+                title: i18n::tr(lang, "autoChannel.helpGroupAgent").to_string(),
+                commands: agent_commands,
+            },
+            HelpSection {
+                title: i18n::tr(lang, "autoChannel.helpGroupCode").to_string(),
+                commands: code_commands,
+            },
+            HelpSection {
+                title: i18n::tr(lang, "autoChannel.helpGroupTodo").to_string(),
+                commands: todo_commands,
+            },
+            HelpSection {
+                title: i18n::tr(lang, "autoChannel.helpGroupChannel").to_string(),
+                commands: channel_commands,
+            },
+        ],
+        question_state: if has_active_question {
+            HelpQuestionState::Active {
+                instruction: i18n::tr(lang, "autoChannel.helpAnswering").to_string(),
+            }
+        } else {
+            HelpQuestionState::None {
+                message: i18n::tr(lang, "autoChannel.helpNoQuestion").to_string(),
+            }
+        },
+        switch_hint: auto.then(|| i18n::tr(lang, "autoChannel.helpSwitchHint").to_string()),
+    }
+}
+
+/// Render a markup-free grouped fallback for channels that reject the rich payload.
+pub fn render_help_plain(view: &HelpView, lang: Lang) -> String {
+    let mut out = format!("{}\n{}", view.title, view.intro);
+    for section in &view.sections {
+        out.push_str("\n\n");
+        out.push_str(&section.title);
+        for command in &section.commands {
+            out.push_str("\n• ");
+            out.push_str(&command.syntax);
+            out.push_str(" — ");
+            out.push_str(&command.description);
+            if let Some(phrase) = &command.phrase {
+                out.push_str("  · ");
+                out.push_str(&help_phrase_hint(phrase, lang));
+            }
+        }
+    }
+    out.push_str("\n\n——\n");
+    match &view.question_state {
+        HelpQuestionState::Active { instruction } => out.push_str(instruction),
+        HelpQuestionState::None { message } => out.push_str(message),
+    }
+    if let Some(hint) = &view.switch_hint {
+        out.push('\n');
+        out.push_str(hint);
+    }
+    out
+}
+
+/// Backward-compatible plain help wrapper used by fallback-only callers and focused tests.
 pub fn help_text(
     auto: bool,
     has_active_question: bool,
@@ -471,50 +775,10 @@ pub fn help_text(
     prefix: &str,
     lang: Lang,
 ) -> String {
-    let mut out = String::new();
-    out.push_str(i18n::tr(lang, "autoChannel.helpTitle"));
-    out.push('\n');
-    out.push_str(&i18n::tr(lang, "autoChannel.helpCmdStatus").replace("{p}", prefix));
-    out.push('\n');
-    out.push_str(&i18n::tr(lang, "autoChannel.helpCmdNew").replace("{p}", prefix));
-    if watch {
-        out.push('\n');
-        out.push_str(&i18n::tr(lang, "autoChannel.helpCmdWatch").replace("{p}", prefix));
-    }
-    // `/msg` 插话与 `/status` 同门控（daemon 存活即可用，spec agent-interject D9）。
-    out.push('\n');
-    out.push_str(&i18n::tr(lang, "autoChannel.helpCmdMsg").replace("{p}", prefix));
-    // `/diff` · `/stage` · `/transcript`：同门控（spec im-diff-stage-transcript）。
-    out.push('\n');
-    out.push_str(&i18n::tr(lang, "autoChannel.helpCmdDiff").replace("{p}", prefix));
-    out.push('\n');
-    out.push_str(&i18n::tr(lang, "autoChannel.helpCmdStage").replace("{p}", prefix));
-    out.push('\n');
-    out.push_str(&i18n::tr(lang, "autoChannel.helpCmdTranscript").replace("{p}", prefix));
-    // `/todo` · `/todo-rm`：项目待办（spec todo-whats-next D8），与 /status 同门控。
-    out.push('\n');
-    out.push_str(&i18n::tr(lang, "autoChannel.helpCmdTodo").replace("{p}", prefix));
-    out.push('\n');
-    out.push_str(&i18n::tr(lang, "autoChannel.helpCmdTodoRm").replace("{p}", prefix));
-    out.push('\n');
-    out.push_str(&i18n::tr(lang, "autoChannel.helpCmdTodoAuto").replace("{p}", prefix));
-    out.push('\n');
-    out.push_str(&i18n::tr(lang, "autoChannel.helpCmdHelp").replace("{p}", prefix));
-    if auto {
-        out.push('\n');
-        out.push_str(&i18n::tr(lang, "autoChannel.helpCmdHere").replace("{p}", prefix));
-    }
-    out.push_str("\n\n");
-    if has_active_question {
-        out.push_str(i18n::tr(lang, "autoChannel.helpAnswering"));
-    } else {
-        out.push_str(i18n::tr(lang, "autoChannel.helpNoQuestion"));
-    }
-    if auto {
-        out.push_str("\n\n");
-        out.push_str(i18n::tr(lang, "autoChannel.helpSwitchHint"));
-    }
-    out
+    render_help_plain(
+        &help_view(auto, has_active_question, watch, prefix, lang),
+        lang,
+    )
 }
 
 /// 激活回执文案：基础确认句 +（补推了 N>0 条在途时）追加补推后缀。
@@ -754,9 +1018,15 @@ pub(crate) fn activity_parts(rec: &Value) -> ActivityParts {
     let rt_at = rt.and_then(|t| t.get("at")).and_then(|v| v.as_u64());
     let rt_tool = rt.and_then(build_rt_tool);
 
-    // 融合：实时工具严格更新（transcript 尚未追上）→ 并入为进行中末步；与末步同一工具则只改其
-    // 状态，否则更早的进行中步先收敛为已完成（新调用开始 = 前一步已结束，保持「只有末步在跑」）。
-    let use_rt = rt_tool.is_some() && realtime_newer(rt_at, ts_at);
+    // 融合（内容收敛，spec gui-agent-console 反馈记录 2026-07-25）：旧版按「事件时刻 vs
+    // transcript mtime」判先后——mtime 因任何写入前进（渐进写盘 / 落上一条完成调用），会把
+    // 仍在跑的实时步秒级挤掉，造成「工具一闪而过」。改为按**内容**收敛：
+    // - transcript 尾部已含同款步（同类别+对象）且时间不早于实时事件 → transcript 接管；
+    // - 否则实时步驻留为进行中末步，直到被接替 / registry 在 turn-end 清除 / TTL 兜底。
+    let tail_has_same = rt_tool
+        .as_ref()
+        .is_some_and(|td| steps.iter().any(|s| s.tool == *td));
+    let use_rt = rt_tool.is_some() && rt_merge_decision(rt_at, ts_at, tail_has_same, now_secs());
     let at = if use_rt {
         if let Some(td) = rt_tool {
             use crate::agents::activity::StepState;
@@ -779,7 +1049,11 @@ pub(crate) fn activity_parts(rec: &Value) -> ActivityParts {
                 }
             }
         }
-        rt_at
+        // 展示时刻取两侧较新者（实时步驻留期间 transcript 可能继续前进）。
+        match (rt_at, ts_at) {
+            (Some(r), Some(t)) => Some(r.max(t)),
+            (r, t) => r.or(t),
+        }
     } else {
         ts_at
     };
@@ -790,6 +1064,28 @@ pub(crate) fn activity_parts(rec: &Value) -> ActivityParts {
         todos,
         at,
     }
+}
+
+/// 实时 currentTool 的呆滞兜底：超过该时长仍未被 transcript 接替 / turn-end 清除（漏 hook /
+/// 会话异常中断）→ 不再展示为进行中。
+const RT_TOOL_TTL_SECS: u64 = 600;
+
+/// 实时工具取舍（内容收敛，抽出便于单测）：
+/// - 事件太旧（TTL）→ 弃用；
+/// - transcript 尾部已含同款步且时间不早于实时事件 → transcript 接管（弃用）；
+/// - 其余情况驻留为进行中末步（mtime 因无关写入前进不构成接替——旧版据此秒级丢弃，
+///   造成「工具一闪而过」，spec gui-agent-console 反馈记录 2026-07-25）。
+fn rt_merge_decision(
+    rt_at: Option<u64>,
+    ts_at: Option<u64>,
+    tail_has_same: bool,
+    now: u64,
+) -> bool {
+    let fresh = rt_at.is_some_and(|t| now.saturating_sub(t) <= RT_TOOL_TTL_SECS);
+    if !fresh {
+        return false;
+    }
+    !tail_has_same || realtime_newer(rt_at, ts_at)
 }
 
 /// 由 snapshot 的 `currentTool`（`{name, object, at}`）构造工具展示。类别标签按原始工具名复得，
@@ -947,6 +1243,29 @@ mod tests {
             todo_summary(&done, Lang::Zh).as_deref(),
             Some("📋 TODO 2/2")
         );
+    }
+
+    /// 实时工具取舍（内容收敛，spec gui-agent-console 反馈记录 2026-07-25）。
+    #[test]
+    fn rt_merge_decision_is_content_based() {
+        let now = 1_000_000u64;
+        // 旧版闪烁场景：transcript mtime 已追平/超过实时事件，但尾部**没有**同款步 → 驻留。
+        assert!(rt_merge_decision(Some(now - 3), Some(now), false, now));
+        // 同秒也不判负（旧版 (Some(r), Some(t)) 要求 r > t）。
+        assert!(rt_merge_decision(Some(now), Some(now), false, now));
+        // 尾部已含同款步且 transcript 不早于实时事件 → transcript 接管。
+        assert!(!rt_merge_decision(Some(now - 3), Some(now), true, now));
+        // 尾部含同款步但实时事件更新（同一工具再次被调）→ 仍并入为进行中。
+        assert!(rt_merge_decision(Some(now), Some(now - 3), true, now));
+        // TTL 呆滞兜底。
+        assert!(!rt_merge_decision(
+            Some(now - RT_TOOL_TTL_SECS - 1),
+            None,
+            false,
+            now
+        ));
+        // 无时刻的实时事件不可信 → 弃用。
+        assert!(!rt_merge_decision(None, Some(now), false, now));
     }
 
     #[test]
@@ -1124,15 +1443,14 @@ mod tests {
 
     #[test]
     fn help_text_gates_on_auto_activation() {
-        let here = i18n::tr(Lang::En, "autoChannel.helpCmdHere").replace("{p}", "/");
         let switch = i18n::tr(Lang::En, "autoChannel.helpSwitchHint");
         // auto on → lists /here + switch hint.
         let on = help_text(true, false, false, "/", Lang::En);
-        assert!(on.contains(&here));
+        assert!(on.contains("/here"));
         assert!(on.contains(switch));
         // auto off → neither /here nor switch hint.
         let off = help_text(false, false, false, "/", Lang::En);
-        assert!(!off.contains(&here));
+        assert!(!off.contains("/here"));
         assert!(!off.contains(switch));
     }
 
@@ -1150,9 +1468,12 @@ mod tests {
 
     #[test]
     fn help_text_gates_on_watch_support() {
-        let watch = i18n::tr(Lang::En, "autoChannel.helpCmdWatch").replace("{p}", "/");
-        assert!(help_text(false, false, true, "/", Lang::En).contains(&watch));
-        assert!(!help_text(false, false, false, "/", Lang::En).contains(&watch));
+        let supported = help_text(false, false, true, "/", Lang::En);
+        assert!(supported.contains("/watch [n]"));
+        assert!(supported.contains("/unwatch [n|all]"));
+        let unsupported = help_text(false, false, false, "/", Lang::En);
+        assert!(!unsupported.contains("/watch [n]"));
+        assert!(!unsupported.contains("/unwatch [n|all]"));
     }
 
     #[test]
@@ -1210,6 +1531,51 @@ mod tests {
     }
 
     #[test]
+    fn classify_yolo_variants() {
+        assert_eq!(
+            classify("/yolo"),
+            Parsed::Command(Command::Yolo(YoloSel::List))
+        );
+        assert_eq!(
+            classify("!yolo"),
+            Parsed::Command(Command::Yolo(YoloSel::List))
+        );
+        assert_eq!(
+            classify("/yolo off"),
+            Parsed::Command(Command::Yolo(YoloSel::Off(None)))
+        );
+        assert_eq!(
+            classify("/yolo OFF 3"),
+            Parsed::Command(Command::Yolo(YoloSel::Off(Some(3))))
+        );
+        assert_eq!(
+            classify("/yolo 关闭 2"),
+            Parsed::Command(Command::Yolo(YoloSel::Off(Some(2))))
+        );
+        // 未知子命令 → 列表（宽松处理，同 /watch 非数字参数）。
+        assert_eq!(
+            classify("/yolo abc"),
+            Parsed::Command(Command::Yolo(YoloSel::List))
+        );
+        // 无前缀整句短语（spec im-command-phrases）：列表卡自带关闭按钮，一律指向列表。
+        for phrase in [
+            "yolo",
+            "YOLO 模式",
+            "关闭 yolo",
+            "yolo off",
+            "turn off yolo",
+        ] {
+            assert_eq!(
+                classify(phrase),
+                Parsed::Command(Command::Yolo(YoloSel::List)),
+                "phrase: {phrase}"
+            );
+        }
+        // 含额外内容的整句不是短语命令（避免吞掉作答文本）。
+        assert_eq!(classify("我觉得 yolo 就行"), Parsed::Text);
+    }
+
+    #[test]
     fn classify_msg_and_msg_clear() {
         // `/msg <编号> <内容>`：内容为编号后的原文，保留内部换行 / 空白。
         assert_eq!(
@@ -1261,6 +1627,38 @@ mod tests {
         assert_eq!(
             classify("!MSG-CLEAR 7"),
             Parsed::Command(Command::MsgClear(Some(7)))
+        );
+    }
+
+    #[test]
+    fn classify_fork_accepts_only_an_optional_session_number() {
+        assert_eq!(
+            classify("/fork"),
+            Parsed::Command(Command::Fork {
+                sel: None,
+                has_invalid_args: false,
+            })
+        );
+        assert_eq!(
+            classify("!fork 12"),
+            Parsed::Command(Command::Fork {
+                sel: Some(12),
+                has_invalid_args: false,
+            })
+        );
+        assert_eq!(
+            classify("/分叉 3 continue here"),
+            Parsed::Command(Command::Fork {
+                sel: Some(3),
+                has_invalid_args: true,
+            })
+        );
+        assert_eq!(
+            classify("/fork current"),
+            Parsed::Command(Command::Fork {
+                sel: None,
+                has_invalid_args: true,
+            })
         );
     }
 
@@ -1363,11 +1761,92 @@ mod tests {
     }
 
     #[test]
+    fn help_text_lists_yolo() {
+        for lang in [Lang::En, Lang::Zh] {
+            assert!(help_text(true, false, true, "/", lang).contains("/yolo"));
+            assert!(help_text(false, false, false, "/", lang).contains("/yolo"));
+        }
+    }
+
+    #[test]
     fn help_text_always_lists_msg() {
         // /msg 与 /status 同门控：任何开关组合都在 help 中列出。
-        let msg = i18n::tr(Lang::En, "autoChannel.helpCmdMsg").replace("{p}", "/");
-        assert!(help_text(false, false, false, "/", Lang::En).contains(&msg));
-        assert!(help_text(true, true, true, "/", Lang::En).contains(&msg));
+        assert!(help_text(false, false, false, "/", Lang::En).contains("/msg [n] [text]"));
+        assert!(help_text(true, true, true, "/", Lang::En).contains("/msg [n] [text]"));
+    }
+
+    #[test]
+    fn help_view_has_grouped_complete_command_set() {
+        let view = help_view(true, false, true, "/", Lang::Zh);
+        assert_eq!(view.sections.len(), 4);
+        assert_eq!(view.sections[0].title, "Agent 管理");
+        assert_eq!(view.sections[1].title, "代码与记录");
+        assert_eq!(view.sections[2].title, "项目待办");
+        assert_eq!(view.sections[3].title, "渠道与帮助");
+
+        let syntaxes: Vec<&str> = view
+            .sections
+            .iter()
+            .flat_map(|section| section.commands.iter())
+            .map(|command| command.syntax.as_str())
+            .collect();
+        assert_eq!(syntaxes.len(), 16);
+        assert_eq!(
+            syntaxes,
+            vec![
+                "/status [编号]",
+                "/new",
+                "/fork [编号]",
+                "/watch [编号]",
+                "/unwatch [编号|all]",
+                "/msg [编号] [内容]",
+                "/msg-clear <编号>",
+                "/yolo [off [编号]]",
+                "/diff [编号]",
+                "/stage [编号]",
+                "/transcript [编号]",
+                "/todo [内容]",
+                "/todo-rm",
+                "/todo-auto [内容]",
+                "/here",
+                "/help",
+            ]
+        );
+        assert_eq!(
+            view.sections[0].commands[6].phrase, None,
+            "/msg-clear must not advertise an unsupported bare phrase"
+        );
+    }
+
+    #[test]
+    fn help_view_phrases_are_real_bare_commands() {
+        for lang in [Lang::En, Lang::Zh] {
+            let view = help_view(true, false, true, "/", lang);
+            for command in view
+                .sections
+                .iter()
+                .flat_map(|section| section.commands.iter())
+            {
+                let Some(phrase) = &command.phrase else {
+                    assert!(command.syntax.starts_with("/msg-clear"));
+                    continue;
+                };
+                assert!(
+                    matches!(classify(phrase), Parsed::Command(_)),
+                    "advertised phrase must parse as a command: {phrase}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_help_is_grouped_bulleted_and_markup_free() {
+        let text = help_text(true, false, true, "/", Lang::Zh);
+        assert!(text.contains("\n\nAgent 管理\n• /status [编号]"));
+        assert!(text.contains("· 直接说「状态」"));
+        assert!(text.contains("\n\n代码与记录\n• /diff [编号]"));
+        assert!(!text.contains('`'));
+        assert!(!text.contains("<font"));
     }
 
     #[test]

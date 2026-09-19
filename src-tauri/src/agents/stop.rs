@@ -68,6 +68,29 @@ fn run_inner(args: &[String]) -> Option<Value> {
         }
         return None;
     }
+    if let Some(reason) = confirmation_suppression_reason(kind, &input) {
+        crate::daemon::lifecycle::log_guard_audit(crate::daemon::lifecycle::GuardAudit {
+            component: "stop_confirmation",
+            action: "suppressed",
+            reason,
+            tool: None,
+            agent: Some(kind.as_str()),
+            thread_source: codex_thread_source(&input),
+            session_id: Some(&session_id),
+            thread_id: input
+                .get("thread_id")
+                .or_else(|| input.get("threadId"))
+                .and_then(Value::as_str),
+            turn_id: input
+                .get("turn_id")
+                .or_else(|| input.get("turnId"))
+                .and_then(Value::as_str),
+        });
+        if track {
+            super::report::report_simple_event(kind, LifecycleEvent::TurnEnd, session_id, cwd);
+        }
+        return None;
+    }
 
     let last_message = last_assistant_message(kind, &input);
     if last_message.user_confirmed_end_turn {
@@ -131,7 +154,37 @@ fn is_natural_stop(kind: AgentKind, input: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|event| event.eq_ignore_ascii_case("stop")),
         AgentKind::Grok => false,
+        AgentKind::Pi => {
+            input.get("stop_reason").and_then(Value::as_str) == Some("stop")
+                && input
+                    .get("hook_event_name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|event| event.eq_ignore_ascii_case("stop"))
+        }
     }
+}
+
+fn codex_thread_source(input: &Value) -> Option<&str> {
+    input
+        .get("thread_source")
+        .or_else(|| input.get("threadSource"))
+        .and_then(Value::as_str)
+}
+
+fn confirmation_suppression_reason(kind: AgentKind, input: &Value) -> Option<&'static str> {
+    if kind != AgentKind::Codex {
+        return None;
+    }
+    if codex_thread_source(input)
+        .is_some_and(|source| crate::mcp::ask::CODEX_BLOCKED_THREAD_SOURCES.contains(&source))
+    {
+        return Some("codex_blocked_thread_source");
+    }
+    input
+        .get("transcript_path")
+        .or_else(|| input.get("transcriptPath"))
+        .is_some_and(Value::is_null)
+        .then_some("codex_transcript_path_null")
 }
 
 fn last_assistant_message(kind: AgentKind, input: &Value) -> LastAssistantMessage {
@@ -144,6 +197,12 @@ fn last_assistant_message(kind: AgentKind, input: &Value) -> LastAssistantMessag
             .map(str::to_string),
         AgentKind::Cursor => cursor_last_message(input),
         AgentKind::Grok => None,
+        AgentKind::Pi => input
+            .get("last_assistant_message")
+            .or_else(|| input.get("lastAssistantMessage"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string),
     };
     normalize_last_assistant_message(raw.as_deref())
 }
@@ -233,10 +292,9 @@ fn build_task(
     // Options: todo chips first (spec D5), then the two original actions. Index math in
     // `parse_ask_decision` relies on this order. Labels carry the "Run todo: " display prefix
     // (same as whats-next); the continuation text comes from the raw entry via index, not the label.
-    let prefix = crate::i18n::tr(lang, "whatsNext.todoPrefix");
     let mut options: Vec<OptionItem> = todos
         .iter()
-        .map(|entry| OptionItem::with_todo(format!("{}{}", prefix, entry.text), entry.id.clone()))
+        .map(|entry| OptionItem::with_todo_entry(crate::todos::option_label(lang, entry), entry))
         .collect();
     options.push(OptionItem::new(continue_label, true));
     options.push(OptionItem::new(end_label, false));
@@ -259,6 +317,7 @@ fn build_task(
         record_history: false,
         agent_kind: Some(kind.as_str().to_string()),
         agent_session_id: Some(session_id.to_string()),
+        mcp_instance_id: None,
         agent_pid: None,
         caller_pid: std::process::id(),
         from_mcp: false,
@@ -305,6 +364,14 @@ fn parse_ask_decision(stdout: &str, todos: &[crate::todos::TodoEntry]) -> StopDe
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(|text| truncate_preserving_layout(text, MAX_INSTRUCTION_CHARS));
+    let files: Vec<String> = answer
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
     if let Some(todo) = indices
         .iter()
         .filter_map(Value::as_u64)
@@ -317,7 +384,9 @@ fn parse_ask_decision(stdout: &str, todos: &[crate::todos::TodoEntry]) -> StopDe
             Some(extra) => format!("{}\n\n{}", todo.text, extra),
             None => todo.text.clone(),
         };
-        return StopDecision::Continue(Some(prompt));
+        return StopDecision::Continue(Some(
+            crate::integrations::agent_launch::task_with_attachments(&prompt, &files, &[]),
+        ));
     }
     if indices
         .iter()
@@ -337,6 +406,7 @@ fn continuation_output(kind: AgentKind, prompt: &str) -> Value {
             json!({ "decision": "block", "reason": prompt })
         }
         AgentKind::Grok => json!({}),
+        AgentKind::Pi => json!({ "followup_message": prompt }),
     }
 }
 
@@ -371,6 +441,66 @@ mod tests {
             &json!({"hook_event_name":"StopFailure"})
         ));
         assert!(!is_natural_stop(AgentKind::Codex, &json!({})));
+        assert!(is_natural_stop(
+            AgentKind::Pi,
+            &json!({"hook_event_name":"Stop","stop_reason":"stop"})
+        ));
+        assert!(!is_natural_stop(
+            AgentKind::Pi,
+            &json!({"hook_event_name":"Stop","stop_reason":"error"})
+        ));
+    }
+
+    #[test]
+    fn codex_system_and_ephemeral_stops_suppress_confirmation() {
+        for input in [
+            json!({"thread_source":"system", "transcript_path":"/tmp/rollout.jsonl"}),
+            json!({"threadSource":"system", "transcriptPath":"/tmp/rollout.jsonl"}),
+            json!({"thread_source":"ambient_suggestions", "transcript_path":"/tmp/rollout.jsonl"}),
+            json!({"threadSource":"ambient_suggestions", "transcriptPath":"/tmp/rollout.jsonl"}),
+        ] {
+            assert_eq!(
+                confirmation_suppression_reason(AgentKind::Codex, &input),
+                Some("codex_blocked_thread_source"),
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            confirmation_suppression_reason(AgentKind::Codex, &json!({"transcript_path":null})),
+            Some("codex_transcript_path_null")
+        );
+        assert_eq!(
+            confirmation_suppression_reason(AgentKind::Codex, &json!({"transcriptPath":null})),
+            Some("codex_transcript_path_null")
+        );
+    }
+
+    #[test]
+    fn ordinary_and_non_codex_stops_keep_confirmation() {
+        for input in [
+            json!({"thread_source":"user", "transcript_path":"/tmp/rollout.jsonl"}),
+            json!({"transcript_path":"/tmp/rollout.jsonl"}),
+            json!({}),
+        ] {
+            assert_eq!(
+                confirmation_suppression_reason(AgentKind::Codex, &input),
+                None
+            );
+        }
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Cursor,
+            AgentKind::Grok,
+            AgentKind::Pi,
+        ] {
+            assert_eq!(
+                confirmation_suppression_reason(
+                    kind,
+                    &json!({"thread_source":"system", "transcript_path":null})
+                ),
+                None
+            );
+        }
     }
 
     #[test]
@@ -419,6 +549,7 @@ mod tests {
                 created_at_ms: 1,
                 agent_kind: None,
                 auto: false,
+                attachments: Vec::new(),
             },
             crate::todos::TodoEntry {
                 id: "id-2".into(),
@@ -426,6 +557,7 @@ mod tests {
                 created_at_ms: 2,
                 agent_kind: None,
                 auto: false,
+                attachments: Vec::new(),
             },
         ]
     }
@@ -484,6 +616,8 @@ mod tests {
         assert_eq!(codex["decision"], "block");
         let cursor = continuation_output(AgentKind::Cursor, "continue");
         assert_eq!(cursor["followup_message"], "continue");
+        let pi = continuation_output(AgentKind::Pi, "continue");
+        assert_eq!(pi["followup_message"], "continue");
     }
 
     #[test]
@@ -517,7 +651,7 @@ mod tests {
     #[test]
     fn confirmed_end_turn_marker_matches_any_substring_occurrence_and_is_stripped() {
         let marker = crate::prompts::USER_CONFIRMED_END_TURN_MARKER;
-        for kind in [AgentKind::Claude, AgentKind::Codex] {
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Pi] {
             let confirmed = last_assistant_message(
                 kind,
                 &json!({"last_assistant_message": format!("final report\n{marker}\n")}),
@@ -625,6 +759,7 @@ mod tests {
                 created_at_ms: i as u64,
                 agent_kind: None,
                 auto: false,
+                attachments: Vec::new(),
             })
             .collect();
         let task = build_task(

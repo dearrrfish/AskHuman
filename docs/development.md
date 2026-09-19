@@ -12,7 +12,7 @@ Engineering notes for contributors. User-facing docs live in [`docs/wiki/`](./wi
 
 - `src/` — Vue 3 + Vite + TypeScript frontend. The Vite entry `index.html` lives here, and Vite's `root` is set to `src` (build output goes to the repo-root `dist/`, which Tauri embeds).
 - `src-tauri/` — Rust backend (Tauri 2). Produces the single `AskHuman` binary.
-- `scripts/` — build/install/release helpers (`install.sh`, `install-windows.ps1`, `publish.sh`, `bump-version.mjs`).
+- `scripts/` — build/install/release helpers (`install.sh`, `install-windows.cmd`, `publish.sh`, `bump-version.mjs`).
 - `packaging/npm/` — npm main package (`askhuman`) and scoped per-platform binary subpackages.
 
 ## Develop, build, test
@@ -24,6 +24,26 @@ pnpm build && cargo build --release \
   --manifest-path src-tauri/Cargo.toml --features custom-protocol   # release (frontend embedded at cargo build time)
 cargo test --manifest-path src-tauri/Cargo.toml            # Rust unit tests
 ```
+
+### UI prototyping (browser-only, no Tauri)
+
+`src/prototype/` hosts standalone HTML entries that run in a plain browser with mock data and
+hot reload — no Tauri, no daemon. They share the app's design tokens (`src/styles/*`) and
+Markdown renderer, and are **excluded from release builds** (Vite only bundles `src/index.html`).
+
+```bash
+pnpm dev
+# open http://localhost:5180/prototype/agent-console.html
+```
+
+Current prototypes:
+
+- `agent-console.html` — the two-pane Agent console (spec `docs/specs/gui-agent-console.md`).
+  This is the visual/interaction baseline for `views/AgentsView.vue` + `views/console/*`.
+
+**Workflow:** iterate UI ideas on the prototype first (cheap, instant feedback, user can review
+in a browser), get the design confirmed, then port to the real views. Keep the prototype in
+sync when a design decision changes — it stays the reference for the next iteration round.
 
 ### Optional local git hooks (fmt + clippy)
 
@@ -44,14 +64,43 @@ Build and install locally:
 # (or <worktree>/.askhuman-dev/bin when Dev Instance is enabled — see below)
 ./scripts/install.sh
 
+# Build/install the exact production release profile when needed:
+./scripts/install.sh --release
+
 # Force production install path even inside an enabled worktree:
 ./scripts/install.sh --global
 
 # Windows        → installs to %LOCALAPPDATA%\Programs\AskHuman
-./scripts/install-windows.ps1
+.\scripts\install-windows.cmd
+
+# Windows exact production profile:
+.\scripts\install-windows.cmd -Release
 ```
 
+The Windows command wrapper works under the default restrictive PowerShell execution policy. The
+installer idempotently adds its install directory to the current user's `PATH` and installs a
+managed `AskHuman.cmd` launcher in the standard per-user `WindowsApps` command directory. This makes
+`AskHuman --version` available immediately even when an Agent installs from a different Windows
+session. The uninstaller removes only its managed launcher and install-directory entry.
+
 > Running the GUI popup on Linux needs system WebKitGTK (e.g. `libwebkit2gtk-4.1`). If it's missing and a session-based channel (Telegram / DingTalk / Feishu) is configured, AskHuman automatically uses that channel; if none is available it exits with code 3 to signal graceful degradation.
+
+`install.sh` uses the dedicated `local-install` Cargo profile (`opt-level=0`, 64 codegen units) so
+small local edits compile quickly; publishing and CI continue to use the production `release`
+profile. The script fingerprints frontend inputs and reuses `dist/` when they have not changed,
+preventing an unchanged Vite rebuild from invalidating Tauri's embedded resources. It also skips
+copy/sign when the built and installed binary state is unchanged (local macOS signing does not
+request a network timestamp). After a successful copy it enforces per-profile target budgets with
+Cargo-coordinated cleanup: local package artifacts are removed first, while dependency caches are
+retained whenever they fit.
+
+Default dev/test builds retain line tables for file/line backtraces without full debugger local
+variable metadata. When full source-level debugger information is needed, use:
+
+```bash
+cargo build --manifest-path src-tauri/Cargo.toml --profile full-debug
+cargo test --manifest-path src-tauri/Cargo.toml --profile full-debug
+```
 
 ### Parallel development (Dev Instance / git worktrees)
 
@@ -83,7 +132,7 @@ existing channel (`slack` is the newest and most complete) and mirror every hit.
 - [ ] `src-tauri/src/secrets.rs` — keychain migration/storage for the channel's secrets
   (and update the module doc comment listing managed secrets).
 - [ ] `src-tauri/src/autochannel.rs` — channel id/label, auto-activation participation.
-- [ ] `src-tauri/src/daemon/unix_impl/` — `mod.rs` `ensure_<channel>_router` (report/clear
+- [ ] `src-tauri/src/daemon/runtime/` — `mod.rs` `ensure_<channel>_router` (report/clear
   channel health on connect), plus per-channel arms in `detect.rs`, `watch.rs`,
   `select.rs`, `inbound.rs`.
 - [ ] `src-tauri/src/confirm/` — `transport.rs` / `choice_cards.rs` arms.

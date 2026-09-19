@@ -1,7 +1,8 @@
 //! 把 `session_id` 解析成「对话标题」，复刻各家恢复对话列表里显示的标题（FINDINGS / spec D10）。
 //!
 //! - Cursor：`~/.cursor/chats/*/<sid>/meta.json` 的 `title`；缺失回退 transcript 首条用户消息。
-//! - Codex：`~/.codex/sessions/**/rollout-*-<sid>.jsonl` 首条**真实**用户消息（跳过注入块）。
+//! - Codex：`~/.codex/sessions/**/rollout-*-<sid>.jsonl` 首条**真实**用户消息（跳过注入块；
+//!   paginated 会话读 `item_completed` `UserMessage`，legacy 读 `event_msg/user_message`）。
 //! - Claude：`~/.claude/projects/*/<sid>.jsonl` 最后一条 `summary`，否则首条真实用户消息。
 //!
 //! 全部 best-effort：文件可能不存在 / 正在写 / 巨大，任何失败都返回 `None`（窗口显示「未命名」）。
@@ -10,7 +11,7 @@
 use crate::paths;
 use serde_json::Value;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use super::AgentKind;
@@ -19,6 +20,8 @@ use super::AgentKind;
 const MAX_TITLE_CHARS: usize = 80;
 /// 扫描 jsonl 的行数上限。
 const MAX_LINES: usize = 4000;
+const MAX_PI_HEADER_BYTES: u64 = 64 * 1024;
+const MAX_PI_SESSION_FILES: usize = 4096;
 
 /// 解析指定家族某 session 的标题。取不到返回 `None`。
 pub fn resolve_title(kind: AgentKind, session_id: &str) -> Option<String> {
@@ -30,6 +33,7 @@ pub fn resolve_title(kind: AgentKind, session_id: &str) -> Option<String> {
         AgentKind::Codex => codex_title(session_id),
         AgentKind::Claude => claude_title(session_id),
         AgentKind::Grok => grok_title(session_id),
+        AgentKind::Pi => pi_title(session_id),
     }?;
     Some(clean_title(&raw))
 }
@@ -47,6 +51,10 @@ fn clean_title(s: &str) -> String {
 // ── Cursor ──
 
 fn cursor_title(session_id: &str) -> Option<String> {
+    // 0) IDE 形态：全局 state.vscdb 的官方标题（实时、与 IDE 恢复列表一致）。
+    if let Some(t) = super::cursor_vscdb::resolve_title(session_id) {
+        return Some(t);
+    }
     // 1) ~/.cursor/chats/*/<sid>/meta.json 的 title
     let chats = paths::cursor_dir().join("chats");
     if let Ok(entries) = fs::read_dir(&chats) {
@@ -94,8 +102,11 @@ fn codex_title(session_id: &str) -> Option<String> {
     first_user_message(&file)
 }
 
-/// Codex：扫描取首条 `event_msg{payload.type=="user_message"}` 的 `message`。
-/// Codex 只为用户真实输入发出该事件（注入的上下文走 response_item），故无需再过滤注入块。
+/// Codex：扫描取首条真实用户消息。
+///
+/// Legacy rollout: `event_msg{payload.type=="user_message"}` 的 `message`。
+/// Paginated rollout (0.147+): `event_msg/item_completed` `UserMessage` 的 content。
+/// Codex 只为用户真实输入发出这些事件（注入的上下文走 response_item），故无需再过滤注入块。
 fn codex_user_message(path: &Path) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
@@ -104,7 +115,7 @@ fn codex_user_message(path: &Path) -> Option<String> {
             break;
         }
         let Ok(line) = line else { break };
-        if !line.contains("user_message") {
+        if !line.contains("user_message") && !line.contains("UserMessage") {
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
@@ -116,14 +127,29 @@ fn codex_user_message(path: &Path) -> Option<String> {
         let Some(payload) = v.get("payload") else {
             continue;
         };
-        if payload.get("type").and_then(|t| t.as_str()) != Some("user_message") {
-            continue;
-        }
-        if let Some(msg) = payload.get("message").and_then(|m| m.as_str()) {
-            let t = msg.trim();
-            if !t.is_empty() {
-                return Some(t.to_string());
+        match payload.get("type").and_then(|t| t.as_str()) {
+            Some("user_message") => {
+                if let Some(msg) = payload.get("message").and_then(|m| m.as_str()) {
+                    let t = msg.trim();
+                    if !t.is_empty() {
+                        return Some(t.to_string());
+                    }
+                }
             }
+            Some("item_completed") => {
+                let item = payload.get("item");
+                if item
+                    .and_then(|item| item.get("type"))
+                    .and_then(|t| t.as_str())
+                    == Some("UserMessage")
+                {
+                    if let Some(text) = item.and_then(super::transcript_full::codex_turn_item_text)
+                    {
+                        return Some(text);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -180,6 +206,98 @@ fn grok_title(session_id: &str) -> Option<String> {
     None
 }
 
+// ── Pi ──
+
+fn pi_title(session_id: &str) -> Option<String> {
+    let path = pi_session_file(session_id)?;
+    let file = fs::File::open(&path).ok()?;
+    let reader = BufReader::new(file);
+    let mut latest_name = None;
+    let mut first_user = None;
+    for (index, line) in reader.lines().enumerate() {
+        if index >= MAX_LINES {
+            break;
+        }
+        let Ok(line) = line else { break };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("session_info") {
+            if let Some(name) = value.get("name").and_then(Value::as_str) {
+                if !name.trim().is_empty() {
+                    latest_name = Some(name.to_string());
+                }
+            }
+        }
+        if first_user.is_none()
+            && value.get("type").and_then(Value::as_str) == Some("message")
+            && value.pointer("/message/role").and_then(Value::as_str) == Some("user")
+        {
+            if let Some(text) = value.pointer("/message/content").and_then(content_to_text) {
+                let text = text.trim();
+                if !text.is_empty() && !is_injected_block(text) {
+                    first_user = Some(text.to_string());
+                }
+            }
+        }
+    }
+    latest_name.or(first_user)
+}
+
+fn pi_session_file(session_id: &str) -> Option<PathBuf> {
+    super::session_paths::get(AgentKind::Pi, session_id).or_else(|| {
+        let mut remaining = MAX_PI_SESSION_FILES;
+        find_file_by_header(&paths::pi_sessions_dir(), session_id, 5, &mut remaining)
+    })
+}
+
+fn find_file_by_header(
+    root: &Path,
+    session_id: &str,
+    depth: usize,
+    remaining: &mut usize,
+) -> Option<PathBuf> {
+    if depth == 0 || *remaining == 0 {
+        return None;
+    }
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        if *remaining == 0 {
+            return None;
+        }
+        *remaining -= 1;
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_file_by_header(&path, session_id, depth - 1, remaining) {
+                return Some(found);
+            }
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(file) = fs::File::open(&path) else {
+            continue;
+        };
+        let mut first = String::new();
+        if BufReader::new(file)
+            .take(MAX_PI_HEADER_BYTES)
+            .read_line(&mut first)
+            .is_err()
+        {
+            continue;
+        }
+        let Ok(header) = serde_json::from_str::<Value>(&first) else {
+            continue;
+        };
+        if header.get("type").and_then(Value::as_str) == Some("session")
+            && header.get("id").and_then(Value::as_str) == Some(session_id)
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// 扫 Grok `chat_history.jsonl` 取首条真实用户输入：优先解包 `<user_query>…</user_query>` 的内层文本；
 /// 若某条用户文本本身不以 `<` 开头（Build harness 可能不加包裹）则直接取用。均跳过纯注入块。
 fn grok_first_query(path: &Path) -> Option<String> {
@@ -227,7 +345,7 @@ fn unwrap_tag(text: &str, tag: &str) -> Option<String> {
 
 /// 按 `session_id` 定位某家 agent 的 transcript（jsonl）文件路径。取不到返回 `None`。
 /// 与 `resolve_title` 的取标题不同，这里定位的是**对话流水**文件（供解析尾部「当前活动」）。
-pub(super) fn transcript_path(kind: AgentKind, session_id: &str) -> Option<PathBuf> {
+pub(crate) fn transcript_path(kind: AgentKind, session_id: &str) -> Option<PathBuf> {
     if session_id.is_empty() {
         return None;
     }
@@ -270,6 +388,7 @@ pub(super) fn transcript_path(kind: AgentKind, session_id: &str) -> Option<PathB
             }
             None
         }
+        AgentKind::Pi => pi_session_file(session_id),
     }
 }
 
@@ -301,8 +420,12 @@ fn first_user_message(path: &Path) -> Option<String> {
             continue;
         }
         if let Some(text) = extract_text(&v) {
-            let t = text.trim();
-            if is_injected_block(t) {
+            // Cursor 把用户输入包在 `<timestamp>…</timestamp>` + `<user_query>` 里：先用
+            // transcript 同款清洗剥壳（其它家族原样通过），再判注入块，否则真实输入会被
+            // 「`<` 开头＝注入块」误滤而永远取不到标题（用户验收反馈）。
+            let (cleaned, _) = super::transcript_full::clean_user(&text);
+            let t = cleaned.trim();
+            if t.is_empty() || is_injected_block(t) {
                 continue; // 跳过注入块（见 is_injected_block）
             }
             return Some(t.to_string());
@@ -476,6 +599,22 @@ mod tests {
         assert_eq!(first_user_message(&f).as_deref(), Some("实际的第一句话"));
     }
 
+    /// Cursor 把用户输入包在 `<timestamp>…</timestamp>` + `<user_query>` 里（用户验收反馈：
+    /// 全部消息被当注入块滤掉 → 永远「未命名」）：回退路径须剥壳后取到真实问题。
+    #[test]
+    fn first_user_message_unwraps_cursor_timestamp_and_user_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("s.jsonl");
+        let lines = [
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Friday, Jul 24, 2026, 11:07 PM (UTC+8)</timestamp>\n<user_query>\n我想优化一下 agent 状态窗口\n</user_query>"}]}}"#,
+        ];
+        std::fs::write(&f, lines.join("\n")).unwrap();
+        assert_eq!(
+            first_user_message(&f).as_deref(),
+            Some("我想优化一下 agent 状态窗口")
+        );
+    }
+
     #[test]
     fn codex_title_skips_agents_md_injection() {
         // 复刻 Codex rollout 开头结构：先注入 AGENTS.md(role=user) + environment_context，
@@ -531,6 +670,47 @@ mod tests {
         assert_eq!(unwrap_tag("no tags here", "user_query"), None);
     }
 
+    /// Codex 0.148 paginated exec: no `event_msg/user_message`; authority is
+    /// `item_completed` + `UserMessage`. Primary title path reads that event;
+    /// response_item fallback still finds the real prompt after skipping injection.
+    #[test]
+    fn paginated_codex_title_reads_item_completed_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("rollout.jsonl");
+        let lines = [
+            r#"{"timestamp":"t","ordinal":0,"type":"session_meta","payload":{"id":"sid","history_mode":"paginated"}}"#,
+            r#"{"timestamp":"t","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>skip me</recommended_plugins>"}]}}"#,
+            r#"{"timestamp":"t","ordinal":2,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"ASKHUMAN_PAGINATED_PROBE_20260820"}]}}"#,
+            r#"{"timestamp":"t","ordinal":3,"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"um-1","content":[{"type":"text","text":"ASKHUMAN_PAGINATED_PROBE_20260820","text_elements":[]}]}}}"#,
+        ];
+        std::fs::write(&f, lines.join("\n")).unwrap();
+        assert_eq!(
+            codex_user_message(&f).as_deref(),
+            Some("ASKHUMAN_PAGINATED_PROBE_20260820")
+        );
+        assert_eq!(
+            first_user_message(&f).as_deref(),
+            Some("ASKHUMAN_PAGINATED_PROBE_20260820")
+        );
+    }
+
+    #[test]
+    fn paginated_codex_148_real_session_title_when_present() {
+        let sid = "01a01ec8-3867-7730-8acf-8911ef19b587";
+        let Some(path) = transcript_path(AgentKind::Codex, sid) else {
+            eprintln!("skip: paginated probe session not on disk");
+            return;
+        };
+        let title = resolve_title(AgentKind::Codex, sid);
+        eprintln!("real paginated title={title:?} path={path:?}");
+        assert!(
+            title
+                .as_deref()
+                .is_some_and(|text| text.contains("ASKHUMAN_PAGINATED_PROBE_20260820")),
+            "expected fallback title from response_item, got {title:?}"
+        );
+    }
+
     #[test]
     fn last_summary_picks_last() {
         let dir = tempfile::tempdir().unwrap();
@@ -542,5 +722,35 @@ mod tests {
         ];
         std::fs::write(&f, lines.join("\n")).unwrap();
         assert_eq!(last_summary(&f).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn pi_title_prefers_latest_session_name_from_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pi.jsonl");
+        let lines = [
+            serde_json::json!({"type":"session","version":3,"id":"pi-title-test","cwd":dir.path()}),
+            serde_json::json!({"type":"message","message":{"role":"user","content":[{"type":"text","text":"first prompt"}]}}),
+            serde_json::json!({"type":"session_info","name":"Named Pi session"}),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        super::super::session_paths::register_pi(
+            "pi-title-test",
+            &path.to_string_lossy(),
+            Some(&dir.path().to_string_lossy()),
+        )
+        .unwrap();
+        assert_eq!(
+            pi_title("pi-title-test").as_deref(),
+            Some("Named Pi session")
+        );
     }
 }

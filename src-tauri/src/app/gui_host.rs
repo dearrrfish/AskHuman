@@ -8,8 +8,6 @@
 //! - 配置监听：菜单栏模式 / 语言变化 → 重建菜单 + 装/卸登录项 + 切活动策略。
 //! - 二进制换新：盘上二进制变化且无窗口时 re-exec / 交 launchd（spec D11）。
 
-#![cfg(unix)]
-
 use crate::app::tray_menu::{Node, TrayMenu};
 use crate::config::{AppConfig, DaemonLifecycleMode, MenuBarIconMode, ThemeMode};
 use crate::daemon::lifecycle::{self, Fingerprint, LockGuard};
@@ -33,7 +31,10 @@ const QUICK_ASK_INTERJECT: &str =
 /// 某 label 是否为宿主统一承载的窗口（用于窗口计数 / 续命判定）。
 /// 插话 composer 窗口每 session 一个，label 动态（`interject-<hash>`），按前缀识别。
 pub fn is_hosted_label(label: &str) -> bool {
-    matches!(label, "settings" | "history" | "agents" | "todos") || label.starts_with("interject-")
+    matches!(
+        label,
+        "settings" | "history" | "agents" | "todos" | "newtask"
+    ) || label.starts_with("interject-")
 }
 
 // ===== 内嵌图标资源（三态；统一单色模板图）=====
@@ -267,6 +268,10 @@ fn tray_supported() -> bool {
     {
         std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
     }
+    #[cfg(windows)]
+    {
+        true
+    }
 }
 
 // ===== 入口：在 launch() 的 setup 中调用 =====
@@ -373,7 +378,67 @@ fn apply_activation_policy(app: &AppHandle, mode: MenuBarIconMode) {
 // ===== 托盘图标 / 菜单 =====
 
 fn decode_icon(bytes: &'static [u8]) -> Option<Image<'static>> {
-    Image::from_bytes(bytes).ok()
+    let image = Image::from_bytes(bytes).ok()?;
+    #[cfg(target_os = "windows")]
+    {
+        Some(compact_windows_tray_icon(image))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some(image)
+    }
+}
+
+/// Trim transparent pixels and place the result on a square canvas with a one-pixel safety edge.
+/// Windows scales the whole source canvas into the notification area, so the macOS-oriented 4:3
+/// artwork otherwise appears visibly smaller than neighboring tray icons.
+#[cfg(any(target_os = "windows", test))]
+fn compact_windows_tray_icon(image: Image<'static>) -> Image<'static> {
+    const PADDING: u32 = 1;
+
+    let width = image.width();
+    let height = image.height();
+    let rgba = image.rgba();
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut found = false;
+
+    for y in 0..height {
+        for x in 0..width {
+            let alpha = rgba[((y * width + x) * 4 + 3) as usize];
+            if alpha == 0 {
+                continue;
+            }
+            found = true;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+
+    if !found {
+        return image;
+    }
+
+    let content_width = max_x - min_x + 1;
+    let content_height = max_y - min_y + 1;
+    let side = content_width.max(content_height) + PADDING * 2;
+    let target_x = (side - content_width) / 2;
+    let target_y = (side - content_height) / 2;
+    let mut compact = vec![0; (side * side * 4) as usize];
+
+    for row in 0..content_height {
+        let source_start = (((min_y + row) * width + min_x) * 4) as usize;
+        let source_end = source_start + (content_width * 4) as usize;
+        let target_start = (((target_y + row) * side + target_x) * 4) as usize;
+        compact[target_start..target_start + (content_width * 4) as usize]
+            .copy_from_slice(&rgba[source_start..source_end]);
+    }
+
+    Image::new_owned(compact, side, side)
 }
 
 fn icon_source(
@@ -531,21 +596,24 @@ fn menu_signature(
         .map(|i| format!("{}={}@{}", i.channel, i.message, fmt_ago(i.at_ms, lang)))
         .collect::<Vec<_>>()
         .join(";");
-    // Agent 子菜单内容也入签名：会话增删 / 标题 / 状态 / 待送达 / 可聚焦变化即触发 diff。
+    // Include Agent identity, lineage, state, and action capabilities so every visible menu change
+    // triggers a diff refresh.
     let agents: String = data
         .agents
         .iter()
         .map(|a| {
             format!(
-                "{}:{}:{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
                 a.session_id,
                 a.seq,
                 a.kind,
                 a.title,
+                a.forked_from_seq.unwrap_or_default(),
                 a.project_name,
                 a.state,
                 a.pending_interject as u8,
-                a.focusable as u8
+                a.focusable as u8,
+                a.forkable as u8
             )
         })
         .collect::<Vec<_>>()
@@ -562,8 +630,9 @@ fn menu_signature(
         data.agents_idle,
         data.im_connections.join(","),
         data.update_available as u8,
-        // update_latest 仅在 update_available 时入签名，避免无更新时的噪声变化触发刷新。
-        if data.update_available {
+        // Available / pending rows both name the target version. Ignore the cached remote value
+        // only when neither row is visible, avoiding irrelevant menu refreshes.
+        if data.update_available || data.pending {
             data.update_latest.as_str()
         } else {
             ""
@@ -587,6 +656,7 @@ fn detect_integration_updates() -> Vec<String> {
         ("claude", AgentTarget::ClaudeCode),
         ("codex", AgentTarget::Codex),
         ("grok", AgentTarget::Grok),
+        ("pi", AgentTarget::Pi),
     ]
     .into_iter()
     .filter(|&(_, target)| crate::integrations::agent_mode::needs_update(target))
@@ -621,6 +691,7 @@ fn integration_agent_label(id: &str) -> &str {
         "claude" => "Claude Code",
         "codex" => "Codex",
         "grok" => "Grok",
+        "pi" => "Pi",
         other => other,
     }
 }
@@ -686,12 +757,25 @@ fn build_specs(
             i18n::tr(lang, "tray.version").replace("{v}", &data.version),
             false,
         ));
+    }
+    // Keep the running daemon version truthful, then explain directly underneath why it can still
+    // be old after the new binary was installed. The exact reason comes from daemon drain state.
+    if data.pending {
+        nodes.push(Node::item(
+            "st.update_pending",
+            pending_update_text(up, data, lang),
+            false,
+        ));
+    }
+    if up {
         nodes.push(Node::item(
             "st.uptime",
             i18n::tr(lang, "tray.uptime").replace("{d}", &fmt_uptime(data.uptime_secs)),
             false,
         ));
-        if data.draining {
+        // A pending update has a more specific drain explanation immediately below the version.
+        // Keep this generic row for manual stop/restart drains.
+        if data.draining && !data.pending {
             nodes.push(Node::item(
                 "st.draining",
                 i18n::tr(lang, "tray.draining").to_string(),
@@ -725,13 +809,6 @@ fn build_specs(
         nodes.push(Node::item(
             "st.update_avail",
             i18n::tr(lang, "tray.updateAvailable").replace("{v}", &data.update_latest),
-            false,
-        ));
-    }
-    if data.pending {
-        nodes.push(Node::item(
-            "st.update_pending",
-            i18n::tr(lang, "tray.updatePending").to_string(),
             false,
         ));
     }
@@ -784,28 +861,31 @@ fn build_specs(
         i18n::tr(lang, "tray.openTodos").to_string(),
         true,
     ));
-    // 「Agent 状态」入口仅在开启了生命周期追踪时显示——否则窗口必为空，徒增困惑。
-    // 忙闲数量直接并入标题（合并了原状态区的只读忙闲行）。
-    // 有活动 agent（daemon 下发摘要）时父项变**子菜单**（spec agent-interject D7）：
-    // 首项「打开状态窗口」+ 分隔线 + 逐 agent 子菜单（发送消息 / 聚焦终端；工作中在前）；
-    // 无活动 agent / 旧 daemon（缺摘要）→ 退回普通条目（点击即开窗口）。
+    // Show New Agent Task when the current platform has a supported terminal. This does not
+    // require agentTasks to be enabled. With lifecycle tracking it moves into the Agent section,
+    // 用户定案 2026-07-25）；未开启（无 Agent 区）时留在窗口区兜底。
+    let new_task_available = crate::integrations::agent_launch::terminal_available();
+    if new_task_available && !lifecycle_on {
+        nodes.push(Node::item(
+            "open_new_task",
+            i18n::tr(lang, "tray.newTask").to_string(),
+            true,
+        ));
+    }
+    // Agent 区仅在开启了生命周期追踪时显示——否则窗口必为空，徒增困惑。
+    // 独立成组（用户验收反馈，spec gui-agent-console 反馈记录）：分隔线 +
+    // 「打开 Agent 状态窗口」直达项 + 忙闲概览子菜单（标签即「工作中 w · 空闲 i」，
+    // 逐 agent：在控制台查看 / 发送消息 / 待办 / 聚焦终端；工作中在前）+
+    // 「新建 Agent 任务」末项。无活动 agent / 旧 daemon（缺摘要）→ 无概览子菜单。
     if lifecycle_on {
-        let label = if up && data.agents_working + data.agents_idle > 0 {
-            i18n::tr(lang, "tray.openAgentsCounts")
-                .replace("{w}", &data.agents_working.to_string())
-                .replace("{i}", &data.agents_idle.to_string())
-        } else {
-            i18n::tr(lang, "tray.openAgents").to_string()
-        };
-        if !up || data.agents.is_empty() {
-            nodes.push(Node::item("open_agents", label, true));
-        } else {
-            let mut children = vec![Node::item(
-                "open_agents",
-                i18n::tr(lang, "tray.openAgentsWindow").to_string(),
-                true,
-            )];
-            children.push(Node::separator("sep.agents"));
+        nodes.push(Node::separator("sep.agents_section"));
+        nodes.push(Node::item(
+            "open_agents",
+            i18n::tr(lang, "tray.openAgents").to_string(),
+            true,
+        ));
+        if up && !data.agents.is_empty() {
+            let mut children: Vec<Node> = Vec::new();
             for a in &data.agents {
                 // Agent 条目前缀用与 /watch 卡片一致的状态圆点，避免仅靠排序区分工作中/空闲。
                 // 编号可直接用于 `/msg <编号>`；标题截断 24 字符防菜单过宽。
@@ -819,15 +899,39 @@ fn build_specs(
                 } else {
                     truncate_chars(a.title.trim(), AGENT_TITLE_MAX_CHARS)
                 };
+                let fork_prefix = a
+                    .forked_from_seq
+                    .map(|parent_seq| {
+                        format!(
+                            "{} · ",
+                            i18n::tr(lang, "watch.forkedFrom")
+                                .replace("{id}", &format!("#{parent_seq}"))
+                        )
+                    })
+                    .unwrap_or_default();
                 let title = format!(
-                    "{} · [{}] {} — {}（{}）",
+                    "{} · [{}] {}{} — {}（{}）",
                     agent_state_label(&a.state, lang),
                     a.seq,
+                    fork_prefix,
                     agent_kind_label(&a.kind),
                     session_title,
                     project
                 );
                 let mut sub: Vec<Node> = Vec::new();
+                // 「在控制台查看」（spec gui-agent-console C10/R4）：打开控制台并定位该会话。
+                sub.push(Node::item(
+                    format!("goto:{}", a.session_id),
+                    i18n::tr(lang, "tray.agentOpenConsole").to_string(),
+                    true,
+                ));
+                if a.forkable {
+                    sub.push(Node::item(
+                        format!("fork:{}", a.session_id),
+                        i18n::tr(lang, "tray.agentFork").to_string(),
+                        true,
+                    ));
+                }
                 // 「发送消息」：grok 无可靠传话通道（首期排除，spec agent-interject D1），且仅「工作中」
                 // 才显示——插话在 agent 下一次工具调用时送达，对空闲无意义（用户定案）。
                 if a.kind != "grok" && a.state == "working" {
@@ -870,7 +974,17 @@ fn build_specs(
                     ));
                 }
             }
-            nodes.push(Node::submenu("agents_menu", label, true, children));
+            let overview = i18n::tr(lang, "tray.agentOverview")
+                .replace("{w}", &data.agents_working.to_string())
+                .replace("{i}", &data.agents_idle.to_string());
+            nodes.push(Node::submenu("agents_menu", overview, true, children));
+        }
+        if new_task_available {
+            nodes.push(Node::item(
+                "open_new_task",
+                i18n::tr(lang, "tray.newTask").to_string(),
+                true,
+            ));
         }
     }
     nodes.push(Node::separator("sep.update"));
@@ -884,11 +998,9 @@ fn build_specs(
         !update_busy,
     ));
     if data.update_available {
-        nodes.push(Node::item(
-            "apply_update",
-            i18n::tr(lang, "tray.applyUpdate").replace("{v}", &data.update_latest),
-            !update_busy,
-        ));
+        let (id, text) =
+            available_update_action(crate::update::apply_mode(), lang, &data.update_latest);
+        nodes.push(Node::item(id, text, !update_busy));
     }
     // 盘上二进制已换新但窗口开着（自动换新被挡）→ 用户可主动重启宿主完成更新（B2）。
     if stale {
@@ -928,6 +1040,39 @@ fn build_specs(
         ));
     }
     nodes
+}
+
+fn available_update_action(
+    mode: crate::update::UpdateApplyMode,
+    lang: Lang,
+    version: &str,
+) -> (&'static str, String) {
+    let (id, key) = if mode == crate::update::UpdateApplyMode::Automatic {
+        ("apply_update", "tray.applyUpdate")
+    } else {
+        ("prepare_update", "tray.prepareManualUpdate")
+    };
+    (id, i18n::tr(lang, key).replace("{v}", version))
+}
+
+fn pending_update_text(up: bool, data: &TrayData, lang: Lang) -> String {
+    let version = if data.update_latest.trim().is_empty() {
+        i18n::tr(lang, "tray.updateTargetFallback").to_string()
+    } else {
+        format!("v{}", data.update_latest)
+    };
+    let key = if !up {
+        "tray.updatePendingNextStart"
+    } else if data.draining && data.active_requests > 0 {
+        "tray.updatePendingWaiting"
+    } else if data.draining {
+        "tray.updatePendingRestarting"
+    } else {
+        "tray.updatePendingSwitching"
+    };
+    i18n::tr(lang, key)
+        .replace("{v}", &version)
+        .replace("{n}", &data.active_requests.to_string())
 }
 
 fn update_action_text(action: &UpdateActionState, lang: Lang) -> Option<String> {
@@ -1000,6 +1145,23 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
         });
         return;
     }
+    // Agent 子菜单「在控制台查看」：打开（或聚焦）控制台并定位该会话（spec gui-agent-console C10/R4）。
+    if let Some(session_id) = id.strip_prefix("goto:") {
+        open_window(
+            app,
+            WindowKind::Agents,
+            false,
+            None,
+            Some(crate::gui_host::InterjectTarget {
+                session: session_id.to_string(),
+                agent: None,
+                cwd: None,
+            }),
+            None,
+            None,
+        );
+        return;
+    }
     // Agent 子菜单「发送消息」：宿主本进程直接开（或聚焦）该 session 的插话 composer 窗口。
     if let Some(session_id) = id.strip_prefix("ij:") {
         let info = app.try_state::<HostState>().and_then(|s| {
@@ -1022,6 +1184,8 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
                     agent: Some(a.kind),
                     cwd: a.cwd,
                 }),
+                None,
+                None,
             );
         }
         return;
@@ -1037,6 +1201,7 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
                     &ClientMsg::InterjectAppend {
                         session_id,
                         text: QUICK_ASK_INTERJECT.to_string(),
+                        attachments: Vec::new(),
                     },
                 )
                 .await;
@@ -1068,34 +1233,55 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
         let project = cwd
             .map(|c| crate::project::detect_from(std::path::Path::new(&c)))
             .filter(|k| !k.is_empty());
-        open_window(app, WindowKind::Todos, false, project, None);
+        open_window(app, WindowKind::Todos, false, project, None, None, None);
+        return;
+    }
+    if let Some(session_id) = id.strip_prefix("fork:") {
+        open_window(
+            app,
+            WindowKind::ForkTask,
+            false,
+            None,
+            Some(crate::gui_host::InterjectTarget {
+                session: session_id.to_string(),
+                agent: None,
+                cwd: None,
+            }),
+            None,
+            None,
+        );
         return;
     }
     // Agent 子菜单「聚焦终端」：AppleScript 可能阻塞（授权弹窗等），放后台线程。
     if let Some(session_id) = id.strip_prefix("term:") {
-        let pid = app.try_state::<HostState>().and_then(|s| {
+        let focus = app.try_state::<HostState>().and_then(|s| {
             s.data
                 .lock()
                 .unwrap()
                 .agents
                 .iter()
                 .find(|a| a.session_id == session_id)
-                .and_then(|a| a.pid)
+                .map(|a| (a.pid, a.launch_id.clone()))
         });
-        if let Some(pid) = pid {
+        if let Some((pid, launch_id)) = focus {
             std::thread::spawn(move || {
-                let _ = crate::integrations::terminal_focus::focus_agent_terminal(pid);
+                let _ = crate::integrations::terminal_focus::focus_agent_terminal(
+                    pid,
+                    launch_id.as_deref(),
+                );
             });
         }
         return;
     }
     match id {
-        "open_settings" => open_window(app, WindowKind::Settings, false, None, None),
+        "open_settings" => open_window(app, WindowKind::Settings, false, None, None, None, None),
         // 托盘「历史」无调用方项目上下文 → 默认展示全部项目。
-        "open_history" => open_window(app, WindowKind::History, true, None, None),
-        "open_agents" => open_window(app, WindowKind::Agents, false, None, None),
+        "open_history" => open_window(app, WindowKind::History, true, None, None, None, None),
+        "open_agents" => open_window(app, WindowKind::Agents, false, None, None, None, None),
         // 托盘「待办」无项目上下文 → 由前端自选默认项目。
-        "open_todos" => open_window(app, WindowKind::Todos, false, None, None),
+        "open_todos" => open_window(app, WindowKind::Todos, false, None, None, None, None),
+        // 托盘「新建 Agent 任务」（spec gui-agent-task-launch）：无预选打开通用表单。
+        "open_new_task" => open_window(app, WindowKind::NewTask, false, None, None, None, None),
         "check_update" => {
             let Some(state) = app.try_state::<HostState>() else {
                 return;
@@ -1126,6 +1312,12 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
             let Some(state) = app.try_state::<HostState>() else {
                 return;
             };
+            if let Err(error) = crate::update::ensure_automatic_apply_allowed() {
+                *state.update_action.lock().unwrap() =
+                    UpdateActionState::ApplyFailed(compact_update_error(&error.to_string()));
+                refresh_on_main(app);
+                return;
+            }
             {
                 let mut action = state.update_action.lock().unwrap();
                 if action.busy() {
@@ -1147,6 +1339,9 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
                             *state.update_action.lock().unwrap() = UpdateActionState::Idle;
                         }
                         refresh_on_main(&app);
+                        // Persisted state tells every open surface that the update is pending; the
+                        // Hello fingerprint check immediately starts graceful daemon replacement.
+                        crate::client::notify_update_applied().await;
                         refresh_binary_on_main(&app);
                     }
                     Err(error) => {
@@ -1160,6 +1355,17 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
                 }
             });
         }
+        // Settings owns the second confirmation and preserves the exact Direct/npm next step
+        // before starting the helper that will close this GUI Host.
+        "prepare_update" => open_window(
+            app,
+            WindowKind::Settings,
+            false,
+            Some("general#manual-update".to_string()),
+            None,
+            None,
+            None,
+        ),
         // B2：用户主动重启宿主完成二进制换新（窗口开着也重启——用户已知情选择）。
         "host_restart" => {
             restart_host(app);
@@ -1189,18 +1395,21 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
 
 /// 在宿主进程内打开（或聚焦）指定窗口，并刷新窗口计数 / 续命。须在主线程调用。
 /// `param` 按窗口类型复用：历史窗口 = 调用方项目 key（默认过滤到该项目，None 用宿主自身项目）；
-/// 设置窗口 = 初始定位 tab（如 "channel"，None 用默认 tab）。
-/// `target` 仅插话窗口使用（session 必填；缺失则忽略本次请求）。
+/// 设置窗口 = 初始定位 tab（如 "channel"，None 用默认 tab）；待办/新建任务窗口 = 预选项目 key。
+/// `target.session` 用于 Agent 窗口预选或插话窗口唯一键；`target.agent/cwd` 仅插话窗口使用；
+/// `todo` 仅新建任务窗口使用。
 pub(crate) fn open_window(
     app: &AppHandle,
     kind: WindowKind,
     all: bool,
     param: Option<String>,
     target: Option<crate::gui_host::InterjectTarget>,
+    todo: Option<String>,
+    history_target: Option<crate::gui_host::HistoryOpenTarget>,
 ) {
     let cfg = AppConfig::load_without_secrets();
     // 弹窗在「另一个进程」（daemon 拉起的助手），宿主无 popup 窗口可探测；改据 daemon 在途请求数
-    // 判定：置顶开启且有在途请求（即有弹窗在屏）→ 让设置/历史与弹窗同级，浮于其上。
+    // 判定：置顶开启且有在途请求（即有弹窗在屏）→ 让辅助窗口与弹窗同级，浮于其上。
     let pin_above_popup = cfg.general.always_on_top
         && app
             .try_state::<HostState>()
@@ -1210,10 +1419,20 @@ pub(crate) fn open_window(
         WindowKind::Settings => {
             crate::app::create_settings_window(app, &cfg, pin_above_popup, param.as_deref())
         }
-        WindowKind::History => {
-            crate::app::create_history_window(app, &cfg, all, param.as_deref(), pin_above_popup)
-        }
-        WindowKind::Agents => crate::app::create_agents_window(app, &cfg),
+        WindowKind::History => crate::app::create_history_window(
+            app,
+            &cfg,
+            all,
+            param.as_deref(),
+            history_target.as_ref(),
+            pin_above_popup,
+        ),
+        WindowKind::Agents => crate::app::create_agents_window(
+            app,
+            &cfg,
+            target.as_ref().map(|t| t.session.as_str()),
+            pin_above_popup,
+        ),
         WindowKind::Interject => match &target {
             Some(t) => crate::app::create_interject_window(app, &cfg, t, pin_above_popup),
             None => return, // session 缺失：无法定位目标 agent，忽略。
@@ -1222,6 +1441,18 @@ pub(crate) fn open_window(
         WindowKind::Todos => {
             crate::app::create_todos_window(app, &cfg, param.as_deref(), pin_above_popup)
         }
+        // `param` = 预选项目 key、`todo` = 预选待办 id（spec gui-agent-task-launch）。
+        WindowKind::NewTask => crate::app::create_new_task_window(
+            app,
+            &cfg,
+            param.as_deref(),
+            todo.as_deref(),
+            pin_above_popup,
+        ),
+        WindowKind::ForkTask => match &target {
+            Some(t) => crate::app::create_fork_task_window(app, &cfg, &t.session, pin_above_popup),
+            None => return,
+        },
     };
     if r.is_ok() {
         // 宿主是 accessory app（不自动激活）：新建窗口需显式聚焦，才能前置到置顶弹窗之上并接收键盘。
@@ -1230,6 +1461,8 @@ pub(crate) fn open_window(
             WindowKind::History => "history".to_string(),
             WindowKind::Agents => "agents".to_string(),
             WindowKind::Todos => "todos".to_string(),
+            WindowKind::NewTask => "newtask".to_string(),
+            WindowKind::ForkTask => "fork-task".to_string(),
             WindowKind::Interject => target
                 .as_ref()
                 .map(|t| crate::gui_host::interject_label(&t.session))
@@ -1253,6 +1486,8 @@ fn open_window_settings_tab(app: &AppHandle, tab: &str) {
         WindowKind::Settings,
         false,
         Some(tab.to_string()),
+        None,
+        None,
         None,
     );
 }
@@ -1394,7 +1629,7 @@ fn start_ipc_listener(app: AppHandle) {
     });
 }
 
-async fn handle_host_conn(stream: tokio::net::UnixStream, app: AppHandle) {
+async fn handle_host_conn(stream: transport::Stream, app: AppHandle) {
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
     while let Ok(Some(msg)) = ipc::read_msg::<_, HostMsg>(&mut reader).await {
@@ -1406,6 +1641,8 @@ async fn handle_host_conn(stream: tokio::net::UnixStream, app: AppHandle) {
                 session,
                 agent,
                 cwd,
+                todo,
+                history_target,
             } => {
                 // 回执（让客户端确认已受理），再到主线程开窗。
                 let _ = ipc::write_msg(&mut w, &HostMsg::Ping).await;
@@ -1415,16 +1652,22 @@ async fn handle_host_conn(stream: tokio::net::UnixStream, app: AppHandle) {
                     cwd,
                 });
                 let app2 = app.clone();
-                let _ =
-                    app.run_on_main_thread(move || open_window(&app2, kind, all, project, target));
+                let _ = app.run_on_main_thread(move || {
+                    open_window(&app2, kind, all, project, target, todo, history_target)
+                });
             }
             HostMsg::Ping => {
                 let _ = ipc::write_msg(&mut w, &HostMsg::Ping).await;
             }
             HostMsg::Shutdown => {
-                let app2 = app.clone();
-                let _ = app.run_on_main_thread(move || app2.exit(0));
-                return;
+                // Confirm that the shutdown frame was consumed before the client starts checking
+                // for pipe disappearance. This removes a named-pipe close race on Windows.
+                let _ = ipc::write_msg(&mut w, &HostMsg::Ping).await;
+                // `AppHandle::exit` can wait for a Settings update-check task (HTTP timeout 30s),
+                // keeping the Windows executable locked. This is a cooperative Host-only shutdown
+                // after daemon drain: release Tauri resources, then terminate this process.
+                app.cleanup_before_exit();
+                std::process::exit(0);
             }
         }
     }
@@ -1433,16 +1676,16 @@ async fn handle_host_conn(stream: tokio::net::UnixStream, app: AppHandle) {
 // ===== daemon 状态订阅（非保活）=====
 
 fn start_status_subscription(app: AppHandle) {
-    // 事件驱动重连信号：daemon socket 出现/变化（daemon 起停）即唤醒下方循环立即重连，
+    // 事件驱动重连信号：daemon metadata 出现/变化（daemon 起停）即唤醒下方循环立即重连，
     // 取代「daemon 关着时每 2s 盲连」的忙轮询。配 30s 兜底超时防漏事件。
-    let sock_event = Arc::new(Notify::new());
-    spawn_daemon_sock_watch(sock_event.clone());
+    let state_event = Arc::new(Notify::new());
+    spawn_daemon_state_watch(state_event.clone());
     tauri::async_runtime::spawn(async move {
         loop {
-            // off 模式无托盘，不必订阅；等 socket 事件或 2s 复查模式（覆盖运行时切到 active/always）。
+            // off 模式无托盘，不必订阅；等 state 事件或 2s 复查模式（覆盖运行时切到 active/always）。
             if mode_of(&app) == MenuBarIconMode::Off {
                 tokio::select! {
-                    _ = sock_event.notified() => {}
+                    _ = state_event.notified() => {}
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 }
                 continue;
@@ -1513,26 +1756,31 @@ fn start_status_subscription(app: AppHandle) {
             set_daemon_up(&app, false);
             refresh_on_main(&app);
             evaluate_exit(&app);
-            // 事件驱动重连：等 daemon socket 出现/变化即重连，30s 兜底防漏事件（取代 2s 忙轮询）。
+            // 事件驱动重连：等 daemon metadata 出现/变化即重连，30s 兜底防漏事件。
             tokio::select! {
-                _ = sock_event.notified() => {}
+                _ = state_event.notified() => {}
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             }
         }
     });
 }
 
-/// 监听 daemon socket（`~/.askhuman/daemon.sock`）所在目录：文件创建/变化（daemon 起停）即唤醒
-/// 状态订阅循环立即重连。用一条 `Notify` 跨「notify 同步回调线程」与「异步订阅循环」传递信号。
-fn spawn_daemon_sock_watch(event: Arc<Notify>) {
+fn daemon_state_signal_path() -> std::path::PathBuf {
+    crate::daemon::lifecycle::meta_path()
+}
+
+/// Watch the cross-platform daemon metadata file. Unlike the transport endpoint, this is a real
+/// filesystem path on both Unix and Windows, and its create/remove lifecycle mirrors daemon start
+/// and stop closely enough to wake the status subscription immediately.
+fn spawn_daemon_state_watch(event: Arc<Notify>) {
     std::thread::spawn(move || {
         use notify::{RecursiveMode, Watcher};
         use std::sync::mpsc::channel;
-        let sock = crate::ipc::transport::socket_path();
-        let Some(name) = sock.file_name().map(|n| n.to_os_string()) else {
+        let state_path = daemon_state_signal_path();
+        let Some(name) = state_path.file_name().map(|n| n.to_os_string()) else {
             return;
         };
-        let Some(dir) = sock.parent().map(|d| d.to_path_buf()) else {
+        let Some(dir) = state_path.parent().map(|d| d.to_path_buf()) else {
             return;
         };
         let _ = std::fs::create_dir_all(&dir);
@@ -1798,6 +2046,16 @@ fn restart_host(app: &AppHandle) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn daemon_status_watch_uses_real_metadata_file() {
+        let path = daemon_state_signal_path();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("daemon.json")
+        );
+        assert!(!path.to_string_lossy().starts_with(r"\\.\pipe\"));
+    }
+
     fn item<'a>(nodes: &'a [Node], key: &str) -> (&'a str, bool) {
         nodes
             .iter()
@@ -1810,6 +2068,58 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("missing menu item {key}"))
+    }
+
+    fn has_item(nodes: &[Node], key: &str) -> bool {
+        nodes.iter().any(|node| match node {
+            Node::Item { key: node_key, .. } => node_key == key,
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn tray_agent_title_marks_fork_parent_sequence() {
+        let nodes = build_specs(
+            true,
+            Lang::Zh,
+            &TrayData {
+                running: true,
+                agents_working: 1,
+                agents: vec![ipc::TrayAgentInfo {
+                    session_id: "child".to_string(),
+                    seq: 6,
+                    kind: "codex".to_string(),
+                    title: "同一个标题".to_string(),
+                    forked_from_seq: Some(5),
+                    project_name: "HumanInLoop".to_string(),
+                    cwd: Some("/tmp/HumanInLoop".to_string()),
+                    state: "working".to_string(),
+                    pending_interject: false,
+                    focusable: true,
+                    forkable: true,
+                    pid: Some(42),
+                    launch_id: None,
+                }],
+                ..Default::default()
+            },
+            &[],
+            true,
+            false,
+            &UpdateActionState::Idle,
+        );
+        let agent_title = nodes
+            .iter()
+            .find_map(|node| match node {
+                Node::Submenu { key, children, .. } if key == "agents_menu" => {
+                    children.iter().find_map(|child| match child {
+                        Node::Submenu { key, text, .. } if key == "agent:child" => Some(text),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("forked agent submenu");
+        assert!(agent_title.contains("[6] 从 #5 分叉 · Codex"));
     }
 
     #[test]
@@ -1870,6 +2180,8 @@ mod tests {
                 release_notes: String::new(),
                 source_url: String::new(),
                 is_npm: false,
+                apply_mode: crate::update::UpdateApplyMode::Automatic,
+                manual_command: String::new(),
             },
         );
         assert!(data.update_available);
@@ -1914,7 +2226,9 @@ mod tests {
             ("Update found: v1.2.0", false)
         );
         assert_eq!(item(&nodes, "check_update"), ("Check for Updates", true));
-        assert!(item(&nodes, "apply_update").1);
+        let (action_id, _) =
+            available_update_action(crate::update::apply_mode(), Lang::En, "1.2.0");
+        assert!(item(&nodes, action_id).1);
     }
 
     #[test]
@@ -1938,7 +2252,85 @@ mod tests {
             ("Updating AskHuman…", false)
         );
         assert!(!item(&nodes, "check_update").1);
-        assert!(!item(&nodes, "apply_update").1);
+        let (action_id, _) =
+            available_update_action(crate::update::apply_mode(), Lang::En, "1.2.0");
+        assert!(!item(&nodes, action_id).1);
+    }
+
+    #[test]
+    fn unsigned_windows_update_action_routes_to_manual_preparation() {
+        assert_eq!(
+            available_update_action(
+                crate::update::UpdateApplyMode::ManualDirect,
+                Lang::En,
+                "1.2.0"
+            ),
+            (
+                "prepare_update",
+                "Prepare manual update to v1.2.0…".to_string()
+            )
+        );
+        assert_eq!(
+            available_update_action(crate::update::UpdateApplyMode::Automatic, Lang::En, "1.2.0").0,
+            "apply_update"
+        );
+    }
+
+    #[test]
+    fn pending_update_explains_why_the_running_version_is_still_old() {
+        let nodes = build_specs(
+            true,
+            Lang::En,
+            &TrayData {
+                running: true,
+                version: "1.1.0".to_string(),
+                active_requests: 2,
+                draining: true,
+                update_latest: "1.2.0".to_string(),
+                pending: true,
+                ..Default::default()
+            },
+            &[],
+            false,
+            false,
+            &UpdateActionState::Idle,
+        );
+
+        assert_eq!(item(&nodes, "st.version"), ("Version 1.1.0", false));
+        assert_eq!(
+            item(&nodes, "st.update_pending"),
+            (
+                "↑ v1.2.0 installed — waiting for 2 in-flight request(s) before restarting daemon (won't interrupt them)",
+                false,
+            )
+        );
+        assert!(!has_item(&nodes, "st.draining"));
+    }
+
+    #[test]
+    fn pending_update_reason_tracks_restart_stage() {
+        let data = TrayData {
+            update_latest: "1.2.0".to_string(),
+            pending: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            pending_update_text(true, &data, Lang::En),
+            "↑ v1.2.0 installed — waiting for daemon to restart…"
+        );
+        assert_eq!(
+            pending_update_text(false, &data, Lang::En),
+            "↑ v1.2.0 installed — updated daemon starts on next use"
+        );
+
+        let restarting = TrayData {
+            draining: true,
+            ..data
+        };
+        assert_eq!(
+            pending_update_text(true, &restarting, Lang::Zh),
+            "↑ v1.2.0 已安装 — daemon 正在重启…"
+        );
     }
 
     #[test]
@@ -1987,5 +2379,40 @@ mod tests {
         assert_eq!(icon_source(true, 0, true), icon_bytes::IDLE_ATTENTION);
         assert_eq!(icon_source(true, 1, true), icon_bytes::ACTIVE);
         assert_eq!(icon_source(true, 0, false), icon_bytes::IDLE);
+    }
+
+    #[test]
+    fn windows_tray_compaction_trims_and_centers_rectangular_artwork() {
+        let mut rgba = vec![0; 8 * 6 * 4];
+        for y in 2..4 {
+            for x in 2..6 {
+                rgba[(y * 8 + x) * 4 + 3] = 255;
+            }
+        }
+
+        let compact = compact_windows_tray_icon(Image::new_owned(rgba, 8, 6));
+        assert_eq!((compact.width(), compact.height()), (6, 6));
+
+        let alpha = |x: usize, y: usize| compact.rgba()[(y * 6 + x) * 4 + 3];
+        assert_eq!(alpha(0, 2), 0);
+        assert_eq!(alpha(1, 2), 255);
+        assert_eq!(alpha(4, 3), 255);
+        assert_eq!(alpha(5, 3), 0);
+    }
+
+    #[test]
+    fn windows_tray_compaction_enlarges_the_shipped_artwork_canvas_share() {
+        let idle = Image::from_bytes(icon_bytes::IDLE).unwrap();
+        assert_eq!((idle.width(), idle.height()), (48, 36));
+
+        let compact = compact_windows_tray_icon(idle);
+        assert_eq!((compact.width(), compact.height()), (38, 38));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_tray_decode_preserves_the_designed_canvas() {
+        let idle = decode_icon(icon_bytes::IDLE).unwrap();
+        assert_eq!((idle.width(), idle.height()), (48, 36));
     }
 }

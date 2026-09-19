@@ -164,6 +164,12 @@
   line-height: 1;
   white-space: nowrap;
 }
+.option .todo-attachment-badge {
+  margin-left: 6px;
+  color: var(--text-secondary);
+  font-size: inherit;
+  white-space: nowrap;
+}
 /* 推荐选项 Badge（大拇指图标 + 本地化「推荐」）：内联在选项文本流开头。
    这样英文等较长 badge 不再独占一列、把文本挤窄，换行后的文字可铺满整行（含 badge 下方）。
 
@@ -201,6 +207,9 @@
 }
 
 /* 图片缩略图 */
+.composer-attachments {
+  display: contents;
+}
 .thumbs {
   display: flex;
   flex-wrap: wrap;
@@ -237,6 +246,72 @@
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* Non-image files paired with composer image thumbnails. */
+.reply-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.reply-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 4px 6px 4px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: var(--bg-elevated);
+  font-size: 12px;
+}
+.reply-file .rf-icon {
+  flex: 0 0 auto;
+  font-size: 13px;
+  line-height: 1;
+}
+.reply-file .rf-warning {
+  flex: 0 0 auto;
+  display: inline-flex;
+  color: var(--text-tertiary);
+}
+.reply-file .rf-warning svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 1.35;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.reply-file .rf-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+.reply-file.unavailable .rf-name {
+  color: var(--text-tertiary);
+  text-decoration: line-through;
+}
+.reply-file .rf-remove {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(128, 128, 128, 0.25);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1;
+  cursor: default;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.reply-file .rf-remove:hover {
+  background: rgba(128, 128, 128, 0.4);
+  color: var(--text-primary);
 }
 
 /* Markdown 正文 */
@@ -364,6 +439,95 @@
 }
 .code-copy.copied .cc-check {
   display: inline;
+}
+.mermaid-block {
+  min-width: 0;
+  border-radius: var(--radius-md);
+  background: var(--md-code-bg);
+}
+.mermaid-block.mermaid-rendered {
+  padding: 10px;
+}
+.mermaid-canvas {
+  min-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-radius: calc(var(--radius-md) - 2px);
+}
+.mermaid-frame-shell {
+  position: relative;
+  margin: 0 auto;
+}
+.mermaid-frame {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  max-width: none;
+  border: 0;
+  background: transparent;
+  transform-origin: top left;
+}
+.mermaid-status {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 42px 10px 12px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  text-align: center;
+}
+.mermaid-status-rendering::before {
+  content: "";
+  width: 12px;
+  height: 12px;
+  margin-right: 7px;
+  border: 1.5px solid color-mix(in srgb, var(--text-secondary) 24%, transparent);
+  border-top-color: var(--text-secondary);
+  border-radius: 50%;
+  animation: mermaid-spin 0.7s linear infinite;
+}
+@keyframes mermaid-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.mermaid-status-failed,
+.mermaid-status-tooLarge,
+.mermaid-status-tooMany {
+  justify-content: flex-start;
+  min-height: 0;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  color: var(--text-secondary);
+}
+.mermaid-source-toggle {
+  position: absolute;
+  top: 6px;
+  right: 38px;
+  z-index: 1;
+  min-height: 26px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+}
+.mermaid-block:hover .mermaid-source-toggle,
+.mermaid-source-toggle:focus-visible {
+  opacity: 1;
+}
+.mermaid-source-toggle:hover {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--text-primary) 8%, var(--bg-elevated));
+}
+.mermaid-rendered > .code-copy {
+  z-index: 1;
 }
 .markdown-body blockquote {
   margin: 10px 0;

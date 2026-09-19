@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 设置页编排层：tabbar（含 R9 搜索态）+ 各 tab 子组件 + 根级弹层。
 // 共享状态与各域逻辑在 ./settings/*（createSettingsContext provide，子组件 inject）。
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { applyLanguage } from "../i18n";
@@ -11,10 +11,11 @@ import type { ThemeMode, UiLanguage } from "../lib/types";
 import {
   createSettingsContext,
   isMac,
-  isWindows,
+  supportsAgentTasks,
   TABS,
   type Tab,
 } from "./settings/context";
+import { tabLoads, type SettingsLoad } from "./settings/tabData";
 import GeneralTab from "./settings/GeneralTab.vue";
 import AdvancedTab from "./settings/AdvancedTab.vue";
 import ExperimentalTab from "./settings/ExperimentalTab.vue";
@@ -31,7 +32,6 @@ const {
   activeTab,
   secretsPresent,
   updateSummary,
-  refreshAgentTaskSettings,
   searchActive,
   searchQuery,
   searchSelected,
@@ -59,9 +59,26 @@ function onTabClick(tab: Tab, e: MouseEvent) {
   tabDown.value = null;
   if (d && Math.hypot(e.screenX - d.x, e.screenY - d.y) > 4) return;
   activeTab.value = tab;
-  // Readiness can change in the Advanced/Agents tabs or in another process. Refresh whenever the
-  // experimental page becomes visible so it never keeps the mount-time snapshot.
-  if (tab === "experimental" && isMac) void refreshAgentTaskSettings(false);
+  void ensureTabData(tab);
+}
+
+function runLoad(load: SettingsLoad): Promise<void> {
+  switch (load.type) {
+    case "integration-status":
+      return ctx.ensureIntegration();
+    case "pi-version":
+      return ctx.ensurePiVersion();
+    case "general":
+      return ctx.ensureGeneral();
+    case "about":
+      return ctx.ensureAbout();
+    case "agent-tasks":
+      return ctx.ensureAgentTaskSettings(load.force);
+  }
+}
+
+function ensureTabData(tab: Tab): Promise<unknown> {
+  return Promise.all(tabLoads(tab, supportsAgentTasks).map(runLoad));
 }
 
 // 其它窗口改了语言时，本窗口也同步切换。
@@ -91,17 +108,36 @@ onMounted(async () => {
     }
   );
   // 窗口已开时的定位请求（托盘「渠道异常」行等）：新开窗走 URL ?tab=，已开窗走本事件。
+  // payload 支持 `tab#elementId` 锚点后缀（跨窗口定位，spec gui-agent-task-launch G5）。
   unlistenGotoTab = await listen<string>("settings-goto-tab", (e) => {
-    if (TABS.includes(e.payload as Tab)) activeTab.value = e.payload as Tab;
+    gotoTabTarget(e.payload);
   });
-  await ctx.initIntegration();
-  await ctx.initGeneral();
-  // 生命周期追踪已迁至「高级」Tab（仅 macOS/Linux，不再受「实验性功能」开关门控）。
-  if (!isWindows) await ctx.refreshLifecycle();
-  // 只读已持久化的工作目录索引；冷扫描延迟到打开「管理工作目录」面板时。
-  if (isMac) await refreshAgentTaskSettings(false);
-  await ctx.initAbout();
+  // Local integration status is cheap after CLI probes were removed; start it in the
+  // background so the tab-bar update badge can appear without blocking the window.
+  void ctx.ensureIntegration();
+  watch(activeTab, (tab) => {
+    void ensureTabData(tab);
+  });
+  void ensureTabData(activeTab.value);
+  // Initial URLs can include an element anchor (for example integration#lifecycle-claude).
+  // Wait only for that tab's data before scrolling.
+  const rawTab = new URLSearchParams(window.location.search).get("tab");
+  if (rawTab?.includes("#")) {
+    await ensureTabData(activeTab.value);
+    gotoTabTarget(rawTab);
+  }
 });
+
+/** 解析 `tab[#elementId]` 并切 tab + 可选滚动定位（settings-goto-tab / 初始 URL 共用）。 */
+function gotoTabTarget(raw: string) {
+  const [tab, target] = raw.split("#");
+  if (!TABS.includes(tab as Tab)) return;
+  activeTab.value = tab as Tab;
+  void (async () => {
+    await ensureTabData(tab as Tab);
+    if (target) await ctx.gotoSettingsTarget(target);
+  })();
+}
 </script>
 
 <template>
@@ -138,7 +174,6 @@ onMounted(async () => {
         {{ t("settings.tabs.channel") }}
       </button>
       <button
-        v-if="!isWindows"
         :data-tauri-drag-region="tabDrag"
         :class="{ active: activeTab === 'advanced' }"
         @mousedown="onTabDown"
@@ -147,7 +182,7 @@ onMounted(async () => {
         {{ t("settings.tabs.advanced") }}
       </button>
       <button
-        v-if="!isWindows && config.experimental.enabled"
+        v-if="config.experimental.enabled"
         :data-tauri-drag-region="tabDrag"
         :class="{ active: activeTab === 'experimental' }"
         @mousedown="onTabDown"

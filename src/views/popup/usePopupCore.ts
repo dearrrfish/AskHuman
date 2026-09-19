@@ -14,6 +14,7 @@ import {
   confirmPopupReady,
   cancelPopup,
   openSettings,
+  openAgentConsole,
   openHistory,
   openTodos,
   openPath,
@@ -28,6 +29,11 @@ import {
   todosRemove,
 } from "../../lib/ipc";
 import { isFocusableTerminal } from "../../lib/terminals";
+import {
+  isWindows,
+  primaryModifierPressed,
+  primaryShortcutLabel,
+} from "../../lib/platform";
 import { matchShortcut } from "../../lib/shortcut";
 import { applyLanguage } from "../../i18n";
 import { renderMarkdown, handleCodeCopyClick } from "../../lib/markdown";
@@ -35,6 +41,7 @@ import { applyTheme, fileToDataUrl } from "../../lib/theme";
 import { mark as perfMarkFe, enable as perfEnableFe } from "../../lib/perf";
 import type {
   AskRequest,
+  ConfirmChoice,
   ConfirmRequest,
   FileAttachment,
   ImageAttachment,
@@ -49,15 +56,29 @@ import type {
 import { useSpeech } from "./useSpeech";
 import { useAttachments } from "./useAttachments";
 import { useUpdateState } from "./useUpdateState";
+import { usePopupFind } from "./usePopupFind";
 import {
   canComposerDock,
-  cmdEnterQuestionIndex,
   composerHomeVisibleRatio,
+  DEFAULT_DOCKED_TEXTAREA_MAX_HEIGHT,
   isComposerHomeFullyVisible,
+  projectedDockedComposerHomeHeight,
+  resolveActionQuestionIndex,
   resolveComposerDocked,
+  shouldApplyScrollSpy,
+  shouldDeactivateOffscreenComposer,
   shouldRevealQuestionBeforeCmdEnter,
   type ComposerDockGeometry,
 } from "./composerDock";
+import {
+  refreshWhatsNextTodos,
+  selectedWhatsNextTodo,
+} from "./whatsNextTodos";
+import {
+  inputMayShrinkTextarea,
+  resizeTextareaToContent,
+  settleTextareaHeightAfterBlur,
+} from "./textareaAutosize";
 
 export function usePopupCore() {
   const { t } = useI18n();
@@ -112,15 +133,11 @@ export function usePopupCore() {
   /** Submit shortcut: cmdEnter (default) or enter. From popup_init / settings-updated. */
   const popupSubmitKey = ref<"cmdEnter" | "enter">("cmdEnter");
   const submitWithBareEnter = computed(() => popupSubmitKey.value === "enter");
-  // 每题的 textarea（函数 ref 按索引登记）；inputRef = 当前题(active) 的 textarea，
-  // 供语音 / autoGrow / 聚焦复用既有逻辑（current 即 active 指针）。
+  // Textarea refs are registered by question index.
   const inputRefs = ref<(HTMLTextAreaElement | null)[]>([]);
   function setInputRef(el: HTMLTextAreaElement | null, i: number) {
     inputRefs.value[i] = el;
   }
-  const inputRef = computed<HTMLTextAreaElement | null>(
-    () => inputRefs.value[current.value] ?? null
-  );
   const fileRef = ref<HTMLInputElement | null>(null);
   // 多问题纵向列表：滚动容器（IntersectionObserver root）+ 每题卡片 + 每题底部哨兵 + 每题缩略图容器。
   const contentRef = ref<HTMLElement | null>(null);
@@ -158,8 +175,12 @@ export function usePopupCore() {
     manuallyActivated: boolean;
   } | null = null;
   let nextSequentialFocusIsManual = false;
+  /** Find-driven sequential navigation: skip auto-focusing the answer composer. */
+  let suppressNextSeqFocus = false;
+  let pendingFindRevealResolve: (() => void) | null = null;
   let lastContentScrollTop = 0;
   let upwardScrollIntentUntil = 0;
+  let contentScrollIntentUntil = 0;
 
   function ensureComposerResizeObserver(): ResizeObserver | null {
     if (composerResizeObserver || typeof ResizeObserver === "undefined") {
@@ -274,6 +295,36 @@ export function usePopupCore() {
     if (liveHomeHeight > 0) composerHomeHeights[i] = liveHomeHeight;
     const homeHeight = composerHomeHeights[i] ?? 0;
     if (homeHeight <= 0) return null;
+    const textarea = inputRefs.value[i];
+    const liveTextareaHeight =
+      dockedComposerQ.value === i
+        ? 0
+        : textarea?.getBoundingClientRect().height ?? 0;
+    const configuredDockedTextareaMaxHeight = textarea
+      ? Number.parseFloat(
+          getComputedStyle(textarea).getPropertyValue(
+            "--composer-docked-textarea-max-height"
+          )
+        )
+      : Number.NaN;
+    const dockedTextareaMaxHeight = Number.isFinite(
+      configuredDockedTextareaMaxHeight
+    )
+      ? configuredDockedTextareaMaxHeight
+      : DEFAULT_DOCKED_TEXTAREA_MAX_HEIGHT;
+    const liveDockedHomeHeight =
+      dockedComposerQ.value === i
+        ? composerHomeRefs.value[i]?.getBoundingClientRect().height ?? 0
+        : 0;
+    const dockedHomeHeight =
+      liveDockedHomeHeight > 0
+        ? liveDockedHomeHeight
+        : projectedDockedComposerHomeHeight(
+            homeHeight,
+            liveTextareaHeight,
+            dockedTextareaMaxHeight
+          );
+    if (dockedHomeHeight <= 0) return null;
     const releasedHeight =
       dockedComposerQ.value === i
         ? composerDockRef.value?.getBoundingClientRect().height ?? 0
@@ -281,6 +332,7 @@ export function usePopupCore() {
     return {
       homeTop: anchorRect.top,
       homeBottom: anchorRect.top + homeHeight,
+      dockedHomeHeight,
       viewportTop: viewport.top,
       viewportBottom: viewport.bottom,
       viewportBottomAfterUndock: viewport.bottom + releasedHeight,
@@ -369,6 +421,10 @@ export function usePopupCore() {
   }
 
   function endOtherComposer(i: number) {
+    const focused = focusedQ.value;
+    if (focused !== null && focused !== i) {
+      inputRefs.value[focused]?.blur();
+    }
     if (composerOwnerQ.value !== null && composerOwnerQ.value !== i) {
       clearComposerOwner();
     }
@@ -406,6 +462,7 @@ export function usePopupCore() {
     nextSequentialFocusIsManual = false;
     lastContentScrollTop = contentRef.value?.scrollTop ?? 0;
     upwardScrollIntentUntil = 0;
+    contentScrollIntentUntil = 0;
   }
   // 当前聚焦的问题索引（null = 无）；驱动折叠输入框展开。
   const focusedQ = ref<number | null>(null);
@@ -440,10 +497,11 @@ export function usePopupCore() {
     lastContentScrollTop = st;
     scrolled.value = st > 0;
     atTop.value = st <= 0;
-    scheduleScrollWork();
+    scheduleScrollWork(true);
   }
 
   function onContentWheel(e: WheelEvent) {
+    if (e.deltaY !== 0) contentScrollIntentUntil = Date.now() + 500;
     if (e.deltaY < 0) upwardScrollIntentUntil = Date.now() + 500;
   }
 
@@ -452,7 +510,7 @@ export function usePopupCore() {
   // 该线当前落在的题（即最后一个 top ≤ 线的题）。如此滚动进度被均匀分配给各题：滚到最顶=第一题、
   // 滚到底=末题、中间进度=中间题，**每题都有一段可达区间**（修复「内容仅略超视口时，一滑就从首题
   // 跳到末题、中间题选不中」）；且因用真实卡片边界，超长题在其铺满视口期间持续保持 active（高度自适应）。
-  // 键盘/按钮导航后 450ms 内不被滚动回改（activeLockUntil）。
+  // Keep scroll-spy from overriding keyboard/button navigation during NAV_LOCK_MS.
   function readingLineY(root: HTMLElement): number {
     const r = root.getBoundingClientRect();
     const max = root.scrollHeight - root.clientHeight;
@@ -470,11 +528,24 @@ export function usePopupCore() {
     return next;
   }
   let scrollRaf = 0;
-  function scheduleScrollWork() {
+  let scrollSpyPending = false;
+  function scheduleScrollWork(fromScrollEvent = false) {
+    // Geometry-only callers (keyboard activation, ResizeObserver, Teleport) must not hand the
+    // current-question pointer back to scroll-spy. Preserve a real scroll intent if calls coalesce.
+    if (fromScrollEvent) scrollSpyPending = true;
     if (scrollRaf) return;
     scrollRaf = requestAnimationFrame(() => {
       scrollRaf = 0;
-      if (verticalMode.value && Date.now() >= activeLockUntil) {
+      const hadScrollEvent = scrollSpyPending;
+      const now = Date.now();
+      const applyScrollSpy = shouldApplyScrollSpy(
+        hadScrollEvent,
+        verticalMode.value,
+        now,
+        activeLockUntil,
+      );
+      scrollSpyPending = false;
+      if (applyScrollSpy) {
         const root = contentRef.value;
         if (root) {
           const next = activeForScroll(root);
@@ -482,6 +553,14 @@ export function usePopupCore() {
         }
       }
       measureComposerDock();
+      // User wheel/trackpad input may intentionally override an in-flight navigation lock. Outside
+      // the lock, any real content scroll is eligible (including scrollbar-driven scrolling).
+      if (
+        hadScrollEvent &&
+        (applyScrollSpy || now <= contentScrollIntentUntil)
+      ) {
+        deactivateOffscreenComposer();
+      }
     });
   }
 
@@ -513,27 +592,41 @@ export function usePopupCore() {
   // 来源 agent：家族标识 + pid + 所在终端类型（决定 badge 是否可点击激活 tab）。
   const agentKind = ref("");
   const agentPid = ref<number | null>(null);
+  const agentLaunchId = ref<string | null>(null);
+  const agentConsoleSessionId = ref("");
   const agentTerminal = ref<string | null>(null);
-  // agent badge 文案：本地化家族名（Claude Code / Codex / Cursor）；未知家族回退原始标识。
+  // agent badge 文案：本地化已知家族名；未知家族回退原始标识。
   const agentLabel = computed(() => {
     const k = agentKind.value;
     if (!k) return "";
     const label = t(`agents.kind.${k}`);
     return label === `agents.kind.${k}` ? k : label;
   });
-  // agent badge 是否可点击：所在终端可激活 tab 且有 pid。
+  // macOS uses a pid/TTY; Windows uses a daemon-registered launch UUID.
   const agentFocusable = computed(
-    () => !!agentPid.value && isFocusableTerminal(agentTerminal.value)
+    () =>
+      (!!agentPid.value || !!agentLaunchId.value) &&
+      isFocusableTerminal(agentTerminal.value)
+  );
+  const agentConsoleAvailable = computed(
+    () => agentConsoleSessionId.value.length > 0
   );
 
   // 点击 agent badge：聚焦该 agent 所在终端的 tab（失败静默，仅日志）。
   async function onFocusAgentTerminal() {
-    if (!agentFocusable.value || agentPid.value == null) return;
+    if (!agentFocusable.value) return;
     try {
-      await focusAgentTerminal(agentPid.value);
+      await focusAgentTerminal(agentPid.value, agentLaunchId.value);
     } catch (err) {
       console.warn("focus agent terminal failed", err);
     }
+  }
+
+  // daemon 已严格匹配会话时才会显示；后端从自身状态取目标 session，前端不参与寻址。
+  function openAgentConsoleWindow() {
+    openAgentConsole().catch((err) => {
+      console.warn("open agent console failed", err);
+    });
   }
 
   // 点击 workspace badge：在文件管理器打开该目录。
@@ -553,12 +646,29 @@ export function usePopupCore() {
   // 关 / 单问题 → 旧版「一次一题 + 上/下一步」（sequential）。
   const verticalEnabled = ref(false);
   const verticalMode = computed(() => verticalEnabled.value && isMulti.value);
+  // 拖拽悬停中的目标题（纵向布局才有意义）：驱动卡片高亮，松手前即可看出落点。
+  const dropTargetQ = ref<number | null>(null);
+  // Passive scrolling only changes `current` (the viewport card). While an editor retains DOM
+  // focus, every user action stays owned by that editor until an explicit cross-question action.
+  const actionQuestionIndex = computed(() =>
+    verticalMode.value
+      ? resolveActionQuestionIndex(current.value, focusedQ.value)
+      : current.value
+  );
+  const actionQuestion = computed<Question | null>(
+    () => questions.value[actionQuestionIndex.value] ?? null
+  );
+  const inputRef = computed<HTMLTextAreaElement | null>(
+    () => inputRefs.value[actionQuestionIndex.value] ?? null
+  );
   // 严格选择：隐藏补充输入 / 附件区，且必须选中才能提交（D11）。
   const selectOnly = computed(() => request.value?.selectOnly ?? false);
   // 单选：选项渲染为 radio，每题恰好一个（D11）。
   const single = computed(() => request.value?.single ?? false);
   // whats-next 提问（spec todo-whats-next D2/D7）：待办已是问题选项本体，折叠区不重复渲染 chip。
   const whatsNext = computed(() => request.value?.whatsNext ?? false);
+  let whatsNextStaticOptions: Question["predefinedOptions"] = [];
+  let whatsNextBaseMessage = "";
 
   // ===== 待办下拉区（spec todo-whats-next D7，第 11 轮改版）=====
   // 该提问项目的待办列表；直读 todos.json（经后端命令），渲染后异步加载不阻塞首屏。
@@ -566,6 +676,7 @@ export function usePopupCore() {
   const todosOpen = ref(false);
   // 选中的待办条目 id（提交时文本并入回答、id 送后端出队）。
   const todoChosenIds = ref<string[]>([]);
+  const todoChosenSnapshots = ref<Record<string, TodoEntry>>({});
   // 点选作答在严格选择（禁自由文本）之外都启用；选中文本恒并入**最后一题**的回答。
   const todoChipsEnabled = computed(() => !selectOnly.value);
   // 跟在最后一个问题后面、仅在有待办时显示：whats-next 弹窗不显示（待办已是选项本体）；
@@ -579,13 +690,43 @@ export function usePopupCore() {
       (verticalMode.value || current.value === total.value - 1)
   );
   const selectedTodos = computed(() =>
-    todos.value.filter((td) => todoChosenIds.value.includes(td.id))
+    todoChosenIds.value
+      .map((id) => todoChosenSnapshots.value[id])
+      .filter((todo): todo is TodoEntry => !!todo)
   );
 
+  let todoLoadGeneration = 0;
   async function loadTodos() {
-    if (!projectPath.value || whatsNext.value) return;
+    if (!projectPath.value || !request.value) return;
+    const generation = ++todoLoadGeneration;
     try {
-      todos.value = await todosList(projectPath.value);
+      const latest = await todosList(projectPath.value);
+      if (generation !== todoLoadGeneration) return;
+      const liveIds = new Set(latest.map((todo) => todo.id));
+      todos.value = latest;
+      if (whatsNext.value) {
+        const question = request.value.questions[0];
+        if (!question) return;
+        const refreshed = refreshWhatsNextTodos(
+          question.predefinedOptions,
+          whatsNextStaticOptions,
+          latest,
+          chosenByQ.value[0] ?? [],
+          t("popup.todos.optionPrefix"),
+          (count) => t("common.attachmentBadge", { n: count }),
+        );
+        question.predefinedOptions = refreshed.options;
+        question.message = refreshed.hiddenTodos
+          ? `${whatsNextBaseMessage}\n\n${t("popup.todos.more", { n: refreshed.hiddenTodos })}`
+          : whatsNextBaseMessage;
+        chosenByQ.value[0] = refreshed.selectedOptions;
+        return;
+      }
+      // External deletes/completions must also clear stale local selections.
+      todoChosenIds.value = todoChosenIds.value.filter((id) => liveIds.has(id));
+      for (const id of Object.keys(todoChosenSnapshots.value)) {
+        if (!liveIds.has(id)) delete todoChosenSnapshots.value[id];
+      }
     } catch {
       /* 旧后端无此命令：待办区保持空 */
     }
@@ -594,13 +735,24 @@ export function usePopupCore() {
   function toggleTodo(id: string) {
     if (!todoChipsEnabled.value) return;
     const i = todoChosenIds.value.indexOf(id);
-    if (i >= 0) todoChosenIds.value.splice(i, 1);
-    else todoChosenIds.value.push(id);
+    if (i >= 0) {
+      todoChosenIds.value.splice(i, 1);
+      delete todoChosenSnapshots.value[id];
+    } else {
+      const todo = todos.value.find((entry) => entry.id === id);
+      if (!todo) return;
+      todoChosenSnapshots.value[id] = {
+        ...todo,
+        attachments: (todo.attachments ?? []).map((attachment) => ({ ...attachment })),
+      };
+      todoChosenIds.value.push(id);
+    }
   }
 
   async function removeTodo(id: string) {
     todos.value = todos.value.filter((td) => td.id !== id);
     todoChosenIds.value = todoChosenIds.value.filter((x) => x !== id);
+    delete todoChosenSnapshots.value[id];
     try {
       await todosRemove(projectPath.value, id);
     } catch {
@@ -620,9 +772,6 @@ export function usePopupCore() {
   });
   const images = computed(() => imagesByQ.value[current.value] ?? []);
   const replyFiles = computed(() => replyFilesByQ.value[current.value] ?? []);
-  const renderedHtml = computed(() =>
-    currentQuestion.value ? questionHtml(currentQuestion.value) : ""
-  );
   // 旧版切题左右滑动方向 + 过渡名；「全部看过」用于 sequential 模式显示发送按钮。
   const slideDir = ref<"next" | "prev">("next");
   const transitionName = computed(() =>
@@ -635,11 +784,6 @@ export function usePopupCore() {
   const qHeaderRef = ref<HTMLElement | null>(null);
   // 共享 Message（描述 + 附件）。无 -q 时 text 为空（第一个参数已提升为问题）。
   const messageText = computed(() => request.value?.message.text ?? "");
-  const messageHtml = computed(() =>
-    request.value?.isMarkdown && !viewSource.value
-      ? renderMarkdown(messageText.value, codeCopyLabels.value)
-      : ""
-  );
   const showDescription = computed(
     () => messageText.value.trim() !== "" || attachments.value.length > 0
   );
@@ -732,18 +876,20 @@ export function usePopupCore() {
       (_, i) => (chosenByQ.value[i]?.length ?? 0) > 0
     );
   });
-  // 是否处于最后一题：多题时 CMD+回车 仅在最后一题提交，否则前往下一题。
-  const onLastQuestion = computed(() => current.value === total.value - 1);
+  // Passive scrolling does not change whether the unified action target is the last question.
+  const onLastQuestion = computed(
+    () => actionQuestionIndex.value === total.value - 1
+  );
 
   // 「上一个」是否可用：纵向模式下即使在首题，只要还没滚到最顶（上方 message 未露全）就可用（点它=露出 message）；
   // 旧版顺序模式仍是「非首题才可用」。
   const canGoPrev = computed(() =>
-    verticalMode.value ? !(current.value === 0 && atTop.value) : current.value > 0
+    verticalMode.value
+      ? !(actionQuestionIndex.value === 0 && atTop.value)
+      : current.value > 0
   );
 
-  const cmdEnterFromQ = computed(() =>
-    cmdEnterQuestionIndex(current.value, focusedQ.value)
-  );
+  const cmdEnterFromQ = computed(() => actionQuestionIndex.value);
   // 纵向模式下 ⌘↵ 是否会「提交」：已看完全部 且 快捷键目标题之后再无未答题（含焦点在末题时恒真）。
   // 与 onCmdEnter 的分支完全一致——「谁挂 ⌘↵ = ⌘↵ 就干谁」，故 ⌘↵ 角标据此挂在提交按钮上。
   const cmdEnterWillSubmit = computed(
@@ -758,7 +904,7 @@ export function usePopupCore() {
   );
   /** Label for the submit shortcut badge (⌘↵ vs ↵). */
   const submitKeyLabel = computed(() =>
-    submitWithBareEnter.value ? "↵" : "⌘↵"
+    submitWithBareEnter.value ? "↵" : primaryShortcutLabel("enter")
   );
   const submitPrimary = computed(() => submitShowsCmdEnter.value);
   // 下一个是否主按钮：末题从不主；否则在「提交尚未成为主按钮」时为主（读题引导）。
@@ -769,7 +915,7 @@ export function usePopupCore() {
   // CMD+数字 选项快捷键上限（1-9）；超出的选项不分配快捷键。
   const OPTION_HOTKEY_MAX = 9;
   function optionHotkey(i: number): string | null {
-    return i < OPTION_HOTKEY_MAX ? `⌘${i + 1}` : null;
+    return i < OPTION_HOTKEY_MAX ? primaryShortcutLabel(String(i + 1)) : null;
   }
 
   function isAnswered(i: number): boolean {
@@ -790,15 +936,9 @@ export function usePopupCore() {
       (inputByQ.value[i]?.trim().length ?? 0) > 0
     );
   }
-  // 每题题干渲染（Markdown 全局开关 + 源码视图）。
-  function questionHtml(q: Question): string {
-    return request.value?.isMarkdown && !viewSource.value
-      ? renderMarkdown(q.message, codeCopyLabels.value)
-      : "";
-  }
   // 仅「当前题」显示 ⌘1–9 角标（避免每题都冒出 ⌘1）。
   function cardOptionHotkey(qIndex: number, optIndex: number): string | null {
-    if (isMulti.value && qIndex !== current.value) return null;
+    if (isMulti.value && qIndex !== actionQuestionIndex.value) return null;
     return optionHotkey(optIndex);
   }
 
@@ -819,6 +959,7 @@ export function usePopupCore() {
   let unlistenCloseReq: UnlistenFn | null = null;
   let unlistenFlash: UnlistenFn | null = null;
   let unlistenAgent: UnlistenFn | null = null;
+  let unlistenTodos: UnlistenFn | null = null;
   // 方案6 预热弹窗：daemon 领用时 emit 的唤醒事件，前端据此 pull 请求并渲染。
   let unlistenShow: UnlistenFn | null = null;
 
@@ -889,6 +1030,12 @@ export function usePopupCore() {
   function toggle(qIndex: number, option: string) {
     const arr = chosenByQ.value[qIndex];
     if (!arr) return;
+    if (
+      (focusedQ.value !== null && focusedQ.value !== qIndex) ||
+      (composerOwnerQ.value !== null && composerOwnerQ.value !== qIndex)
+    ) {
+      speech.stopListening();
+    }
     endOtherComposer(qIndex);
     const i = arr.indexOf(option);
     // 单选：选中即替换为唯一项；再次点击当前选中项则清空（保留"可不选"，除非严格模式）。
@@ -901,11 +1048,20 @@ export function usePopupCore() {
     else arr.push(option);
   }
 
-  // 通过序号（0 始）切换「当前题」的选项，供 CMD+数字 调用。
+  // Toggle an option on the unified action target. If passive scrolling moved its card away,
+  // Cmd+1–9 reveals the card after selecting while retaining editor focus.
   function toggleByIndex(i: number) {
-    const opts = currentQuestion.value?.predefinedOptions;
+    const qIndex = actionQuestionIndex.value;
+    const opts = actionQuestion.value?.predefinedOptions;
     if (!opts || i < 0 || i >= opts.length) return;
-    toggle(current.value, opts[i].text);
+    toggle(qIndex, opts[i].text);
+    if (!verticalMode.value) return;
+    setActive(qIndex, false);
+    activeLockUntil = Date.now() + NAV_LOCK_MS;
+    nextTick(() => {
+      activeLockUntil = Date.now() + NAV_LOCK_MS;
+      scrollQuestionIntoView(qIndex);
+    });
   }
 
   // 点「添加图片」：记录目标题后唤起文件选择。
@@ -956,15 +1112,37 @@ export function usePopupCore() {
   // DOM 级 drop 仅阻止默认（真正落盘走原生 onDragDropEvent，带落点坐标）。
   function onDrop(_e: DragEvent) {}
 
-  // 原生拖放落点 → 命中的问题卡片索引（physical 坐标需除以 DPR 转 CSS 像素）。
-  function questionAtPoint(physX: number, physY: number): number {
+  /**
+   * 落点坐标 → 命中的问题卡片索引，未命中返回 null。
+   *
+   * Tauri 把落点标注为 `PhysicalPosition`，但各平台底层给的单位并不一致：macOS 的
+   * `draggingLocation()` 与 Linux 的 GTK 控件坐标都是逻辑像素（与 CSS 像素同尺度），只有
+   * Windows 的 IDropTarget 给的是真·物理像素。所以先按平台选一种解释，再用另一种兜底——
+   * 上游哪天统一了单位也不至于又只能拖到第一题。
+   */
+  function cardIndexAt(x: number, y: number): number | null {
+    const el = document.elementFromPoint(x, y) as HTMLElement | null;
+    const card = el?.closest?.(".q-card") as HTMLElement | null;
+    if (card?.dataset.qIndex == null) return null;
+    const idx = Number(card.dataset.qIndex);
+    return Number.isNaN(idx) ? null : idx;
+  }
+
+  function questionAtPoint(x: number, y: number): number {
     if (!verticalMode.value) return current.value;
     const dpr = window.devicePixelRatio || 1;
-    const el = document.elementFromPoint(physX / dpr, physY / dpr) as HTMLElement | null;
-    const card = el?.closest?.(".q-card") as HTMLElement | null;
-    if (card?.dataset.qIndex != null) {
-      const idx = Number(card.dataset.qIndex);
-      if (!Number.isNaN(idx)) return idx;
+    const candidates: [number, number][] = isWindows
+      ? [
+          [x / dpr, y / dpr],
+          [x, y],
+        ]
+      : [
+          [x, y],
+          [x / dpr, y / dpr],
+        ];
+    for (const [cx, cy] of candidates) {
+      const idx = cardIndexAt(cx, cy);
+      if (idx != null) return idx;
     }
     return current.value;
   }
@@ -1021,24 +1199,31 @@ export function usePopupCore() {
   }
 
   // 输入框随内容自增高（封顶 240px，超出则框内滚动）。仅展开态生效（折叠态固定 1 行）。
-  const MAX_TEXTAREA_H = 240;
-  function autoGrow(i: number = current.value) {
+  function autoGrow(i: number = current.value, allowShrink = true) {
     const el = inputRefs.value[i];
-    if (!el) return;
-    if (!expandedQ(i)) {
-      // 折叠态：清除内联高度，交回 CSS 的 1 行高度。
-      el.style.height = "";
-      return;
-    }
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, MAX_TEXTAREA_H)}px`;
+    resizeTextareaToContent(el, expandedQ(i), allowShrink);
   }
 
-  // ===== 子域接线：语音（依赖 current / inputByQ / inputRef / autoGrow）=====
-  const speech = useSpeech({ current, inputByQ, inputRef, autoGrow });
+  // ===== Speech follows the unified action target, not passive scroll position. =====
+  const speech = useSpeech({
+    targetQuestion: actionQuestionIndex,
+    inputByQ,
+    inputRef,
+    autoGrow,
+  });
+
+  // Toolbar actions are explicit question switches. Focus the owning textarea first so their
+  // speech / attachment target cannot be inherited from an editor retained by passive scrolling.
+  function focusQuestionAction(i: number) {
+    if (speech.speechTargetQ.value !== i) speech.stopListening();
+    endOtherComposer(i);
+    setActive(i, false);
+    focusComposer(i, true);
+  }
 
   // textarea 聚焦/失焦：维护 focusedQ + 切当前题（聚焦即展开）；失焦且空则折叠。
   function onTextareaFocus(i: number) {
+    if (speech.speechTargetQ.value !== i) speech.stopListening();
     const activation = programmaticFocusActivation;
     const manuallyActivated =
       activation?.qIndex === i ? activation.manuallyActivated : false;
@@ -1048,9 +1233,9 @@ export function usePopupCore() {
     setActive(i, false);
     nextTick(() => autoGrow(i));
   }
-  function onComposerInput(i: number) {
+  function onComposerInput(i: number, event: Event) {
     activateComposer(i);
-    autoGrow(i);
+    autoGrow(i, inputMayShrinkTextarea(event));
   }
   function onComposerMouseDown(i: number) {
     activateComposer(i);
@@ -1059,7 +1244,9 @@ export function usePopupCore() {
   function onTextareaBlur(i: number) {
     rememberComposerSelection(i);
     if (focusedQ.value === i) focusedQ.value = null;
-    nextTick(() => autoGrow(i));
+    nextTick(() => {
+      settleTextareaHeightAfterBlur(inputRefs.value[i], expandedQ(i));
+    });
   }
 
   // ===== 多题导航（纵向列表：当前题指针 + 滚动定位） =====
@@ -1092,6 +1279,23 @@ export function usePopupCore() {
     return (
       elRect.top >= rootRect.top + root.clientHeight || elRect.bottom <= rootRect.top
     );
+  }
+
+  function deactivateOffscreenComposer() {
+    const i = focusedQ.value;
+    if (i === null) return;
+    if (
+      !shouldDeactivateOffscreenComposer(
+        i,
+        dockedComposerQ.value,
+        isCardOffScreen(i)
+      )
+    ) {
+      return;
+    }
+    if (speech.speechTargetQ.value === i) speech.stopListening();
+    inputRefs.value[i]?.blur();
+    if (composerOwnerQ.value === i) clearComposerOwner();
   }
 
   // 把内容滚到最顶（scrollTop=0）：纵向模式在首题按「上一个」时用来完整露出上方 message。
@@ -1170,6 +1374,13 @@ export function usePopupCore() {
   // 锁住 scroll-spy 到滚动动画结束，避免 current 被滚动事件抢走。供上一个/下一个、⌘[/⌘]、⌘↵ 复用，行为一致。
   function goToIdx(target: number) {
     const i = Math.max(0, Math.min(target, total.value - 1));
+    if (
+      actionQuestionIndex.value !== i ||
+      (composerOwnerQ.value !== null && composerOwnerQ.value !== i)
+    ) {
+      speech.stopListening();
+    }
+    endOtherComposer(i);
     setActive(i, false); // 先置当前题、不滚动（滚动放到展开之后）
     activeLockUntil = Date.now() + NAV_LOCK_MS;
     nextTick(() => {
@@ -1181,9 +1392,9 @@ export function usePopupCore() {
     });
   }
 
-  // 相对移动当前题（上一个/下一个 + ⌘[/⌘]）。委托 goToIdx（焦点携带 + 展开后滚动）。
+  // Move relative to the unified action target and let goToIdx transfer focus before scrolling.
   function goRel(delta: number) {
-    goToIdx(current.value + delta);
+    goToIdx(actionQuestionIndex.value + delta);
   }
 
   // 旧版顺序模式切题：仅一题可见，改 current 即换页（聚焦/滚动由 Transition after-enter 处理）。
@@ -1207,11 +1418,22 @@ export function usePopupCore() {
   // 旧版切题动画完成后：聚焦输入 + 校正高度 + 滚动头部到顶（新面板已挂载、高度确定）。
   function onQuestionEntered() {
     if (verticalMode.value) return;
+    if (suppressNextSeqFocus) {
+      suppressNextSeqFocus = false;
+      autoGrow(current.value);
+      scrollHeaderIntoView();
+      find.refreshFind();
+      pendingFindRevealResolve?.();
+      pendingFindRevealResolve = null;
+      return;
+    }
     if (nextSequentialFocusIsManual) focusComposer(current.value, true);
     else focusComposerIfInitiallyVisible(current.value);
     nextSequentialFocusIsManual = false;
     autoGrow(current.value);
     scrollHeaderIntoView();
+    pendingFindRevealResolve?.();
+    pendingFindRevealResolve = null;
   }
 
   // 纵向导航统一在此闪一下：无论来自「上一个/下一个」按钮还是 ⌘[/⌘]，落点题都整题闪一次（用户要求按钮也闪）。
@@ -1219,7 +1441,7 @@ export function usePopupCore() {
     if (verticalMode.value) {
       // 已在首题：「上一个」= 把上方 message 完整露出（滚到最顶），而非无动作（用户预期两级：Q2→Q1 露出 Q1、
       // 在 Q1 再上一个才露出 message）。
-      if (current.value === 0) {
+      if (actionQuestionIndex.value === 0) {
         activeLockUntil = Date.now() + NAV_LOCK_MS;
         scrollContentToTop();
         flashCard(0);
@@ -1237,9 +1459,10 @@ export function usePopupCore() {
     if (verticalMode.value) {
       // 当前题**完全在屏外**（如长 message 刚打开把 Q1 顶到屏外）→ 先把它露出来 + 聚焦 + 闪一下，而非直接跳下一题
       // （用户反馈：刚打开点「下一个」直接跳到 Q2、Q1 从没露出）。仅「底部被切一点」不算屏外，可正常推进到下一题。
-      if (isCardOffScreen(current.value)) {
-        goToIdx(current.value);
-        flashCard(current.value);
+      const from = actionQuestionIndex.value;
+      if (isCardOffScreen(from)) {
+        goToIdx(from);
+        flashCard(from);
         return;
       }
       goRel(1);
@@ -1289,7 +1512,7 @@ export function usePopupCore() {
       submit();
       return;
     }
-    const s = nextUnseenAfter(current.value);
+    const s = nextUnseenAfter(from);
     if (s >= 0) {
       goToIdx(s);
       flashCard(s);
@@ -1308,6 +1531,29 @@ export function usePopupCore() {
         images: imagesByQ.value[i] ?? [],
         files: (replyFilesByQ.value[i] ?? []).map((f) => f.path),
       };
+      // Local whats-next TODO options refresh after the daemon snapshots its request. Submit a
+      // refreshed TODO as raw task text + stable id so output and dequeue semantics stay exact.
+      const whatsNextTodo =
+        i === 0 && whatsNext.value
+          ? selectedWhatsNextTodo(
+              q.predefinedOptions,
+              chosenByQ.value[i] ?? [],
+              todos.value,
+              t("popup.todos.optionPrefix"),
+            )
+          : null;
+      if (whatsNextTodo) {
+        answer.selectedOptions = answer.selectedOptions.filter(
+          (text) => text !== whatsNextTodo.optionText,
+        );
+        answer.userInput = [whatsNextTodo.text, answer.userInput.trim()]
+          .filter((text) => text.trim())
+          .join("\n\n");
+        answer.todoIds = [whatsNextTodo.id];
+        answer.todoSelections = [
+          { id: whatsNextTodo.id, attachments: whatsNextTodo.attachments },
+        ];
+      }
       // 待办下拉区选中的条目（恒归**最后一题**，spec D7 第 11 轮改版）：每条加「另外看一下
       // 这个待办任务：」前缀并入 userInput（手输文本在前、待办在后，空行分隔），id 送后端出队。
       if (
@@ -1324,6 +1570,16 @@ export function usePopupCore() {
           .filter((s) => s.trim())
           .join("\n\n");
         answer.todoIds = selectedTodos.value.map((td) => td.id);
+        answer.todoSelections = selectedTodos.value.map((td) => ({
+          id: td.id,
+          attachments: (td.attachments ?? []).map((attachment) => ({
+            id: attachment.id,
+            name: attachment.name,
+            path: attachment.path,
+            sourcePath: attachment.sourcePath,
+            storage: attachment.storage,
+          })),
+        }));
       }
       return answer;
     });
@@ -1364,6 +1620,169 @@ export function usePopupCore() {
       confirmRequest.value?.context.find((field) => field.id === "tool")?.value ??
       "Tool"
   );
+
+  // ===== 前缀档位选择器（D51）=====
+  // 同 group 的 choices 是同一动作的不同泛化档位：折叠成一行展示，所有 group 共享
+  // 一个档位选择器；提交仍然走被选中 choice 的 wire index，协议零改动。
+  const confirmVariantLevel = ref(0);
+
+  const confirmVariantGroups = computed(() => {
+    const groups = new Map<
+      string,
+      {
+        level: number;
+        index: number;
+        levelLabel: string;
+        segmentLabel: string;
+        recommended: boolean;
+      }[]
+    >();
+    (confirmRequest.value?.choices ?? []).forEach((choice, index) => {
+      const variant = choice.variant;
+      if (!variant) return;
+      const list = groups.get(variant.group) ?? [];
+      list.push({
+        level: variant.level,
+        index,
+        levelLabel: variant.levelLabel,
+        segmentLabel: variant.segmentLabel || variant.levelLabel,
+        recommended: variant.recommended,
+      });
+      groups.set(variant.group, list);
+    });
+    for (const list of groups.values()) list.sort((a, b) => a.level - b.level);
+    return groups;
+  });
+
+  // 选择器档位（标签取第一个 group；各 group 的阶梯由 Hook 端保证一致）。
+  const confirmVariantLevels = computed(() => {
+    const first:
+      | {
+          level: number;
+          levelLabel: string;
+          segmentLabel: string;
+          recommended: boolean;
+        }[]
+      | undefined =
+      confirmVariantGroups.value.values().next().value;
+    return first && first.length > 1
+      ? first.map((entry) => ({
+          level: entry.level,
+          label: entry.segmentLabel,
+          prefixLabel: entry.levelLabel,
+          recommended: entry.recommended,
+        }))
+      : [];
+  });
+
+  const confirmVariantRecommendedLevel = computed(
+    () =>
+      confirmVariantLevels.value.find((entry) => entry.recommended)?.level ??
+      confirmVariantLevels.value[0]?.level ??
+      0,
+  );
+
+  // 展示行：普通 choice 原样一行；每个 group 在其首个 choice 的位置折叠为一行，
+  // 行内容（label/description/wire index）跟随当前档位。
+  const confirmRows = computed(() => {
+    const choices = confirmRequest.value?.choices ?? [];
+    const rows: { index: number; choice: ConfirmChoice; group?: string }[] = [];
+    const seen = new Set<string>();
+    choices.forEach((choice, index) => {
+      const variant = choice.variant;
+      if (!variant) {
+        rows.push({ index, choice });
+        return;
+      }
+      if (seen.has(variant.group)) return;
+      seen.add(variant.group);
+      const entries = confirmVariantGroups.value.get(variant.group) ?? [];
+      const active =
+        entries.find((entry) => entry.level === confirmVariantLevel.value) ??
+        entries[0];
+      if (active) {
+        rows.push({ index: active.index, choice: choices[active.index], group: variant.group });
+      }
+    });
+    return rows;
+  });
+
+  function selectConfirmVariantLevel(level: number) {
+    if (submitting.value || level === confirmVariantLevel.value) return;
+    const previousGroup = selectedConfirmChoice.value?.variant?.group;
+    confirmVariantLevel.value = level;
+    // 已选中某个档位行时，选中项跟随切到同组的新档位。
+    if (previousGroup) {
+      const entries = confirmVariantGroups.value.get(previousGroup) ?? [];
+      const target = entries.find((entry) => entry.level === level);
+      if (target) confirmChoiceIndex.value = target.index;
+    }
+  }
+
+  // ===== In-page find (⌘/Ctrl+F) — see docs/specs/popup-find.md =====
+  const confirmChoiceTexts = computed(() =>
+    confirmRows.value.map((row) => {
+      const d = row.choice.description?.trim();
+      return d ? `${row.choice.label}\n${d}` : row.choice.label;
+    }),
+  );
+  const confirmTitle = computed(() => confirmRequest.value?.title ?? "");
+  const confirmSummary = computed(
+    () => confirmRequest.value?.detail.summary ?? "",
+  );
+  const confirmBodyText = computed(
+    () => confirmRequest.value?.detail.bodyMd ?? "",
+  );
+
+  async function revealQuestionForFind(index: number): Promise<void> {
+    const i = Math.max(0, Math.min(index, total.value - 1));
+    if (verticalMode.value) {
+      setActive(i, true);
+      await nextTick();
+      return;
+    }
+    if (i === current.value) {
+      scrollHeaderIntoView();
+      await nextTick();
+      return;
+    }
+    speech.stopListening();
+    clearComposerOwner();
+    suppressNextSeqFocus = true;
+    nextSequentialFocusIsManual = false;
+    slideDir.value = i > current.value ? "next" : "prev";
+    current.value = i;
+    markVisited(i);
+    await new Promise<void>((resolve) => {
+      pendingFindRevealResolve = resolve;
+      window.setTimeout(() => {
+        if (pendingFindRevealResolve === resolve) {
+          pendingFindRevealResolve = null;
+          resolve();
+        }
+      }, 400);
+    });
+  }
+
+  const find = usePopupFind({
+    contentRef,
+    isConfirm,
+    confirmRequest,
+    messageText,
+    viewSource,
+    attachments,
+    questions,
+    whatsNext,
+    todoPrefix: computed(() => t("popup.todos.optionPrefix")),
+    confirmChoiceTexts,
+    confirmTitle,
+    confirmSummary,
+    confirmToolName,
+    confirmBodyText,
+    currentQ: current,
+    verticalMode,
+    revealQuestion: revealQuestionForFind,
+  });
 
   function startPermissionDiffEnrichment() {
     const edit = permissionEdit.value;
@@ -1447,7 +1866,7 @@ export function usePopupCore() {
   // 仅「纯」⌘/Ctrl（未叠加 Shift/Option）才算命中快捷键修饰键：例如 Cmd+Shift（截屏）下
   // 再按 1–9 不会命中选项快捷键，故此时不应高亮。
   function onlyCmdHeld(e: KeyboardEvent): boolean {
-    return (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey;
+    return primaryModifierPressed(e) && !e.shiftKey && !e.altKey;
   }
 
   /** Insert a newline at the caret of the focused textarea (enter-submit mode). */
@@ -1478,8 +1897,10 @@ export function usePopupCore() {
   }
 
   function onKeydown(e: KeyboardEvent) {
-    const mod = e.metaKey || e.ctrlKey;
+    const mod = primaryModifierPressed(e);
     cmdHeld.value = onlyCmdHeld(e);
+    // In-page find (⌘/Ctrl+F, Esc while open, ⌘G, …) — before business shortcuts.
+    if (find.handleFindKeydown(e)) return;
     if (isConfirm.value) {
       if (e.key === "Escape") {
         e.preventDefault();
@@ -1491,7 +1912,7 @@ export function usePopupCore() {
         if (e.isComposing || (e as KeyboardEvent & { keyCode?: number }).keyCode === 229) {
           return;
         }
-        const anyMod = mod || e.shiftKey || e.altKey;
+        const anyMod = e.metaKey || e.ctrlKey || e.shiftKey || e.altKey;
         const isPrimarySendMod = mod && !e.shiftKey && !e.altKey;
         const shouldSubmit = submitWithBareEnter.value ? !anyMod : isPrimarySendMod;
         if (shouldSubmit) {
@@ -1512,10 +1933,11 @@ export function usePopupCore() {
         return;
       }
       if (mod && e.key >= "1" && e.key <= "9") {
-        const index = Number(e.key) - 1;
-        if (index < (confirmRequest.value?.choices.length ?? 0)) {
+        // 快捷键按展示行计数（档位 group 折叠为一行，D51）。
+        const row = confirmRows.value[Number(e.key) - 1];
+        if (row) {
           e.preventDefault();
-          selectConfirmChoice(index);
+          selectConfirmChoice(row.index);
         }
         return;
       }
@@ -1532,7 +1954,7 @@ export function usePopupCore() {
       if (e.isComposing || (e as KeyboardEvent & { keyCode?: number }).keyCode === 229) {
         return;
       }
-      const anyMod = mod || e.shiftKey || e.altKey;
+      const anyMod = e.metaKey || e.ctrlKey || e.shiftKey || e.altKey;
       const isPrimarySendMod = mod && !e.shiftKey && !e.altKey; // pure ⌘/Ctrl+Enter
       const shouldSubmit = submitWithBareEnter.value
         ? !anyMod
@@ -1596,7 +2018,7 @@ export function usePopupCore() {
     // CMD+数字（1-9）：选中/取消当前题对应序号的选项。
     if (mod && e.key >= "1" && e.key <= "9") {
       const idx = Number(e.key) - 1;
-      const opts = currentQuestion.value?.predefinedOptions;
+      const opts = actionQuestion.value?.predefinedOptions;
       if (opts && idx < opts.length && idx < OPTION_HOTKEY_MAX) {
         e.preventDefault();
         toggleByIndex(idx);
@@ -1613,8 +2035,8 @@ export function usePopupCore() {
   let adopting = false;
   let interactionRendered = false;
 
-  // 把（含 request 的）init 渲染上屏：套主题/语言/来源 → 设 request → 双 rAF 打点 → 首帧后再做非关键初始化。
-  // 预热弹窗（init.warm）窗口起始隐藏，绘制完成后调 popup_show_window 让后端延后 show（杜绝空白闪现）。
+  // 把（含 request 的）init 渲染上屏：套主题/语言/来源 → 设 request → 报告 ready → 双 rAF 打点。
+  // daemon 收到 ready 后统一决定前景显示或后方级联；冷/热 helper 都保持隐藏到该授权到达。
   function renderInit(init: PopupInit) {
     const interaction = init.interaction;
     if (!interaction || interactionRendered) return;
@@ -1628,6 +2050,7 @@ export function usePopupCore() {
     projectPath.value = init.project;
     agentKind.value = init.agentKind ?? "";
     agentPid.value = init.agentPid ?? null;
+    agentConsoleSessionId.value = init.agentConsoleSessionId ?? "";
     createdAtMs.value = init.createdAtMs ?? 0;
     // 领用/渲染即刻校准 now，避免 tick 首帧前相对时间偏大。
     nowMs.value = Date.now();
@@ -1640,6 +2063,11 @@ export function usePopupCore() {
     verticalEnabled.value = init.verticalQuestions ?? false;
     const req = interaction.type === "ask" ? interaction.request : null;
     request.value = req;
+    const whatsNextQuestion = req?.whatsNext ? req.questions[0] : null;
+    whatsNextStaticOptions = whatsNextQuestion
+      ? whatsNextQuestion.predefinedOptions.filter((option) => !option.todoId)
+      : [];
+    whatsNextBaseMessage = whatsNextQuestion?.message.split("\n\n", 1)[0] ?? "";
     confirmRequest.value = interaction.type === "confirm" ? interaction.request : null;
     permissionEdit.value = interaction.type === "confirm" ? init.popupEdit ?? null : null;
     permissionDiff.value = permissionEdit.value?.initialDiff
@@ -1656,6 +2084,12 @@ export function usePopupCore() {
           )
         : null;
     if (confirmChoiceIndex.value === -1) confirmChoiceIndex.value = null;
+    // 档位选择器默认停在推荐档（D51）。
+    confirmVariantLevel.value =
+      interaction.type === "confirm"
+        ? interaction.request.choices.find((choice) => choice.variant?.recommended)
+            ?.variant?.level ?? 0
+        : 0;
     confirmComment.value = "";
     showConfirmCloseWarning.value = false;
     const n = req?.questions.length ?? 0;
@@ -1676,6 +2110,7 @@ export function usePopupCore() {
     todos.value = [];
     todosOpen.value = false;
     todoChosenIds.value = [];
+    todoChosenSnapshots.value = {};
     attach.loadThumbs();
     attach.loadDragIcons();
     // 纵向模式（实验开关开 且 多题）：不自动聚焦、保持全部折叠、建哨兵观察。
@@ -1705,20 +2140,13 @@ export function usePopupCore() {
         });
       });
     };
-    if (init.warm) {
-      // 预热弹窗的窗口此刻仍隐藏（ordered-out），没有 display link → rAF 不会回调，故不能「先双 rAF 再 show」。
-      // 改为：nextTick 等 DOM 把正文更新完，再请后端上屏；窗口可见后 WebKit 即绘制当前 DOM（已是正文，无
-      // 「加载中→正文」闪现），rAF 也随之恢复，afterPaint 在 show 之后打点 / 自动取消。
-      nextTick(() => {
-        popupShowWindow().catch(() => {});
-        appearGuardUntil = Date.now() + APPEAR_GUARD_MS; // 窗口刚上屏：短时吞掉 ⌘W 防误关
-        afterPaint();
-      });
-    } else {
-      // 冷路径：窗口已在 setup 中显示，rAF 正常回调。
+    // Hidden windows have no display link, so readiness must not wait for rAF. nextTick is enough
+    // to put this request into the DOM; daemon presentation restores rAF for afterPaint.
+    nextTick(() => {
+      popupShowWindow().catch(() => {});
       appearGuardUntil = Date.now() + APPEAR_GUARD_MS;
       afterPaint();
-    }
+    });
     // 内容已渲染：把其余初始化（事件监听 / 语音 / 自更新 / 终端探测）放到首帧之后，不阻塞首屏。
     void initAfterPaint(init);
   }
@@ -1783,16 +2211,33 @@ export function usePopupCore() {
   // 或为用户 / 托盘触发，略晚于首帧注册无碍（自更新态另用 popupUpdateState() 拉初值兜底）。
   // 放此处是为了不阻塞弹窗首屏（原先这些 await 串在 popupInit 之前，正是「加载中」停留的来源）。
   async function initAfterPaint(init: PopupInit) {
+    // Any process may update todos.json while the question stays open. The popup host watches
+    // the file and emits this event to refresh the ordinary todo section or whats-next options.
+    unlistenTodos = await listen("todos-updated", () => {
+      void loadTodos();
+    });
     void loadTodos();
     await attach.initAttachmentPreviewListeners();
     unlistenDrop = await getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload.type !== "drop") return;
+      // 拖出自家附件时不接管（那是往外拖，不是往里放）。
       if (attach.draggingOut.value) {
-        attach.draggingOut.value = false;
+        if (event.payload.type === "drop") attach.draggingOut.value = false;
+        dropTargetQ.value = null;
         return;
       }
+      if (event.payload.type === "over") {
+        const pos = event.payload.position;
+        // 纵向布局下高亮即将落入的那张卡，松手前就能看出附件会进哪一题。
+        dropTargetQ.value = verticalMode.value
+          ? questionAtPoint(pos?.x ?? 0, pos?.y ?? 0)
+          : null;
+        return;
+      }
+      const wasOver = dropTargetQ.value;
+      dropTargetQ.value = null;
+      if (event.payload.type !== "drop") return;
       const pos = event.payload.position;
-      const qIndex = questionAtPoint(pos?.x ?? 0, pos?.y ?? 0);
+      const qIndex = wasOver ?? questionAtPoint(pos?.x ?? 0, pos?.y ?? 0);
       addDroppedPaths(event.payload.paths, qIndex);
     });
     // 设置变更实时生效（同进程内设置窗口保存后广播 general 配置）。
@@ -1837,17 +2282,27 @@ export function usePopupCore() {
     // 升级成「可点 + ↗」（终端类型探测仍要跑进程链 ps，故也在此渲染后异步进行）。旧 daemon 可能随
     // popup_init 直接带 pid → 一并处理。
     if (init.agentPid != null) {
-      void applyAgentResolved(init.agentKind, init.agentPid);
+      void applyAgentResolved(init.agentKind, init.agentPid, undefined);
     }
-    unlistenAgent = await listen<{ kind?: string | null; pid?: number | null }>(
+    unlistenAgent = await listen<{
+      kind?: string | null;
+      pid?: number | null;
+      launchId?: string | null;
+    }>(
       "agent-resolved",
       (e) => {
-        void applyAgentResolved(e.payload.kind, e.payload.pid);
+        void applyAgentResolved(
+          e.payload.kind,
+          e.payload.pid,
+          e.payload.launchId
+        );
       },
     );
     try {
       const r = await popupAgentResolved();
-      if (r.kind || r.pid != null) void applyAgentResolved(r.kind, r.pid);
+      if (r.kind || r.pid != null || r.launchId) {
+        void applyAgentResolved(r.kind, r.pid, r.launchId);
+      }
     } catch {
       /* 无 daemon / 单进程回退：忽略 */
     }
@@ -1863,11 +2318,17 @@ export function usePopupCore() {
   /// 「可点 + ↗」。幂等：pull 初值与事件可能各触发一次，重复设值无副作用。
   async function applyAgentResolved(
     kind: string | null | undefined,
-    pid: number | null | undefined
+    pid: number | null | undefined,
+    launchId: string | null | undefined
   ) {
     if (kind && !agentKind.value) agentKind.value = kind;
+    if (launchId) {
+      agentLaunchId.value = launchId;
+      if (isWindows) agentTerminal.value = "windows-terminal";
+    }
     if (pid != null) {
       agentPid.value = pid;
+      if (launchId && isWindows) return;
       try {
         agentTerminal.value = (await popupAgentTerminal(pid)) ?? null;
       } catch {
@@ -1889,6 +2350,7 @@ export function usePopupCore() {
     unlistenCloseReq?.();
     unlistenFlash?.();
     unlistenAgent?.();
+    unlistenTodos?.();
     unlistenShow?.();
     if (timeTicker) window.clearInterval(timeTicker);
     if (flashTimer) window.clearTimeout(flashTimer);
@@ -1897,11 +2359,27 @@ export function usePopupCore() {
     io = null;
     composerResizeObserver?.disconnect();
     composerResizeObserver = null;
+    scrollSpyPending = false;
     if (scrollRaf) cancelAnimationFrame(scrollRaf);
     speech.disposeSpeech();
   });
 
   return {
+    // In-page find
+    findActive: find.findActive,
+    findQuery: find.findQuery,
+    findCaseSensitive: find.findCaseSensitive,
+    findCurrent: find.findCurrent,
+    findTotal: find.findTotal,
+    findCountLabel: find.findCountLabel,
+    findNoMatch: find.findNoMatch,
+    findInputEl: find.findInputEl,
+    openFind: find.openFind,
+    closeFind: find.closeFind,
+    goFind: find.goFind,
+    onFindQueryInput: find.onFindQueryInput,
+    toggleFindCase: find.toggleFindCase,
+    refreshFind: find.refreshFind,
     // 请求 / 加载态
     request,
     confirmRequest,
@@ -1920,6 +2398,7 @@ export function usePopupCore() {
     selectOnly,
     single,
     current,
+    actionQuestionIndex,
     currentQuestion,
     chosenByQ,
     inputByQ,
@@ -1929,10 +2408,8 @@ export function usePopupCore() {
     userInput,
     images,
     replyFiles,
-    renderedHtml,
     transitionName,
     allViewed,
-    questionHtml,
     expandedQ,
     optionHotkey,
     cardOptionHotkey,
@@ -1948,6 +2425,7 @@ export function usePopupCore() {
     activateComposer,
     onComposerCompositionStart,
     onComposerCompositionEnd,
+    focusQuestionAction,
     // DOM refs
     setInputRef,
     setComposerAnchorRef,
@@ -1966,7 +2444,6 @@ export function usePopupCore() {
     returnComposerHome,
     // Message / 头部
     messageText,
-    messageHtml,
     showDescription,
     showQuestionHeader,
     questionHeaderLabel,
@@ -1989,6 +2466,7 @@ export function usePopupCore() {
     onScroll,
     onContentWheel,
     onDrop,
+    dropTargetQ,
     setActive,
     goPrev,
     goNext,
@@ -2015,6 +2493,11 @@ export function usePopupCore() {
     confirmCanSubmit,
     confirmDetailHtml,
     confirmToolName,
+    confirmRows,
+    confirmVariantLevel,
+    confirmVariantLevels,
+    confirmVariantRecommendedLevel,
+    selectConfirmVariantLevel,
     permissionEdit,
     permissionDiff,
     permissionDiffLoading,
@@ -2027,6 +2510,8 @@ export function usePopupCore() {
     // 顶栏动作
     pinned,
     togglePin,
+    agentConsoleAvailable,
+    openAgentConsoleWindow,
     openSettingsWindow,
     openTodosWindow,
     openHistoryWindow,

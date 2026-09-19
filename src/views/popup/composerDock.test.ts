@@ -4,7 +4,11 @@ import {
   cmdEnterQuestionIndex,
   composerHomeVisibleRatio,
   isComposerHomeFullyVisible,
+  projectedDockedComposerHomeHeight,
+  resolveActionQuestionIndex,
   resolveComposerDocked,
+  shouldApplyScrollSpy,
+  shouldDeactivateOffscreenComposer,
   shouldRevealQuestionBeforeCmdEnter,
   type ComposerDockGeometry,
 } from "./composerDock";
@@ -13,6 +17,7 @@ function geometry(overrides: Partial<ComposerDockGeometry> = {}): ComposerDockGe
   return {
     homeTop: 300,
     homeBottom: 380,
+    dockedHomeHeight: 80,
     viewportTop: 100,
     viewportBottom: 500,
     viewportBottomAfterUndock: 500,
@@ -50,6 +55,46 @@ describe("docked composer Cmd+Enter", () => {
   });
 });
 
+describe("multi-question action target", () => {
+  it("keeps actions on the focused editor while the viewport moves", () => {
+    expect(resolveActionQuestionIndex(0, 1)).toBe(1);
+  });
+
+  it("hands actions back to the viewport after the editor blurs", () => {
+    expect(resolveActionQuestionIndex(0, null)).toBe(0);
+  });
+});
+
+describe("scroll-spy scheduling", () => {
+  it("ignores composer-only measurements such as modifier key activation", () => {
+    expect(shouldApplyScrollSpy(false, true, 1_000, 700)).toBe(false);
+  });
+
+  it("accepts real scrolling after the navigation lock expires", () => {
+    expect(shouldApplyScrollSpy(true, true, 1_000, 700)).toBe(true);
+    expect(shouldApplyScrollSpy(true, true, 600, 700)).toBe(false);
+  });
+
+  it("never applies the vertical scroll-spy in sequential mode", () => {
+    expect(shouldApplyScrollSpy(true, false, 1_000, 0)).toBe(false);
+  });
+});
+
+describe("offscreen composer deactivation", () => {
+  it("deactivates a focused editor after its card fully leaves the viewport", () => {
+    expect(shouldDeactivateOffscreenComposer(1, null, true)).toBe(true);
+  });
+
+  it("keeps a docked editor active even when its card is offscreen", () => {
+    expect(shouldDeactivateOffscreenComposer(1, 1, true)).toBe(false);
+  });
+
+  it("keeps partially visible and already blurred editors unchanged", () => {
+    expect(shouldDeactivateOffscreenComposer(1, null, false)).toBe(false);
+    expect(shouldDeactivateOffscreenComposer(null, null, true)).toBe(false);
+  });
+});
+
 describe("resolveComposerDocked", () => {
   it("does not dock an owner that has never been visible inline", () => {
     expect(
@@ -74,10 +119,10 @@ describe("resolveComposerDocked", () => {
 
   it("uses a return gap so the boundary cannot oscillate", () => {
     expect(
-      resolveComposerDocked(true, true, geometry({ homeTop: 410, homeBottom: 495 }))
+      resolveComposerDocked(true, true, geometry({ homeTop: 411, homeBottom: 496 }))
     ).toBe(true);
     expect(
-      resolveComposerDocked(true, true, geometry({ homeTop: 400, homeBottom: 490 }))
+      resolveComposerDocked(true, true, geometry({ homeTop: 410, homeBottom: 495 }))
     ).toBe(false);
   });
 
@@ -101,14 +146,64 @@ describe("resolveComposerDocked", () => {
     ).toBe(false);
   });
 
-  it("keeps a taller-than-viewport input docked until its home can fit", () => {
+  it("lets a tall inline editor clip down to its docked height before docking", () => {
+    expect(
+      resolveComposerDocked(
+        false,
+        true,
+        geometry({
+          homeTop: 350,
+          homeBottom: 590,
+          dockedHomeHeight: 120,
+        })
+      )
+    ).toBe(false);
+    expect(
+      resolveComposerDocked(
+        false,
+        true,
+        geometry({
+          homeTop: 381,
+          homeBottom: 621,
+          dockedHomeHeight: 120,
+        })
+      )
+    ).toBe(true);
+  });
+
+  it("returns a tall editor when its dock-sized portion fits without expanding abruptly", () => {
     expect(
       resolveComposerDocked(
         true,
         true,
-        geometry({ homeTop: 110, homeBottom: 560 })
+        geometry({
+          homeTop: 380,
+          homeBottom: 620,
+          dockedHomeHeight: 120,
+        })
       )
     ).toBe(true);
+    expect(
+      resolveComposerDocked(
+        true,
+        true,
+        geometry({
+          homeTop: 370,
+          homeBottom: 610,
+          dockedHomeHeight: 120,
+        })
+      )
+    ).toBe(false);
+  });
+});
+
+describe("projectedDockedComposerHomeHeight", () => {
+  it("keeps a short textarea unchanged", () => {
+    expect(projectedDockedComposerHomeHeight(80, 80)).toBe(80);
+  });
+
+  it("caps only the textarea portion of a tall composer home", () => {
+    expect(projectedDockedComposerHomeHeight(274, 240)).toBe(154);
   });
 });
 

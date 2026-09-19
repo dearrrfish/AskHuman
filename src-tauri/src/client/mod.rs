@@ -13,7 +13,7 @@ use crate::ipc::{
 use std::io::{Error, ErrorKind};
 use std::time::{Duration, Instant};
 use tokio::io::BufReader;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use transport::{OwnedReadHalf, OwnedWriteHalf};
 
 type Reader = BufReader<OwnedReadHalf>;
 
@@ -67,19 +67,64 @@ pub async fn ensure_running() -> std::io::Result<()> {
         None => {}
     }
 
-    // 2. 拉起并等待就绪（最多约 5 秒）。
-    spawn::spawn_detached()?;
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
-        if let Some(HelloStatus::Ok) = hello_status().await {
-            return Ok(());
+    // 2. Start it, serialized across processes. Right after a drain exit, several clients notice
+    //    the gap within the same few hundred milliseconds (agent hooks, the GUI Host, other
+    //    waiting CLIs). Without the lock each of them would spawn its own daemon and, on macOS,
+    //    `launchctl bootout` the instance a sibling had just started; here the queued starters
+    //    re-check after the winner is ready and simply reuse it.
+    let _spawn_guard = acquire_spawn_lock().await;
+    match hello_status().await {
+        Some(HelloStatus::Ok) => return Ok(()),
+        Some(HelloStatus::Draining) => {
+            return Err(Error::new(ErrorKind::WouldBlock, "daemon is draining"));
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        Some(HelloStatus::Restarting) => wait_until_down(Duration::from_secs(5)).await,
+        None => {}
+    }
+    spawn::spawn_detached(spawn::SpawnPolicy::ReuseAlive)?;
+    if wait_ready(Duration::from_secs(5)).await {
+        return Ok(());
+    }
+    // A daemon process may be alive yet never answer (wedged, stale socket path). `ReuseAlive`
+    // left it untouched; fall back to the replacing spawn so `restart --force` and plain asks can
+    // still recover, exactly as before serialization existed.
+    spawn::spawn_detached(spawn::SpawnPolicy::Replace)?;
+    if wait_ready(Duration::from_secs(5)).await {
+        return Ok(());
     }
     Err(Error::new(
         ErrorKind::TimedOut,
         "daemon did not become ready in time",
     ))
+}
+
+/// Poll Hello until the daemon answers `Ok` or `max` elapses.
+async fn wait_ready(max: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < max {
+        if let Some(HelloStatus::Ok) = hello_status().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// Take the cross-process spawn lock, waiting for a sibling starter to finish (it holds the lock
+/// for at most the ready timeouts above). Best-effort: if the lock cannot be taken in time or
+/// the filesystem refuses, proceed unlocked rather than fail the ask.
+async fn acquire_spawn_lock() -> Option<crate::file_lock::FileLock> {
+    let path = lifecycle::spawn_lock_path();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        match crate::file_lock::FileLock::try_exclusive(&path) {
+            Ok(Some(lock)) => return Some(lock),
+            Ok(None) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(None) | Err(_) => return None,
+        }
+    }
 }
 
 /// 请求运行状态（未运行返回 None）。
@@ -136,6 +181,64 @@ pub async fn notify_update_state_changed() {
     let _ = ipc::write_msg(&mut writer, &ClientMsg::RefreshUpdateState).await;
 }
 
+/// Notify an already-running daemon that an in-app update replaced the on-disk binary.
+///
+/// First reload the persisted update snapshot so open popups and tray subscribers see `pending`,
+/// then send a normal Hello. The Hello makes the daemon compare its startup fingerprint with the
+/// new on-disk image immediately: it drains when requests are active and exits at once otherwise.
+/// Unlike [`ensure_running`], this deliberately does not start a daemon that is currently stopped.
+pub async fn notify_update_applied() {
+    notify_update_state_changed().await;
+    let _ = hello_status().await;
+}
+
+/// GUI 启动新任务后把活跃槽切到 popup（spec gui-agent-task-launch G11）。best-effort、不拉起
+/// daemon：daemon 在跑经 IPC 切（含旧渠道反激活回执 / auto-end-watch）；未运行则直接写
+/// `auto-channel.json`（daemon 启动时 `load_active` 读回）。
+pub async fn activate_popup_slot() {
+    match connect_split().await {
+        Ok((_reader, mut writer)) => {
+            if ipc::write_msg(&mut writer, &ClientMsg::ActivatePopupSlot)
+                .await
+                .is_err()
+            {
+                crate::autochannel::save_active(Some("popup"));
+            }
+        }
+        Err(_) => crate::autochannel::save_active(Some("popup")),
+    }
+}
+
+/// Register a GUI-created launch with an already-running daemon. Fork sources necessarily came
+/// from that daemon, so failure simply means lineage correlation will be unavailable.
+pub async fn register_launch(record: &crate::integrations::agent_launch::LaunchRecord) {
+    let source_session_id = match &record.launch_mode {
+        crate::integrations::agent_launch::LaunchMode::New => None,
+        crate::integrations::agent_launch::LaunchMode::Fork { source_session_id } => {
+            Some(source_session_id.clone())
+        }
+    };
+    if let Ok((_reader, mut writer)) = connect_split().await {
+        let _ = ipc::write_msg(
+            &mut writer,
+            &ClientMsg::RegisterLaunch {
+                id: record.id.clone(),
+                kind: record.kind,
+                cwd: record.cwd.clone(),
+                task_sha256: record.task_sha256.clone(),
+                source_session_id,
+            },
+        )
+        .await;
+    }
+}
+
+pub async fn cancel_launch(id: String) {
+    if let Ok((_reader, mut writer)) = connect_split().await {
+        let _ = ipc::write_msg(&mut writer, &ClientMsg::CancelLaunch { id }).await;
+    }
+}
+
 /// 请求停止（force=false 为 graceful：有在途请求时 Daemon 排空后退出）；
 /// 收到 Stopping 回应返回 true，未运行返回 false。
 pub async fn request_stop(force: bool) -> bool {
@@ -154,38 +257,72 @@ pub async fn request_stop(force: bool) -> bool {
     )
 }
 
-/// 轮询直到 Daemon 不可连（或超时）。
+/// Poll until the daemon instance that is running *now* is gone, or `max` elapses.
+///
+/// "Gone" means nothing answers on the socket **or a different pid answers**. A replacement
+/// daemon is routinely spawned within a few hundred milliseconds of the old one exiting (agent
+/// hooks, the GUI Host and other waiting CLIs all call [`ensure_running`]), so a loop that only
+/// tests connectivity can miss the transition entirely and keep waiting on a healthy successor.
 pub async fn wait_until_down(max: Duration) {
     let start = Instant::now();
+    let Some(initial) = request_status().await else {
+        return;
+    };
     while start.elapsed() < max {
-        if transport::connect().await.is_err() {
+        if instance_gone(initial.pid).await {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-/// 排空等待：旧 Daemon 正在完结在途请求，无限等待其下线（首条提示立即输出，之后每 30s 一条，
-/// 含剩余在途数与强制换新提示）。剩余数经 `Status` 查询获取（不带 Hello，不会误触发 stale 判定）。
+/// Whether the daemon instance `pid` is gone: nothing accepts on the endpoint, or a different
+/// instance answers `Status`. An endpoint that still accepts but stays silent belongs to an
+/// instance in its shutdown sequence (listener bound, `daemon.lock` held), so it is *not* gone
+/// yet; starting a successor at that moment would only lose the single-instance lock.
+async fn instance_gone(pid: u32) -> bool {
+    match request_status().await {
+        Some(info) => info.pid != pid,
+        None => transport::connect().await.is_err(),
+    }
+}
+
+/// Wait out a draining daemon so the caller can submit to its successor.
+///
+/// Returns once the draining instance is gone or replaced: `Status` stops answering, answers
+/// with a different pid, or no longer reports `draining`. Connectivity alone is not a usable
+/// exit signal (see [`wait_until_down`]); a CLI that only tested `connect()` was observed
+/// polling a healthy replacement daemon for days, and its question never popped up.
+///
+/// Prints a stderr hint immediately and then every 30s: the number of in-flight requests on the
+/// *draining* daemon (pid-matched, so a busy successor is never mistaken for it), a note that
+/// the question pops up automatically once they are answered, and the force-switch escape hatch.
+/// `Status` deliberately carries no Hello, so polling never triggers a stale-binary check.
 async fn wait_for_drain() {
+    let Some(initial) = request_status().await else {
+        return; // Already gone.
+    };
+    if !initial.draining {
+        return; // A fresh daemon already took over the socket.
+    }
+    let mut latest = initial.active_requests;
     let mut last_hint: Option<Instant> = None;
     loop {
-        if transport::connect().await.is_err() {
-            return; // 旧 Daemon 已下线，可拉起新的。
-        }
         if last_hint.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
-            match request_status().await {
-                Some(info) => eprintln!(
-                    "askhuman: daemon is draining ({} active request(s) left); waiting to submit… (run 'AskHuman daemon restart --force' to switch now, interrupting them)",
-                    info.active_requests
-                ),
-                None => eprintln!(
-                    "askhuman: daemon is draining; waiting to submit… (run 'AskHuman daemon restart --force' to switch now)"
-                ),
-            }
+            eprintln!(
+                "askhuman: daemon is draining ({} active request(s) left); this question will pop up automatically once they are answered (run 'AskHuman daemon restart --force' to switch now, interrupting them)",
+                latest
+            );
             last_hint = Some(Instant::now());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+        match request_status().await {
+            Some(info) if info.pid != initial.pid || !info.draining => return, // Replaced.
+            Some(info) => latest = info.active_requests,
+            // Silent but still accepting: the old instance is in its shutdown sequence.
+            None if transport::connect().await.is_err() => return,
+            None => {}
+        }
     }
 }
 
@@ -247,13 +384,87 @@ pub fn report_agent_event(msg: ClientMsg) {
     });
 }
 
+/// Best-effort Grok side-channel pending report from the short-lived recovery hook.
+pub fn report_grok_binding_pending(msg: ClientMsg) {
+    report_agent_event(msg);
+}
+
+/// Register the long-lived MCP process before exposing its tools to the client.
+pub async fn register_mcp_instance(
+    mcp_instance_id: String,
+    project: String,
+    server_pid: u32,
+    parent_pid_hint: Option<u32>,
+) {
+    let _ = ensure_running().await;
+    if let Ok((_, mut writer)) = connect_split().await {
+        let _ = ipc::write_msg(
+            &mut writer,
+            &ClientMsg::McpInstanceRegister {
+                mcp_instance_id,
+                project,
+                server_pid,
+                parent_pid_hint,
+            },
+        )
+        .await;
+    }
+}
+
+/// Claim a unique Grok hook candidate. A short bounded retry covers hook/handler scheduling.
+pub async fn claim_grok_binding(
+    mcp_instance_id: String,
+    project: String,
+    tool_name: String,
+    arguments_sha256: String,
+    server_pid: u32,
+) -> Option<String> {
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let Ok((mut reader, mut writer)) = connect_split().await else {
+            continue;
+        };
+        if ipc::write_msg(
+            &mut writer,
+            &ClientMsg::GrokBindingClaim {
+                mcp_instance_id: mcp_instance_id.clone(),
+                project: project.clone(),
+                tool_name: tool_name.clone(),
+                arguments_sha256: arguments_sha256.clone(),
+                server_pid,
+            },
+        )
+        .await
+        .is_err()
+        {
+            continue;
+        }
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            ipc::read_msg::<_, ServerMsg>(&mut reader),
+        )
+        .await;
+        if let Ok(Ok(Some(ServerMsg::GrokBindingClaim { agent_session_id }))) = response {
+            if agent_session_id.is_some() {
+                return agent_session_id;
+            }
+        }
+    }
+    None
+}
+
 /// 插话轮询产物（hook 侧视角，spec agent-interject D3/D4）。
 #[derive(Debug, PartialEq, Eq)]
 pub enum InterjectPollOutcome {
     /// 放行（无消息 / composer 取消 / daemon 不可达 / 旧 daemon 无回帧 / 任何失败）。
     Allow,
     /// deny + 用户插话消息（hook 侧按家族输出 deny JSON）。
-    Deny(String),
+    Deny {
+        text: String,
+        attachments: Vec<crate::models::FileAttachment>,
+    },
 }
 
 /// 首帧读取超时：旧 daemon 不认识 `interject_poll`、不会回帧，超时即放行（fail-open），
@@ -294,9 +505,13 @@ where
         Err(_) => return InterjectPollOutcome::Allow, // 超时：旧 daemon / 慢回帧 → 放行
     };
     match first {
-        Some((InterjectAction::Message, text)) => InterjectPollOutcome::Deny(text),
-        Some((InterjectAction::Hold, _)) => match read_interject_decision(reader).await {
-            Some((InterjectAction::Message, text)) => InterjectPollOutcome::Deny(text),
+        Some((InterjectAction::Message, text, attachments)) => {
+            InterjectPollOutcome::Deny { text, attachments }
+        }
+        Some((InterjectAction::Hold, _, _)) => match read_interject_decision(reader).await {
+            Some((InterjectAction::Message, text, attachments)) => {
+                InterjectPollOutcome::Deny { text, attachments }
+            }
             _ => InterjectPollOutcome::Allow, // release / EOF（daemon 退出等）→ 放行
         },
         _ => InterjectPollOutcome::Allow, // none / release / EOF / 意外帧
@@ -304,13 +519,23 @@ where
 }
 
 /// 读到下一帧 `InterjectDecision`（跳过其它服务端消息）；EOF/错误返回 None。
-async fn read_interject_decision<R>(reader: &mut R) -> Option<(crate::ipc::InterjectAction, String)>
+async fn read_interject_decision<R>(
+    reader: &mut R,
+) -> Option<(
+    crate::ipc::InterjectAction,
+    String,
+    Vec<crate::models::FileAttachment>,
+)>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     loop {
         match ipc::read_msg::<_, ServerMsg>(reader).await {
-            Ok(Some(ServerMsg::InterjectDecision { action, text })) => return Some((action, text)),
+            Ok(Some(ServerMsg::InterjectDecision {
+                action,
+                text,
+                attachments,
+            })) => return Some((action, text, attachments)),
             Ok(Some(_)) => continue,
             Ok(None) | Err(_) => return None,
         }
@@ -320,6 +545,35 @@ where
 /// 状态窗口手动把某 agent 置空闲（纠正漏 hook 卡「工作中」）：即发即走，best-effort。
 pub fn force_agent_idle(session_id: String) {
     report_agent_event(ClientMsg::AgentForceIdle { session_id });
+}
+
+/// 查询某 session 的待送达插话全文、条目数与附件（控制台气泡，spec gui-agent-console C3）：
+/// 一问一答。daemon 未运行时**不拉起**（无 daemon 即无待送达），连不上 / 超时 → 空状态。
+pub async fn interject_peek(
+    session_id: String,
+) -> (String, usize, Vec<crate::models::FileAttachment>) {
+    let query = async {
+        let (mut reader, mut writer) = connect_split().await.ok()?;
+        ipc::write_msg(&mut writer, &ClientMsg::InterjectQuery { session_id })
+            .await
+            .ok()?;
+        loop {
+            match ipc::read_msg::<_, ServerMsg>(&mut reader).await {
+                Ok(Some(ServerMsg::InterjectState {
+                    text,
+                    entries,
+                    attachments,
+                })) => return Some((text, entries, attachments)),
+                Ok(Some(_)) => continue,
+                _ => return None,
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_millis(800), query)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or((String::new(), 0, Vec::new()))
 }
 
 /// 打开一条到 daemon 的连接（订阅状态窗口用，spec D20）：确保在跑后连接并拆分读写半。
@@ -621,6 +875,7 @@ mod tests {
             vec![ServerMsg::InterjectDecision {
                 action: InterjectAction::None,
                 text: String::new(),
+                attachments: Vec::new(),
             }],
             true,
             Duration::from_millis(300),
@@ -631,16 +886,29 @@ mod tests {
 
     #[tokio::test]
     async fn first_frame_message_denies() {
+        let attachment = crate::models::FileAttachment {
+            path: "/tmp/screenshot.png".into(),
+            name: "screenshot.png".into(),
+            size: 42,
+            is_image: true,
+        };
         let out = run_frames(
             vec![ServerMsg::InterjectDecision {
                 action: InterjectAction::Message,
                 text: "改用方案 B".into(),
+                attachments: vec![attachment.clone()],
             }],
             true,
             Duration::from_millis(300),
         )
         .await;
-        assert_eq!(out, InterjectPollOutcome::Deny("改用方案 B".into()));
+        assert_eq!(
+            out,
+            InterjectPollOutcome::Deny {
+                text: "改用方案 B".into(),
+                attachments: vec![attachment],
+            }
+        );
     }
 
     #[tokio::test]
@@ -650,17 +918,25 @@ mod tests {
                 ServerMsg::InterjectDecision {
                     action: InterjectAction::Hold,
                     text: String::new(),
+                    attachments: Vec::new(),
                 },
                 ServerMsg::InterjectDecision {
                     action: InterjectAction::Message,
                     text: "停一下".into(),
+                    attachments: Vec::new(),
                 },
             ],
             true,
             Duration::from_millis(300),
         )
         .await;
-        assert_eq!(out, InterjectPollOutcome::Deny("停一下".into()));
+        assert_eq!(
+            out,
+            InterjectPollOutcome::Deny {
+                text: "停一下".into(),
+                attachments: Vec::new(),
+            }
+        );
     }
 
     #[tokio::test]
@@ -670,10 +946,12 @@ mod tests {
                 ServerMsg::InterjectDecision {
                     action: InterjectAction::Hold,
                     text: String::new(),
+                    attachments: Vec::new(),
                 },
                 ServerMsg::InterjectDecision {
                     action: InterjectAction::Release,
                     text: String::new(),
+                    attachments: Vec::new(),
                 },
             ],
             true,
@@ -690,6 +968,7 @@ mod tests {
             vec![ServerMsg::InterjectDecision {
                 action: InterjectAction::Hold,
                 text: String::new(),
+                attachments: Vec::new(),
             }],
             true,
             Duration::from_millis(300),
@@ -725,6 +1004,7 @@ mod tests {
                 ServerMsg::InterjectDecision {
                     action: InterjectAction::Hold,
                     text: String::new(),
+                    attachments: Vec::new(),
                 },
                 ServerMsg::Warn {
                     text: "noise2".into(),
@@ -732,12 +1012,19 @@ mod tests {
                 ServerMsg::InterjectDecision {
                     action: InterjectAction::Message,
                     text: "msg".into(),
+                    attachments: Vec::new(),
                 },
             ],
             true,
             Duration::from_millis(300),
         )
         .await;
-        assert_eq!(out, InterjectPollOutcome::Deny("msg".into()));
+        assert_eq!(
+            out,
+            InterjectPollOutcome::Deny {
+                text: "msg".into(),
+                attachments: Vec::new(),
+            }
+        );
     }
 }

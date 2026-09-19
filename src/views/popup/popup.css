@@ -259,6 +259,106 @@
   display: grid;
   gap: 8px;
 }
+/* 前缀档位选择器（D51） */
+.confirm-variant-bar {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.confirm-variant-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.confirm-variant-title {
+  color: var(--text-secondary);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.confirm-variant-reset {
+  appearance: none;
+  border: 0;
+  padding: 1px 0;
+  color: var(--accent, #0a84ff);
+  background: transparent;
+  font-size: 11px;
+  cursor: pointer;
+}
+.confirm-variant-track {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 0;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 7px;
+  border: var(--hairline) solid var(--control-border);
+  border-radius: 8px;
+  background: var(--control-bg);
+}
+.confirm-variant-track::-webkit-scrollbar {
+  height: 5px;
+}
+.confirm-variant-track::-webkit-scrollbar-track {
+  background: transparent;
+}
+.confirm-variant-track::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-primary) 28%, transparent);
+}
+.confirm-variant-track::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--text-primary) 42%, transparent);
+}
+.confirm-variant-segment {
+  position: relative;
+  z-index: 0;
+  flex: 0 0 auto;
+  appearance: none;
+  min-width: 28px;
+  max-width: 190px;
+  margin-left: -1px;
+  overflow: hidden;
+  border: var(--hairline) solid var(--control-border);
+  border-radius: 0;
+  padding: 4px 8px;
+  color: var(--text-secondary);
+  background: var(--control-bg);
+  font-size: 12px;
+  cursor: pointer;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.confirm-variant-segment:first-child {
+  margin-left: 0;
+  border-radius: 6px 0 0 6px;
+}
+.confirm-variant-segment:last-child {
+  border-radius: 0 6px 6px 0;
+}
+.confirm-variant-segment code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+}
+.confirm-variant-segment.in-prefix {
+  z-index: 1;
+  border-color: color-mix(in srgb, var(--accent, #0a84ff) 52%, var(--control-border));
+  background: color-mix(in srgb, var(--accent, #0a84ff) 14%, var(--control-bg));
+  color: var(--text-primary);
+}
+.confirm-variant-segment.boundary {
+  z-index: 2;
+  border-color: var(--accent, #0a84ff);
+}
+.confirm-variant-segment.committed::after {
+  content: "";
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent, #0a84ff);
+}
 .confirm-option {
   width: 100%;
   box-sizing: border-box;
@@ -480,10 +580,25 @@
   font-variant-numeric: tabular-nums;
 }
 .nav-actions {
+  position: relative;
   margin-left: auto;
   display: inline-flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 2px;
+  /* Min width keeps layout stable while find bar overlays the buttons. */
+  min-height: 28px;
+  pointer-events: none;
+}
+.nav-actions-btns {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.nav-actions.find-open .nav-actions-btns {
+  opacity: 0;
+  transform: translateY(-4px);
   pointer-events: none;
 }
 .nav-btn {
@@ -546,8 +661,7 @@
   width: 280px;
   max-height: 360px;
   overflow-y: auto;
-  /* 用不透明的 --bg：弹窗窗体是毛玻璃，--bg-elevated 仅 3%~6% alpha 会透出底下文字 */
-  background: var(--bg);
+  background: var(--surface-overlay);
   border: 1px solid var(--border, rgba(127, 127, 127, 0.2));
   border-radius: 10px;
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
@@ -616,6 +730,195 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
+}
+
+/* —— In-page find in navbar action corner (docs/specs/popup-find.md) —— */
+.popup-find-bar {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  /* Fixed outer width so only the input flexes; count/buttons never reflow the bar. */
+  width: min(320px, calc(100vw - 48px));
+  height: 28px;
+  padding: 0 2px 0 8px;
+  border-radius: 8px;
+  border: var(--hairline) solid var(--border);
+  /* Fully opaque so brand/title never show through on a narrow window. */
+  background: var(--surface-overlay);
+  box-shadow: var(--clickable-shadow);
+  pointer-events: auto;
+  transform: translateY(-50%);
+}
+.popup-find-icon {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+}
+.popup-find-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.2;
+  padding: 2px 4px;
+  /* No focus ring — slide-in + button fade carries attention. */
+  appearance: none;
+  -webkit-appearance: none;
+}
+.popup-find-input:focus,
+.popup-find-input:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+.popup-find-input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
+}
+.popup-find-input.empty {
+  color: #c41e3a;
+}
+.theme-dark .popup-find-input.empty {
+  color: #ff7b72;
+}
+/* Reserve width for up to "999/999" so 9→10 does not grow the bar. */
+.popup-find-count {
+  flex: 0 0 4.75em;
+  width: 4.75em;
+  text-align: center;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  padding: 0;
+  user-select: none;
+  overflow: hidden;
+}
+.popup-find-count.empty {
+  color: #c41e3a;
+}
+.theme-dark .popup-find-count.empty {
+  color: #ff7b72;
+}
+.popup-find-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: default;
+}
+.popup-find-btn svg {
+  width: 13px;
+  height: 13px;
+}
+.popup-find-btn:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+.popup-find-case {
+  width: auto;
+  min-width: 24px;
+  padding: 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.popup-find-case.active {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+}
+/* Slide down from above into the nav-actions slot; reverse on leave. */
+.popup-find-slide-enter-active,
+.popup-find-slide-leave-active {
+  transition:
+    opacity 0.2s ease,
+    transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.popup-find-slide-enter-from {
+  opacity: 0;
+  transform: translateY(calc(-50% - 10px));
+}
+.popup-find-slide-enter-to,
+.popup-find-slide-leave-from {
+  opacity: 1;
+  transform: translateY(-50%);
+}
+.popup-find-slide-leave-to {
+  opacity: 0;
+  transform: translateY(calc(-50% - 10px));
+}
+@media (prefers-reduced-motion: reduce) {
+  .nav-actions-btns,
+  .popup-find-slide-enter-active,
+  .popup-find-slide-leave-active {
+    transition: none;
+  }
+}
+mark.popup-find-hit,
+.popup-find-hit {
+  background: color-mix(in srgb, #ffd60a 72%, transparent);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+mark.popup-find-hit-current,
+.popup-find-hit-current {
+  background: color-mix(in srgb, #ff9f0a 88%, transparent);
+  outline: 1px solid color-mix(in srgb, #ff9f0a 70%, #000);
+  scroll-margin: 64px 12px;
+}
+.theme-dark mark.popup-find-hit,
+.theme-dark .popup-find-hit {
+  background: color-mix(in srgb, #ffd60a 42%, transparent);
+}
+.theme-dark mark.popup-find-hit-current,
+.theme-dark .popup-find-hit-current {
+  background: color-mix(in srgb, #ff9f0a 55%, transparent);
+  outline-color: color-mix(in srgb, #ff9f0a 80%, #fff);
+}
+.popup-find-atomic-proxy {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: block;
+  padding: 0;
+  pointer-events: none;
+  background: transparent;
+  outline: none;
+}
+.popup-find-atomic-hit {
+  outline: 2px solid color-mix(in srgb, #ffd60a 72%, transparent);
+  outline-offset: 2px;
+}
+.popup-find-atomic-current {
+  outline-color: color-mix(in srgb, #ff9f0a 90%, #000);
+  box-shadow: 0 0 0 3px color-mix(in srgb, #ff9f0a 20%, transparent);
+  scroll-margin: 64px 12px;
+}
+.theme-dark .popup-find-atomic-hit {
+  outline-color: color-mix(in srgb, #ffd60a 55%, transparent);
+}
+.theme-dark .popup-find-atomic-current {
+  outline-color: color-mix(in srgb, #ff9f0a 88%, #fff);
 }
 .options {
   display: flex;
@@ -816,6 +1119,12 @@
 .q-card.flash::before {
   animation: q-flash 0.55s ease-out;
 }
+/* 拖拽悬停：复用闪光层做常显高亮 + 虚线描边，指明附件会落进哪一题（松手即消失）。 */
+.q-card.drop-target::before {
+  opacity: 1;
+  outline: 1.5px dashed color-mix(in srgb, var(--accent) 60%, transparent);
+  outline-offset: -1.5px;
+}
 @keyframes q-flash {
   from {
     opacity: 1;
@@ -890,13 +1199,93 @@
   flex: 0 0 auto;
 }
 .answer-composer {
+  --composer-docked-textarea-max-height: 120px;
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
   min-width: 0;
 }
-.composer-attachments {
-  display: contents;
+.answer-composer .input-wrap::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: var(--radius-md);
+  pointer-events: none;
+}
+.answer-composer .input-wrap:focus-within::after {
+  box-shadow: var(--focus-ring);
+}
+.answer-composer .textarea:focus,
+.answer-composer .textarea:focus-visible {
+  box-shadow: var(--clickable-shadow);
+}
+/* A collapsible composer is one real control surface. Its textarea and action row are borderless
+   children, so focus and hover belong to the surface instead of sitting behind an overlaid row. */
+.answer-composer.is-collapsible {
+  --compact-answer-height: calc(38px + 2 * var(--hairline));
+  --compact-answer-actions-height: 34px;
+}
+.answer-composer.is-collapsible .input-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: var(--compact-answer-height);
+  border: var(--hairline) solid var(--control-border);
+  border-radius: var(--radius-md);
+  background: var(--control-bg);
+  box-shadow: var(--clickable-shadow);
+  box-sizing: border-box;
+}
+.answer-composer.is-collapsible .input-wrap.has-text {
+  grid-template-columns: minmax(0, 1fr);
+  min-height: calc(
+    var(--compact-answer-height) + var(--compact-answer-actions-height)
+  );
+}
+.answer-composer.is-collapsible .input-wrap:not(:focus-within):hover {
+  background: var(--control-hover-bg);
+}
+.answer-composer.is-collapsible .input-wrap:focus-within {
+  box-shadow: var(--clickable-shadow);
+}
+.answer-composer.is-collapsible .textarea,
+.answer-composer.is-collapsible .textarea.collapsed {
+  min-width: 0;
+  min-height: calc(var(--compact-answer-height) - 2 * var(--hairline));
+  height: auto;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.answer-composer.is-collapsible .textarea:focus,
+.answer-composer.is-collapsible .textarea:focus-visible {
+  box-shadow: none;
+}
+.answer-composer.is-collapsible .composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  padding-right: 7px;
+  box-sizing: border-box;
+}
+.answer-composer.is-collapsible .input-wrap.has-text .composer-actions {
+  height: var(--compact-answer-actions-height);
+  padding: 1px 7px 7px;
+}
+.answer-composer.is-collapsible .img-btn,
+.answer-composer.is-collapsible .mic-btn {
+  position: static;
+  flex: 0 0 26px;
+}
+/* Keep the visible gap at space-2 when the focus ring extends outside the control. */
+.options + .composer-anchor {
+  margin-top: calc(
+    var(--space-2) + var(--focus-ring-width) - var(--space-3)
+  );
 }
 .composer-dock {
   position: relative;
@@ -905,7 +1294,8 @@
   min-width: 0;
   padding: 8px var(--space-4) 10px;
   border-top: var(--hairline) solid var(--border);
-  background: var(--bg);
+  /* Opaque so scrolled message content does not bleed through the dock. */
+  background: var(--surface-overlay);
   box-shadow: 0 -8px 22px color-mix(in srgb, #000 8%, transparent);
 }
 .composer-dock-home {
@@ -938,7 +1328,7 @@
   gap: 7px;
 }
 .answer-composer.is-docked .textarea {
-  max-height: 120px;
+  max-height: var(--composer-docked-textarea-max-height);
 }
 .answer-composer.is-docked .composer-attachments {
   display: flex;
@@ -1240,56 +1630,6 @@
 .todo-option .todo-del-confirm:hover {
   background: color-mix(in srgb, #ff453a 22%, transparent);
 }
-/* 回复文件 chip */
-.reply-files {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
-}
-.reply-file {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 220px;
-  padding: 4px 6px 4px 8px;
-  border-radius: var(--radius-sm);
-  border: 1px solid transparent;
-  background: var(--bg-elevated);
-  font-size: 12px;
-}
-.reply-file .rf-icon {
-  flex: 0 0 auto;
-  font-size: 13px;
-  line-height: 1;
-}
-.reply-file .rf-name {
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-primary);
-}
-.reply-file .rf-remove {
-  flex: 0 0 auto;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  border: none;
-  background: rgba(128, 128, 128, 0.25);
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 1;
-  cursor: default;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.reply-file .rf-remove:hover {
-  background: rgba(128, 128, 128, 0.4);
-  color: var(--text-primary);
-}
-
 /* 选项末尾的快捷键标注（⌘1…⌘9） */
 .option .opt-sc {
   flex: 0 0 auto;
@@ -1349,8 +1689,7 @@
 }
 .confirm-box {
   width: min(320px, 84%);
-  /* 用不透明 --bg：弹窗是毛玻璃，--card-bg 仅 3~6% alpha 会透出底下内容 */
-  background: var(--bg);
+  background: var(--surface-overlay);
   border: var(--hairline) solid var(--border);
   border-radius: var(--radius-md, 12px);
   padding: 18px 18px 14px;

@@ -30,11 +30,22 @@ export interface ConfirmDetail {
   bodyMd: string;
 }
 
+/** 前缀档位元数据（D51）：同 group 的 choice 是同一动作的不同泛化档位。 */
+export interface ChoiceVariant {
+  group: string;
+  level: number;
+  levelLabel: string;
+  /** Exact token chunk added at this level; old daemons fall back to levelLabel. */
+  segmentLabel?: string;
+  recommended: boolean;
+}
+
 export interface ConfirmChoice {
   id: string;
   label: string;
   description: string;
   role: ConfirmActionRole;
+  variant?: ChoiceVariant | null;
 }
 
 export interface ConfirmInput {
@@ -179,6 +190,31 @@ export interface OptionItem {
   recommended: boolean;
   /** whats-next / Stop 卡待办 chip 对应的待办条目 id（spec todo-whats-next D2/D5）。 */
   todoId?: string | null;
+  todoText?: string | null;
+  todoAttachments?: TodoAttachmentSnapshot[];
+}
+
+export type TodoAttachmentStorage = "managed" | "reference";
+
+/** One attachment owned by or referenced from a project todo. */
+export interface TodoAttachmentView {
+  id: string;
+  name: string;
+  size: number;
+  isImage: boolean;
+  sourcePath: string;
+  /** Effective path opened or delivered to an Agent. */
+  path: string;
+  storage: TodoAttachmentStorage;
+  available: boolean;
+}
+
+export interface TodoAttachmentSnapshot {
+  id: string;
+  name: string;
+  path: string;
+  sourcePath: string;
+  storage: TodoAttachmentStorage;
 }
 
 /** 项目级待办条目（spec todo-whats-next D1）。 */
@@ -190,6 +226,7 @@ export interface TodoEntry {
   agentKind?: string | null;
   /** 自动执行：whats-next 时不提问直接派发（后端 auto=false 时省略该字段）。 */
   auto?: boolean;
+  attachments?: TodoAttachmentView[];
 }
 
 /** 已执行的历史待办（仅执行出队进历史）。 */
@@ -200,6 +237,7 @@ export interface TodoDoneEntry {
   /** Preserved Agent origin from the pending todo. */
   agentKind?: string | null;
   doneAtMs: number;
+  attachments?: TodoAttachmentView[];
 }
 
 /** 待办窗口项目选择器候选（spec todo-whats-next D9）。 */
@@ -224,6 +262,50 @@ export interface TodosInit {
   lang: string;
   /** 与弹窗一致的提交快捷键（添加待办）。 */
   popupSubmitKey: PopupSubmitKey;
+  /** Whether a supported platform terminal is available for creating Agent tasks. */
+  newTaskSupported: boolean;
+}
+
+/** 新建任务窗口 init 负载（spec gui-agent-task-launch）。 */
+export interface NewTaskInit {
+  theme: ThemeMode;
+  lang: string;
+  /** 与弹窗一致的提交快捷键（⌘↵ 启动任务）。 */
+  popupSubmitKey: PopupSubmitKey;
+  /** `agentTasks.permissionPrompt`（G6）。 */
+  permissionPrompt: "ask" | "agent-default" | "yolo" | string;
+}
+
+/** 新建任务窗口的项目下拉候选。 */
+export interface NewTaskProject {
+  /** workspace 路径（canonical cwd）或待办项目 git 根。 */
+  path: string;
+  /** 显示名（basename）。 */
+  label: string;
+  /** 置顶 workspace（列表已按置顶排序；展示加 ★）。 */
+  pinned: boolean;
+  /** `workspace`（最近 workspace 索引）或 `todos`（仅存在于待办存储）。 */
+  source: "workspace" | "todos" | string;
+}
+
+export interface ForkTaskSource {
+  sessionId: string;
+  seq: number;
+  kind: AgentKind;
+  title: string;
+  cwd: string;
+  state: AgentRunState;
+  forkedFromSessionId?: string | null;
+  /** Runtime-probed native Fork capability for this active source session. */
+  forkReady?: boolean;
+}
+
+export interface ForkTaskInit {
+  theme: ThemeMode;
+  lang: string;
+  popupSubmitKey: PopupSubmitKey;
+  permissionPrompt: "ask" | "agent-default" | "yolo" | string;
+  source: ForkTaskSource;
 }
 
 export interface Question {
@@ -262,10 +344,12 @@ export interface PopupInit {
   project: string;
   /** workspace 目录名（标题区展示）。 */
   projectName: string;
-  /** 发起本次提问的 agent 家族（claude/codex/cursor）；空表示未识别，不显示 agent badge。 */
+  /** 发起本次提问的 agent 家族（claude/codex/cursor/grok）；空表示未识别，不显示 agent badge。 */
   agentKind?: string | null;
   /** 发起本次提问的 agent 进程 pid；「聚焦终端」用。 */
   agentPid?: number | null;
+  /** daemon 严格匹配到活动 Agent 记录的会话 ID；有值才显示 Agent Window 快捷入口。 */
+  agentConsoleSessionId?: string | null;
   /** 界面语言原始值（auto/en/zh）；弹窗据此 applyLanguage，免再走 get_settings()。 */
   language?: string;
   /** 语音识别语言（BCP-47，如 zh-CN；auto 跟随系统）。 */
@@ -280,7 +364,7 @@ export interface PopupInit {
   perf?: boolean;
   /** 性能测试：画完首帧后自动取消弹窗（仅 harness 用）。 */
   perfAutodismiss?: boolean;
-  /** 方案6：本进程是否为预热弹窗（窗口起始隐藏）。为真时前端在内容绘制完成后调 `popup_show_window` 上屏。 */
+  /** Whether this helper started as a hidden prewarmed popup before it adopted the interaction. */
   warm?: boolean;
   /** 提问创建时刻（epoch 毫秒）：弹窗据此显示相对时间（几秒/分钟/小时前），超过一天显示绝对时间。0=未知。 */
   createdAtMs?: number;
@@ -293,6 +377,10 @@ export interface QuestionAnswer {
   files: string[];
   /** 折叠待办区选中的待办条目 id（spec todo-whats-next D7）：文本已并入 userInput，id 供后端出队。 */
   todoIds?: string[];
+  todoSelections?: Array<{
+    id: string;
+    attachments: TodoAttachmentSnapshot[];
+  }>;
 }
 
 export interface PopupSubmission {
@@ -319,6 +407,10 @@ export interface HistoryEntry {
   source: string;
   /** Caller agent family (claude/codex/cursor/grok); absent on legacy entries. */
   agentKind?: string | null;
+  /** Native Agent conversation/session id; absent on legacy or unbound entries. */
+  agentSessionId?: string | null;
+  /** AskHuman MCP server process id; a fallback partition when no native session is known. */
+  mcpInstanceId?: string | null;
   /** Channel that submitted / cancelled: popup / dingding / feishu / telegram. */
   channel: string;
   action: ChannelAction;
@@ -336,6 +428,43 @@ export interface ProjectInfo {
   lastMs: number;
 }
 
+/** Trustworthy session partition used by the history filter. */
+export type HistorySessionRef =
+  | { type: "agent"; agentKind: string; sessionId: string }
+  | { type: "mcp"; project: string; instanceId: string }
+  | { type: "unbound" };
+
+/** One aggregated session option derived from the currently loaded history entries. */
+export interface HistorySessionGroup {
+  token: string;
+  ref: HistorySessionRef;
+  count: number;
+  lastMs: number;
+}
+
+/** Batch title lookup sent only for exact native Agent sessions. */
+export interface HistorySessionTitleRequest {
+  token: string;
+  agentKind: string;
+  sessionId: string;
+}
+
+export interface HistorySessionTitleResult {
+  token: string;
+  title: string;
+}
+
+/** Popup-originated initial/retarget filter for the global history window. */
+export type HistoryOpenTarget =
+  | { type: "agent"; agentKind: string; sessionId: string }
+  | { type: "mcp"; project: string; instanceId: string };
+
+export interface HistoryOpenRequest {
+  all: boolean;
+  project?: string | null;
+  target?: HistoryOpenTarget | null;
+}
+
 /** History window init payload. */
 export interface HistoryInit {
   theme: ThemeMode;
@@ -345,19 +474,27 @@ export interface HistoryInit {
   projectName: string;
 }
 
-/** Agent 状态窗口 init 负载（实验性功能）。 */
+/** Agent 控制台（状态窗口）init 负载。 */
 export interface AgentsInit {
   theme: ThemeMode;
   lang: string;
+  /** 与弹窗一致的提交快捷键（输入框 ⌘↵ 发送）。 */
+  popupSubmitKey: PopupSubmitKey;
+  /** Whether a supported platform terminal is available for creating Agent tasks. */
+  newTaskSupported: boolean;
 }
 
-export type AgentKind = "claude" | "codex" | "cursor" | "grok";
+export type AgentKind = "claude" | "codex" | "cursor" | "grok" | "pi";
 
-/** 生命周期 hook 安装状态（实验区开关据此渲染）。 */
+/** Lifecycle preference and artifact state inside an Agent integration. */
 export interface LifecycleStatus {
+  enabled: boolean;
+  preferenceConfigured: boolean;
   installed: boolean;
   outdated: boolean;
   supported: boolean;
+  needsUpdate: boolean;
+  cleanupRequired: boolean;
 }
 
 export type AgentRunState = "working" | "idle" | "ended";
@@ -371,16 +508,121 @@ export interface AgentRecord {
   pid?: number | null;
   title?: string | null;
   cwd?: string | null;
+  /** Direct parent session for a branch created by AskHuman's native Fork flow. */
+  forkedFromSessionId?: string | null;
+  /** AskHuman-created terminal task UUID; required for exact Windows Terminal focus. */
+  launchId?: string | null;
+  /** Runtime-probed native Fork capability for this active source session. */
+  forkReady?: boolean;
   startedAt: number;
   lastActivity: number;
   state: AgentRunState;
   endedAt?: number | null;
-  /** 所在终端类型（apple-terminal/iterm2/vscode/…/other）；用于「聚焦终端」按钮显隐。 */
+  /** 所在终端类型（apple-terminal/iterm2/windows-terminal/vscode/…）；用于聚焦按钮显隐。 */
   terminal?: string | null;
   /** 实时「当前工具」（hook 上报，仅 snapshot、不落盘）：`{name, object?, at}`。GUI 暂不消费。 */
   currentTool?: { name: string; object?: string | null; at: number } | null;
   /** 有待送达的插话消息（daemon 注入；驱动「待送达」徽标与撤回按钮）。 */
   pendingInterject?: boolean;
+  /** 在途 AskHuman 提问的请求 id（daemon 注入，spec gui-agent-console C7/R2）：
+   *  🙋 徽标 + 「去回答」精确聚焦对应弹窗。 */
+  waitingRequestId?: string | null;
+  /** 在途提问的摘要预览（等待横幅展示；可缺省）。 */
+  waitingPreview?: string | null;
+  /** 累计有效工作时长（秒，registry snapshot 含当前区间的生效总值）。 */
+  activeElapsedSecs?: number | null;
+}
+
+// ===== Agent 控制台（spec gui-agent-console）=====
+
+/** 焦点会话详情帧的工具步（daemon `frame_detail_json`）。 */
+export interface DetailStep {
+  /** 结构化类别：run/read/write/other（本地化由前端完成）。 */
+  kind: "run" | "read" | "write" | "other" | string;
+  /** kind=other 时的原始工具名。 */
+  name?: string | null;
+  object?: string | null;
+  state: "running" | "done" | "failed" | string;
+}
+
+/** 焦点会话详情帧的 TODO 条目。 */
+export interface DetailTodo {
+  content: string;
+  state: "pending" | "inProgress" | "completed" | string;
+}
+
+/** 完整会话事件（console_transcript 输出，tagged；spec gui-agent-console C14）。 */
+export type TranscriptEventJson =
+  | { type: "user"; text: string; at?: number | null; atLabel?: string | null }
+  | { type: "assistant"; text: string; at?: number | null; atLabel?: string | null }
+  | { type: "thinking"; text: string; at?: number | null; atLabel?: string | null }
+  | {
+      type: "tool";
+      label: string;
+      object?: string | null;
+      isError: boolean;
+      resultSummary?: string | null;
+      at?: number | null;
+      atLabel?: string | null;
+    }
+  | {
+      type: "ask";
+      kind?: "ask" | "whatsNext";
+      message: string;
+      questions: { text: string; answer?: string | null }[];
+      at?: number | null;
+      atLabel?: string | null;
+    }
+  | { type: "meta"; text: string };
+
+/** 完整会话一页（`[start, start+events.length)` 窗口）。 */
+export interface TranscriptPage {
+  events: TranscriptEventJson[];
+  start: number;
+  total: number;
+  truncatedHead: boolean;
+  partial: boolean;
+}
+
+/** 项目未暂存变更统计的一行（console_diff_stat；spec gui-agent-console C15）。 */
+export interface DiffFileStat {
+  path: string;
+  /** M 修改 / D 删除 / A 新增 / B 二进制。 */
+  kind: "M" | "D" | "A" | "B" | string;
+  adds: number;
+  dels: number;
+}
+
+export interface DiffStatPage {
+  /** git 根（stage 调用沿用）。 */
+  root: string;
+  files: DiffFileStat[];
+}
+
+/** 单文件 hunk 视图（console_diff_file）。 */
+export interface DiffFileView {
+  path: string;
+  kind: string;
+  skipped: boolean;
+  skipReason?: string | null;
+  lines: { kind: "add" | "del" | "context" | "header" | string; text: string }[];
+}
+
+/** 焦点会话详情帧（tagged，daemon 签名变化才推；spec gui-agent-console C8/R5）。 */
+export interface AgentDetailFrame {
+  type: "watchFrame" | string;
+  sessionId: string;
+  seq: number;
+  kindLabel: string;
+  phase: "working" | "idle" | "waiting" | "ended" | string;
+  title?: string | null;
+  project?: string | null;
+  text?: string | null;
+  steps: DetailStep[];
+  stepsOmitted: number;
+  todos: DetailTodo[];
+  activeElapsedSecs?: number | null;
+  at?: number | null;
 }
 
 /** 插话 composer 窗口 init 负载。 */
@@ -391,6 +633,18 @@ export interface InterjectInit {
   text: string;
   /** 待送达条数。 */
   entries: number;
+  /** Flattened pending attachment references. */
+  attachments: InterjectAttachment[];
+}
+
+export interface InterjectAttachment extends FileAttachment {
+  available: boolean;
+}
+
+export interface InterjectPending {
+  text: string;
+  entries: number;
+  attachments: InterjectAttachment[];
 }
 
 export type UiLanguage = "auto" | "en" | "zh";
@@ -424,11 +678,11 @@ export interface GeneralConfig {
   collaborationStyleCustomText: string;
   /** 回复历史保留条数上限。默认 200；0 = 停止新增记录（但保留旧记录）。 */
   historyLimit: number;
-  /** 待办执行历史保留条数（每项目）。默认 20；0 = 停止新增记录（保留旧历史）。 */
+  /** 待办执行历史保留条数（每项目）。默认 100；0 = 停止新增记录（保留旧历史）。 */
   todoHistoryLimit: number;
-  /** Built-in popup sound. Empty disables it; macOS stores a name, Linux uses a toggle. */
+  /** Built-in popup sound. Empty disables it; macOS stores a name, other desktops use a toggle. */
   popupSound: string;
-  /** Menu bar / tray status icon mode (off/active/always). Desktop only (macOS/Linux). */
+  /** Menu bar / system-tray status icon mode (off/active/always). */
   menuBarIcon: MenuBarIconMode;
   /** Popup pre-warm (faster popups by keeping one mounted, hidden helper ready). Default true. */
   popupPrewarm: boolean;
@@ -508,6 +762,12 @@ export interface ExperimentalConfig {
   verticalQuestions: boolean;
 }
 
+/** 权限确认相关全局设置（spec codex-permission-remember）。 */
+export interface PermissionsConfig {
+  /** Codex shell 宽松模式全局开关（D52）：非危险且可解析的 shell 命令自动放行。 */
+  codexRelaxedShell: boolean;
+}
+
 export type AgentTaskPermission = "ask" | "agent-default" | "yolo";
 
 export interface AgentTasksConfig {
@@ -529,6 +789,7 @@ export interface AgentTaskReadiness {
   label: string;
   command: string;
   executable: string | null;
+  version: string | null;
   binaryReady: boolean;
   lifecycleReady: boolean;
   integrationReady: boolean;
@@ -541,6 +802,7 @@ export interface AppConfig {
   general: GeneralConfig;
   channels: ChannelsConfig;
   agentTasks: AgentTasksConfig;
+  permissions: PermissionsConfig;
   experimental: ExperimentalConfig;
 }
 
@@ -581,6 +843,8 @@ export interface PermissionSessionSummary {
   shellCount: number;
   networkCount: number;
   mcpCount: number;
+  /** 该会话 YOLO 模式开启中（D53）。 */
+  yolo: boolean;
   lastUsedAtMs: number;
 }
 
@@ -598,7 +862,9 @@ export type PermissionRuleKind =
   | "mcpTool"
   | "networkHost"
   | "shellExact"
-  | "shellPrefix";
+  | "shellPrefix"
+  | "shellRelaxed"
+  | "yolo";
 
 /** 一条规则展示行（D48：原样键文本）。 */
 export interface PermissionRuleInfo {
@@ -614,7 +880,8 @@ export type PermissionRulesOp =
   | { op: "sessionDetail"; sessionId: string }
   | { op: "globalDetail" }
   | { op: "resetSession"; sessionId: string }
-  | { op: "resetGlobal" };
+  | { op: "resetGlobal" }
+  | { op: "disableYolo"; sessionId: string };
 
 export type PermissionRulesResult =
   | { kind: "summaries"; sessions: PermissionSessionGroup[]; globalCount: number }
@@ -649,7 +916,7 @@ export interface ClaudeHookStatus {
   supported: boolean;
 }
 
-export type AgentId = "cursor" | "claude" | "codex" | "grok";
+export type AgentId = "cursor" | "claude" | "codex" | "grok" | "pi";
 
 export interface UpdateInfo {
   available: boolean;
@@ -658,18 +925,24 @@ export interface UpdateInfo {
   releaseNotes: string;
   sourceUrl: string;
   isNpm: boolean;
+  applyMode: UpdateApplyMode;
+  manualCommand: string;
 }
+
+export type UpdateApplyMode = "automatic" | "manualDirect" | "manualNpm";
 
 export interface PushedUpdateState {
   available: boolean;
   latestVersion: string;
   pending: boolean;
+  applyMode: UpdateApplyMode;
 }
 
 /** 调用方 agent 的异步解析结果（方案5/b）：daemon walk 出家族 + pid 后经 `agent-resolved` 后推弹窗。 */
 export interface PushedAgent {
   kind?: string | null;
   pid?: number | null;
+  launchId?: string | null;
 }
 
 export interface RuleStatus {
@@ -694,11 +967,27 @@ export interface AgentModeStatus {
   timeoutHookSupported: boolean;
   timeoutHookInstalled: boolean;
   timeoutHookNeedsUpdate: boolean;
+  recoveryHookInstalled: boolean;
   permission: PermissionStatus;
   permissionNeedsUpdate: boolean;
   stop: StopStatus;
+  lifecycle: LifecycleStatus;
+  askQuestion: AskQuestionStatus;
+  mcpSupported: boolean;
   mcpConfigPath: string;
   mcpConfigInstalled: boolean;
+  runtimeArtifactKind: "hook" | "extension";
+  agentVersion: string | null;
+  minimumVersion: string | null;
+  versionSupported: boolean;
+}
+
+/** 接管 Claude 内置 AskUserQuestion 的开关状态（仅 Claude Code 支持）。 */
+export interface AskQuestionStatus {
+  supported: boolean;
+  enabled: boolean;
+  installed: boolean;
+  outdated: boolean;
 }
 
 export interface StopStatus {

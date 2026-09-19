@@ -40,7 +40,7 @@
 | D18 | 思考块 | 能识别则 **默认折叠**（HTML `<details>`；docx 用「思考」小节/缩写） |
 | D19 | 工具块 | 概览：工具名 + 关键参数摘要；**默认折叠**详情（入参/结果摘要） |
 | D20 | AskHuman 专项 | 识别 Bash/Shell 中的 AskHuman CLI 与 MCP `ask`，渲染独立「向人类提问」块（问题摘要 + 可解析的人类答复） |
-| D21 | agent 格式 | 四家（Claude / Cursor / Codex / Grok）**best-effort**：统一中间事件模型；不识别的段落降级展示或跳过 |
+| D21 | agent 格式 | 五家（Claude / Cursor / Codex / Grok / Pi）**best-effort**：统一中间事件模型；Pi 解析 v3 message/toolResult/compaction/branch_summary，自定义 sessionDir 使用 daemon 已验证路径；不识别的段落降级展示或跳过 |
 | D22 | 门控 | 与 `/status` 相同：依赖 daemon + 生命周期追踪；**不另设**实验开关；无 agent 时文本提示 |
 | D23 | `/help` | 动态 help 增加三条命令说明（含 `{p}` 前缀） |
 
@@ -143,7 +143,10 @@ resolve agent → kind + session_id → transcript_path
 
 - 复用并扩展 `agents/activity.rs` / `title.rs` 的路径与家族分支，但改为**整文件有界读取**（非仅尾部 256KB；上限如 2MB，优先尾部窗口保证「最近完整」时从文件末向前取）。
 - Claude / Cursor：message content 数组（text / tool_use / tool_result / thinking 若有）。
-- Codex：response_item / event_msg；reasoning 作 Thinking。
+- Codex：legacy rollout 的权威用户消息是 `event_msg / user_message`；0.147+ paginated
+  改为 `event_msg / item_completed` 的 `UserMessage`（助手为 `AgentMessage`，写文件为
+  `FileChange`）。紧邻的 `response_item / message(role=user|assistant)` 是模型输入副本，需去重。
+  独立 `<skill>` / Hook 等上下文跳过；仅为更旧格式保留非上下文 response_item 回退；reasoning 作 Thinking。
 - Grok：assistant / user / tool_result；reasoning 字段作 Thinking。
 - **CLI vs MCP**：同一 session 通常同一 jsonl；AskHuman 专项同时匹配：
   - 命令行含 `AskHuman` / `askhuman`；
@@ -189,7 +192,7 @@ ConfirmView {
 - 不 commit、不 push、不 `git stash`。
 - 不做交互式逐文件 stage / partial hunk stage。
 - 不做真·长图截图导出。
-- 不做 Windows 特例之外的平台（与 lifecycle 一致：Unix daemon；Windows 无 lifecycle 则本功能自然不可用）。
+- macOS、Linux 与 Windows 共用 lifecycle/daemon 能力；不为其它未支持平台增加单独降级实现。
 - 不保证 100% 还原所有 agent 私有事件类型；best-effort。
 - 钉钉 HTML 预览、PDF 转换不在本期。
 

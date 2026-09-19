@@ -30,6 +30,8 @@ fn button_style(action: SelectAction) -> Option<&'static str> {
         | SelectAction::TaskWorkspace
         | SelectAction::TaskAgent
         | SelectAction::TaskPermission
+        | SelectAction::TaskInputSource
+        | SelectAction::Fork
         | SelectAction::Msg
         | SelectAction::MsgTarget
         | SelectAction::Stage
@@ -40,7 +42,7 @@ fn button_style(action: SelectAction) -> Option<&'static str> {
         | SelectAction::Transcript
         | SelectAction::Todo
         | SelectAction::TodoAutoEntry => None,
-        SelectAction::Unwatch | SelectAction::TodoRmEntry => Some("danger"),
+        SelectAction::Unwatch | SelectAction::TodoRmEntry | SelectAction::Yolo => Some("danger"),
     }
 }
 

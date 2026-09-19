@@ -1,3 +1,5 @@
+pub mod agent_ask_question;
+pub mod agent_context_recovery;
 pub mod agent_launch;
 pub mod agent_lifecycle;
 pub mod agent_mode;
@@ -9,8 +11,8 @@ pub mod claude_hook;
 pub mod cursor_hook;
 pub mod grok_skill;
 pub mod hook_edit;
-#[cfg(unix)]
 pub mod login_item;
 pub mod mcp_config;
 pub mod mutation_lock;
+pub mod pi_extension;
 pub mod terminal_focus;

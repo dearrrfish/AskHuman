@@ -10,7 +10,9 @@
 //! 编排逻辑复用 `conversation::run_conversation`，本文件提供传输实现 `DingTalkSession`
 //! （`MessagingChannel`）+ 薄外层 `DingTalkChannel`。
 
-use super::conversation::{run_conversation, MessagingChannel, QuestionCtx};
+use super::conversation::{
+    run_conversation, InboundReply, MessagingChannel, QuestionCtx, QuestionOutcome,
+};
 use super::{Channel, ConversationOrigin, Interruption, Preemption, ResultSink};
 use crate::config::DingTalkChannelConfig;
 use crate::dingtalk::card;
@@ -31,6 +33,25 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// 而卡片 createAndDeliver 投递更快，会插队先到，导致问题把内联内容顶上去、默认看不见。
 /// 这里短暂等待让 batchSend 的正文/内联先落地，保证「先 message 后题目」的视觉顺序。
 const MESSAGE_SETTLE_DELAY: Duration = Duration::from_millis(1000);
+
+async fn send_inbound_reply(client: &DingTalkClient, reply: InboundReply, lang: Lang) {
+    match reply {
+        InboundReply::Text(text) => {
+            let _ = client.send_oto_text(&text).await;
+        }
+        InboundReply::Help(view) => {
+            let markdown = crate::dingtalk::help::render(&view, lang);
+            if client
+                .send_oto_markdown(&view.title, &markdown)
+                .await
+                .is_err()
+            {
+                let plain = crate::autochannel::render_help_plain(&view, lang);
+                let _ = client.send_oto_text(&plain).await;
+            }
+        }
+    }
+}
 
 /// 内置默认卡片模板 ID（设置项 `cardTemplateId` 留空时使用）。
 /// D15 定稿模板：`options=[{id,md}]` + `single` + `allow_input` 变量条件渲染（单/多选、严格）。
@@ -112,6 +133,7 @@ impl Channel for DingTalkChannel {
                                 i18n::warn_prefix(lang),
                                 i18n::tr(lang, "channel.ddConfigInvalidSkip").replace("{e}", &e)
                             );
+                            sink.surface_lost("dingding", &e);
                             return;
                         }
                     }
@@ -125,6 +147,7 @@ impl Channel for DingTalkChannel {
                     i18n::warn_prefix(lang),
                     i18n::tr(lang, "channel.ddConfigInvalidSkip").replace("{e}", &e)
                 );
+                sink.surface_lost("dingding", &e);
                 return;
             }
             run_conversation(&mut session, &request, &origin, preempt, sink).await;
@@ -244,7 +267,7 @@ impl MessagingChannel for DingTalkSession {
         &mut self,
         ctx: &QuestionCtx<'_>,
         preempt: &Preemption,
-    ) -> Option<QuestionAnswer> {
+    ) -> QuestionOutcome {
         // 题首：无则用兜底标题。
         let title = if ctx.header.is_empty() {
             i18n::tr(ctx.lang, "channel.ddTitleFallback")
@@ -273,8 +296,9 @@ impl MessagingChannel for DingTalkSession {
             events,
             config,
         } = self;
-        let client = client.as_ref()?;
-        let events = events.as_mut()?;
+        let (Some(client), Some(events)) = (client.as_ref(), events.as_mut()) else {
+            return QuestionOutcome::Lost;
+        };
         let user_id = config.user_id.trim().to_string();
 
         // 先登记卡片精确路由 + 认领本 user 的聊天消息（投放前登记，规避「秒答」竞态）。
@@ -302,7 +326,16 @@ impl MessagingChannel for DingTalkSession {
         while !preempt.is_cancelled() {
             let ev = match tokio::time::timeout(POLL_INTERVAL, events.recv()).await {
                 Ok(Some(ev)) => ev,
-                Ok(None) => break,  // 连接彻底断开
+                Ok(None) => {
+                    // Event source gone for good (Router dropped); transient disconnects are
+                    // absorbed by the Router's endless reconnect. Leave the card untouched and let
+                    // the coordinator drop this surface instead of stamping "cancelled" on it.
+                    if preempt.is_cancelled() {
+                        break;
+                    }
+                    events.clear_active(Some(&out_track_id), &user_id);
+                    return QuestionOutcome::Lost;
+                }
                 Err(_) => continue, // 超时：回到循环顶部重新检查 cancelled
             };
             match ev {
@@ -326,12 +359,13 @@ impl MessagingChannel for DingTalkSession {
                             events.clear_active(Some(&out_track_id), &user_id);
                             let images = std::mem::take(&mut *images.lock().unwrap());
                             let files = std::mem::take(&mut *files.lock().unwrap());
-                            return Some(QuestionAnswer {
+                            return QuestionOutcome::Answered(QuestionAnswer {
                                 selected_options: restore_selected(s.selected_indices, ctx.options),
                                 user_input: s.user_input,
                                 images,
                                 files,
                                 todo_ids: Vec::new(),
+                                todo_selections: Vec::new(),
                             });
                         }
                         // 非本卡片（理论上不会路由到此）：回空包让 Router 别空等，继续。
@@ -354,7 +388,7 @@ impl MessagingChannel for DingTalkSession {
                         ) {
                             let ack_client = client.clone();
                             tauri::async_runtime::spawn(async move {
-                                let _ = ack_client.send_oto_text(&reply).await;
+                                send_inbound_reply(&ack_client, reply, lang).await;
                             });
                         }
                         // 并发下载：spawn 后立刻回到循环收事件，避免大文件下载卡住提交处理。
@@ -369,9 +403,8 @@ impl MessagingChannel for DingTalkSession {
             }
         }
 
-        // Interrupted (preempted / cancelled) or disconnected: best-effort finalize the card.
-        // Preempted → "Answered via X"; cancelled (with/without source) → "Cancelled [by X]";
-        // disconnect with no reason → generic "Cancelled".
+        // Interrupted (preempted / cancelled): best-effort finalize the card.
+        // Preempted → "Answered via X"; cancelled (with/without source) → "Cancelled [by X]".
         let status = match preempt.reason() {
             Some(Interruption::AnsweredBy(w)) => {
                 i18n::tr(ctx.lang, "channel.ddAnsweredVia").replace("{source}", &w)
@@ -389,7 +422,7 @@ impl MessagingChannel for DingTalkSession {
             )
             .await;
         events.clear_active(Some(&out_track_id), &user_id);
-        None
+        QuestionOutcome::Interrupted
     }
 
     async fn close(&mut self) {
@@ -405,7 +438,7 @@ async fn ask_question_text(
     user_id: &str,
     ctx: &QuestionCtx<'_>,
     preempt: &Preemption,
-) -> Option<QuestionAnswer> {
+) -> QuestionOutcome {
     let title = if ctx.header.is_empty() {
         i18n::tr(ctx.lang, "channel.ddTitleFallback")
     } else {
@@ -425,6 +458,9 @@ async fn ask_question_text(
             i18n::warn_prefix(ctx.lang),
             i18n::tr(ctx.lang, "channel.ddQuestionSendFailed").replace("{e}", &e.to_string())
         );
+        // Neither the card nor the plain-text fallback reached the human: this surface cannot
+        // carry the question. Waiting here would only hide the failure from the caller.
+        return QuestionOutcome::Lost;
     }
 
     // 文本兜底无卡片：认领本 user 的聊天消息即可（不登记卡片精确路由）。
@@ -433,7 +469,13 @@ async fn ask_question_text(
     while !preempt.is_cancelled() {
         let ev = match tokio::time::timeout(POLL_INTERVAL, events.recv()).await {
             Ok(Some(ev)) => ev,
-            Ok(None) => break,
+            Ok(None) => {
+                if preempt.is_cancelled() {
+                    break;
+                }
+                events.clear_active(None, user_id);
+                return QuestionOutcome::Lost;
+            }
             Err(_) => continue,
         };
         match ev {
@@ -455,10 +497,10 @@ async fn ask_question_text(
                         "dingding",
                         ctx.lang,
                     ) {
-                        let _ = client.send_oto_text(&reply).await;
+                        send_inbound_reply(client, reply, ctx.lang).await;
                     }
                     events.clear_active(None, user_id);
-                    return Some(answer);
+                    return QuestionOutcome::Answered(answer);
                 } else {
                     // 未接受 → 引导（spec R3）；命令交 handle_inbound，不回引导。
                     if let Some(reply) = super::conversation::answer_inbound_reply(
@@ -468,7 +510,7 @@ async fn ask_question_text(
                         "dingding",
                         ctx.lang,
                     ) {
-                        let _ = client.send_oto_text(&reply).await;
+                        send_inbound_reply(client, reply, ctx.lang).await;
                     }
                 }
             }
@@ -479,7 +521,7 @@ async fn ask_question_text(
         }
     }
     events.clear_active(None, user_id);
-    None
+    QuestionOutcome::Interrupted
 }
 
 /// 累积聊天里收到的图片/文件（卡片作答期间）；纯文字等忽略。
@@ -630,6 +672,7 @@ async fn message_to_answer(
                 images: Vec::new(),
                 files: Vec::new(),
                 todo_ids: Vec::new(),
+                todo_selections: Vec::new(),
             })
         }
         // 严格模式禁附件：图片/文件回复忽略（继续等待编号选择）。
@@ -646,6 +689,7 @@ async fn message_to_answer(
                     images: vec![img],
                     files: Vec::new(),
                     todo_ids: Vec::new(),
+                    todo_selections: Vec::new(),
                 }),
                 Err(e) => {
                     let lang = Lang::current();
@@ -675,6 +719,7 @@ async fn message_to_answer(
                     images: Vec::new(),
                     files: vec![path],
                     todo_ids: Vec::new(),
+                    todo_selections: Vec::new(),
                 }),
                 Err(e) => {
                     let lang = Lang::current();

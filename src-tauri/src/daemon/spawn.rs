@@ -1,24 +1,115 @@
-//! 后台拉起 Daemon：detach（新会话）+ stdio 重定向到 daemon.log，使其脱离 CLI 终端独立存活。
+//! 后台拉起 Daemon：macOS 优先交给当前用户的 GUI launchd domain 管理，其它 Unix 则 detach
+//! （新会话）并把 stdio 重定向到 daemon.log；Windows 使用无控制台的新进程组并写同一日志。
 //!
-//! macOS 会话修正：若 CLI 本身处于「非 GUI(非 Aqua) 会话」（如 SSH、Codex app-server 等后台上下文，
-//! `launchctl managername != "Aqua"`），直接 `setsid` 拉起的 daemon 会继承这个非 Aqua 安全会话，
-//! **运行时读不到登录钥匙串** → 各渠道密钥取空 → 渠道被判「未配置」→ 长连接不建（现象：飞书 `/status`
-//! 无回复、`daemon status` 显 `im conns none`）。此时改经用户 GUI launchd 域（`gui/<uid>`）bootstrap 一个
-//! 跑 `daemon run` 的任务，让 daemon 落在 Aqua 会话、能静默读钥匙串（复刻 install.sh 的
-//! `sign_via_gui_launchd` 手法）。GUI 会话、或 GUI 域不可用（纯 headless 无图形登录）时回退原 setsid 拉起。
+//! macOS 不能在 Aqua 会话里直接 `setsid` 后长期运行：那样的 daemon 会跨用户登出残留，却仍持有
+//! 已销毁 GUI 会话的 bootstrap namespace。用户重新登录后，它虽然还能通过 Unix socket 接收请求，
+//! 但新拉起的 popup helper 无法向新 WindowServer / pasteboard 服务 check-in，最终表现为“进程存在但
+//! 永远不弹窗”。因此只要 `gui/<uid>` 可用，就统一 bootstrap 到该 domain：既能静默读取登录钥匙串，
+//! 也会在登出时随 GUI domain 一起退出。纯 headless 环境无法 bootstrap 时才回退 setsid。
 
-#[cfg(unix)]
-pub fn spawn_detached() -> std::io::Result<()> {
+/// How to treat a daemon process that the platform service manager still reports as alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnPolicy {
+    /// Leave an alive instance alone and report success; the caller polls the socket anyway.
+    /// This is the normal path: the alive instance is usually one a sibling client just started.
+    ReuseAlive,
+    /// Tear the existing job down and start a fresh one even if its process is alive. Only for
+    /// recovery from an instance that stays unresponsive.
+    Replace,
+}
+
+pub fn spawn_detached(policy: SpawnPolicy) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        // 仅「非 Aqua 会话」才绕道 GUI 域；Aqua 会话保持原样，
-        // 不影响 perf/隔离等以 HOME/env 隔离的前台调用方。
-        if !in_aqua_session() && spawn_via_gui_launchd().is_ok() {
+        if spawn_via_gui_launchd(policy).is_ok() {
             return Ok(());
         }
         // GUI 域不可用（纯 headless）→ 回退原 setsid 拉起。
     }
-    spawn_plain_detached()
+    #[cfg(not(target_os = "macos"))]
+    let _ = policy; // Other platforms have no service manager to consult; a duplicate daemon
+                    // loses the single-instance `daemon.lock` and exits on its own.
+    #[cfg(unix)]
+    {
+        spawn_plain_detached()
+    }
+    #[cfg(windows)]
+    {
+        spawn_windows_detached()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "daemon spawning is unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn spawn_windows_detached() -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+
+    let exe = std::env::current_exe()?;
+    let mut application: Vec<u16> = exe.as_os_str().encode_wide().collect();
+    application.push(0);
+
+    // `std::process::Command` must enable handle inheritance when it wires redirected stdio.
+    // On Windows that can retain an unrelated caller pipeline in the daemon and its GUI children,
+    // so a script capturing `AskHuman daemon start` never observes EOF. Create the background role
+    // with inheritance explicitly disabled; `--background` makes the child append logs itself.
+    let mut command_line = Vec::new();
+    command_line.push(b'"' as u16);
+    command_line.extend(exe.as_os_str().encode_wide());
+    command_line.push(b'"' as u16);
+    command_line.extend(" daemon run --background".encode_utf16());
+    command_line.push(0);
+
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup,
+            &mut process,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    Ok(())
+}
+
+/// Prevent background roles from opening a second console while keeping ordinary CLI output.
+pub fn configure_background(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 /// 原始拉起方式：`setsid` 新建会话 + stdio 重定向到 daemon.log，直接继承当前会话上下文。
@@ -55,20 +146,28 @@ fn spawn_plain_detached() -> std::io::Result<()> {
     Ok(())
 }
 
-// ===== macOS：非 Aqua 会话时经 GUI launchd 域拉起 =====
+// ===== macOS：经 GUI launchd 域拉起 =====
 
-/// 当前进程是否处于用户 GUI(Aqua) 安全会话。
-///
-/// `launchctl managername` 打印当前 launchd 域管理者名：GUI 登录会话为 `Aqua`，SSH / 后台
-/// 上下文为 `Background` / `System` / `StandardIO` 等。非 Aqua 即拿不到登录钥匙串的静默访问权。
-/// 查询失败时保守当作 Aqua（不改变原有行为，避免误绕道）。
 #[cfg(target_os = "macos")]
-fn in_aqua_session() -> bool {
-    use std::process::Command;
-    match Command::new("/bin/launchctl").arg("managername").output() {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim() == "Aqua",
-        _ => true,
+const DAEMON_LAUNCHD_LABEL: &str = "com.naituw.humaninloop.daemon";
+
+/// Production 沿用登录项的固定 label；Dev Instance 按配置目录生成稳定后缀，避免多个工作树以及
+/// production daemon 在同一个 `gui/<uid>` domain 内互相 bootout。
+#[cfg(target_os = "macos")]
+fn launchd_label(config_dir: &std::path::Path, isolated: bool) -> String {
+    if !isolated {
+        return DAEMON_LAUNCHD_LABEL.to_string();
     }
+
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(config_dir.to_string_lossy().as_bytes());
+    let mut suffix = String::with_capacity(16);
+    for byte in &digest[..8] {
+        write!(&mut suffix, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    format!("{DAEMON_LAUNCHD_LABEL}.instance.{suffix}")
 }
 
 /// 经 `gui/<uid>` launchd 域 bootstrap 一个跑 `daemon run` 的任务，使 daemon 落在 Aqua 会话。
@@ -76,11 +175,9 @@ fn in_aqua_session() -> bool {
 /// 透传 HOME / TMPDIR / PATH 及全部 `ASKHUMAN_*` 环境变量，保住 perf/隔离调用方（隔离 HOME、
 /// `ASKHUMAN_NO_KEYCHAIN`、mock API base 等）的语义。成功返回 `Ok(())`，否则 `Err`（调用方回退）。
 #[cfg(target_os = "macos")]
-fn spawn_via_gui_launchd() -> std::io::Result<()> {
+fn spawn_via_gui_launchd(policy: SpawnPolicy) -> std::io::Result<()> {
     use super::lifecycle;
     use std::process::{Command, Stdio};
-
-    const LABEL: &str = "com.naituw.humaninloop.daemon";
 
     let exe = std::env::current_exe()?;
     let log = lifecycle::log_path();
@@ -90,7 +187,17 @@ fn spawn_via_gui_launchd() -> std::io::Result<()> {
 
     let uid = unsafe { libc::getuid() };
     let domain = format!("gui/{uid}");
-    let plist_path = crate::paths::config_dir().join("daemon-launchd.plist");
+    let config_dir = crate::paths::config_dir();
+    let label = launchd_label(&config_dir, crate::dev_instance::is_dev_instance());
+    let plist_path = config_dir.join("daemon-launchd.plist");
+
+    // `bootout` below is a SIGTERM (then SIGKILL after the job's 5s exit timeout) for a job whose
+    // process is still alive, and the daemon it would hit is almost always one a sibling client
+    // started a moment ago. Never tear an alive job down on the reuse path; the caller keeps
+    // polling the socket and picks that instance up as it becomes ready.
+    if policy == SpawnPolicy::ReuseAlive && launchd_job_alive(&domain, &label) {
+        return Ok(());
+    }
 
     // 透传隔离/配置相关 env：HOME/TMPDIR/PATH + 全部 ASKHUMAN_*。
     let mut env_xml = String::new();
@@ -105,7 +212,41 @@ fn spawn_via_gui_launchd() -> std::io::Result<()> {
         }
     }
 
-    let plist = format!(
+    let plist = launchd_plist_contents(
+        &exe.display().to_string(),
+        &log.display().to_string(),
+        &label,
+        &env_xml,
+    );
+    std::fs::write(&plist_path, plist)?;
+
+    // 自清理：先 bootout 上次残留的任务（正常已退出；`Replace` 时可能仍在跑，SIGTERM 由 daemon 的
+    // 信号处理走 graceful 退出），再 bootstrap 新的（RunAtLoad 立即启动）。
+    let plist_str = plist_path.display().to_string();
+    let _ = Command::new("/bin/launchctl")
+        .args(["bootout", &domain, &plist_str])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let status = Command::new("/bin/launchctl")
+        .args(["bootstrap", &domain, &plist_str])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "launchctl bootstrap gui domain failed",
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_plist_contents(exe: &str, log: &str, label: &str, env_xml: &str) -> String {
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -132,33 +273,10 @@ fn spawn_via_gui_launchd() -> std::io::Result<()> {
 </dict>
 </plist>
 "#,
-        label = LABEL,
-        exe = xml_escape(&exe.display().to_string()),
-        log = xml_escape(&log.display().to_string()),
-    );
-    std::fs::write(&plist_path, plist)?;
-
-    // 自清理：先 bootout 上次残留的（已退出）任务，再 bootstrap 新的（RunAtLoad 立即启动）。
-    let plist_str = plist_path.display().to_string();
-    let _ = Command::new("/bin/launchctl")
-        .args(["bootout", &domain, &plist_str])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let status = Command::new("/bin/launchctl")
-        .args(["bootstrap", &domain, &plist_str])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(
-            "launchctl bootstrap gui domain failed",
-        ))
-    }
+        label = xml_escape(label),
+        exe = xml_escape(exe),
+        log = xml_escape(log),
+    )
 }
 
 /// 生成一条 plist `EnvironmentVariables` 子项（key/value 均做 XML 转义）。
@@ -177,4 +295,104 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Ask launchd whether the daemon job's process is currently alive. A job that is not loaded or
+/// has exited (`state = not running`, no `pid = …`) is not alive; a failing `launchctl` is
+/// treated as "not alive" so the caller falls through to the regular bootstrap path.
+#[cfg(target_os = "macos")]
+fn launchd_job_alive(domain: &str, label: &str) -> bool {
+    use std::process::{Command, Stdio};
+
+    let Ok(out) = Command::new("/bin/launchctl")
+        .args(["print", &format!("{domain}/{label}")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    out.status.success() && launchd_print_reports_alive(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse `launchctl print <service>` output. Only the service's own top-level `state = …` line
+/// counts (endpoint sub-blocks also print `state = active`); an explicit `pid = …` line is the
+/// strongest signal and appears only while the process exists.
+#[cfg(target_os = "macos")]
+fn launchd_print_reports_alive(text: &str) -> bool {
+    let mut top_level_state: Option<&str> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("pid = ") {
+            return true;
+        }
+        // Top-level keys are indented by exactly one tab; nested blocks use two or more.
+        if top_level_state.is_none() && line.starts_with('\t') && !line.starts_with("\t\t") {
+            if let Some(value) = trimmed.strip_prefix("state = ") {
+                top_level_state = Some(value.trim());
+            }
+        }
+    }
+    matches!(top_level_state, Some(state) if state != "not running")
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn production_and_isolated_launchd_labels_do_not_collide() {
+        let production = launchd_label(Path::new("/Users/test/.askhuman"), false);
+        let dev_a = launchd_label(Path::new("/work/a/.askhuman-dev/home"), true);
+        let dev_a_again = launchd_label(Path::new("/work/a/.askhuman-dev/home"), true);
+        let dev_b = launchd_label(Path::new("/work/b/.askhuman-dev/home"), true);
+
+        assert_eq!(production, DAEMON_LAUNCHD_LABEL);
+        assert_eq!(dev_a, dev_a_again);
+        assert_ne!(dev_a, production);
+        assert_ne!(dev_a, dev_b);
+        assert!(dev_a.starts_with(&format!("{DAEMON_LAUNCHD_LABEL}.instance.")));
+    }
+
+    #[test]
+    fn launchd_plist_binds_daemon_to_interactive_gui_job() {
+        let plist = launchd_plist_contents(
+            "/Applications/A&B/AskHuman",
+            "/Users/test/log<1>",
+            DAEMON_LAUNCHD_LABEL,
+            "        <key>ASKHUMAN_HOME</key>\n        <string>/tmp/dev</string>\n",
+        );
+
+        assert!(plist.contains(&format!("<string>{DAEMON_LAUNCHD_LABEL}</string>")));
+        assert!(plist.contains("<string>daemon</string>"));
+        assert!(plist.contains("<string>run</string>"));
+        assert!(plist.contains("<key>RunAtLoad</key>"));
+        assert!(plist.contains("<string>Interactive</string>"));
+        assert!(plist.contains("/Applications/A&amp;B/AskHuman"));
+        assert!(plist.contains("/Users/test/log&lt;1&gt;"));
+        assert!(plist.contains("<key>ASKHUMAN_HOME</key>"));
+        assert!(!plist.contains("<key>KeepAlive</key>"));
+    }
+
+    #[test]
+    fn launchd_print_running_job_is_alive() {
+        let text = "com.naituw.humaninloop.daemon = {\n\tactive count = 1\n\tpath = /x.plist\n\tstate = running\n\n\tprogram = /x/AskHuman\n\tpid = 81380\n\tlast exit code = (never exited)\n\tendpoints = {\n\t\t\"a\" = {\n\t\t\tstate = active\n\t\t}\n\t}\n}\n";
+        assert!(launchd_print_reports_alive(text));
+    }
+
+    #[test]
+    fn launchd_print_exited_job_is_not_alive() {
+        // Loaded but exited: no `pid =` line; nested endpoint `state = active` must not count.
+        let text = "com.naituw.humaninloop.daemon = {\n\tactive count = 0\n\tstate = not running\n\n\tprogram = /x/AskHuman\n\tlast exit code = 0\n\tendpoints = {\n\t\t\"a\" = {\n\t\t\tstate = active\n\t\t}\n\t}\n}\n";
+        assert!(!launchd_print_reports_alive(text));
+        assert!(!launchd_print_reports_alive(""));
+    }
+
+    #[test]
+    fn launchd_print_scheduled_job_counts_as_alive() {
+        // Just bootstrapped by a sibling: process not yet forked, but tearing it down would race.
+        let text = "com.naituw.humaninloop.daemon = {\n\tstate = spawn scheduled\n\tprogram = /x/AskHuman\n}\n";
+        assert!(launchd_print_reports_alive(text));
+    }
 }

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
+import ComposerAttachments from "../../components/ComposerAttachments.vue";
 import { usePopupContext } from "./context";
 
 const props = defineProps<{
@@ -38,7 +39,7 @@ const {
   speechErrorText,
   speechStatusText,
   toggleSpeech,
-  setActive,
+  focusQuestionAction,
   pickFiles,
   removeImage,
   removeReplyFile,
@@ -51,15 +52,17 @@ const isExpanded = computed(
 const ownsSpeech = computed(
   () => listening.value && speechTargetQ.value === props.qIndex
 );
+const hasText = computed(
+  () => (inputByQ.value[props.qIndex] ?? "").trim().length > 0
+);
 
 function handleSpeech() {
-  activateComposer(props.qIndex);
-  setActive(props.qIndex, false);
+  focusQuestionAction(props.qIndex);
   toggleSpeech();
 }
 
 function handlePickFiles() {
-  setActive(props.qIndex, false);
+  focusQuestionAction(props.qIndex);
   pickFiles(props.qIndex);
 }
 </script>
@@ -72,10 +75,14 @@ function handlePickFiles() {
     :style="composerAnchorStyle(qIndex)"
   >
     <Teleport defer to="#popup-composer-dock-target" :disabled="!isDocked">
-      <div class="answer-composer" :class="{ 'is-docked': isDocked }">
+      <div
+        class="answer-composer"
+        :class="{ 'is-docked': isDocked, 'is-collapsible': collapsible }"
+      >
         <div
           :ref="(el) => setComposerHomeRef(el as HTMLElement | null, qIndex)"
           class="input-wrap"
+          :class="{ 'has-text': hasText }"
         >
           <textarea
             :ref="(el) => setInputRef(el as HTMLTextAreaElement | null, qIndex)"
@@ -84,7 +91,7 @@ function handlePickFiles() {
             :class="{ collapsed: !isExpanded }"
             :rows="collapsible ? 1 : undefined"
             :placeholder="t('popup.inputPlaceholder')"
-            @input="onComposerInput(qIndex)"
+            @input="onComposerInput(qIndex, $event)"
             @focus="onTextareaFocus(qIndex)"
             @blur="onTextareaBlur(qIndex)"
             @compositionstart="onComposerCompositionStart(qIndex)"
@@ -94,7 +101,7 @@ function handlePickFiles() {
             @mousedown="onComposerMouseDown(qIndex)"
             @click="activateComposer(qIndex)"
           ></textarea>
-          <template v-if="isExpanded">
+          <div v-if="isExpanded" class="composer-actions">
             <button
               v-if="speechSupported"
               class="mic-btn"
@@ -136,7 +143,7 @@ function handlePickFiles() {
                 <path d="M21 15l-5-5L5 21" />
               </svg>
             </button>
-          </template>
+          </div>
         </div>
 
         <p v-if="speechTargetQ === qIndex && speechError" class="speech-error">
@@ -149,38 +156,13 @@ function handlePickFiles() {
           {{ speechStatusText(speechStatus) }}
         </p>
 
-        <div
-          v-if="(imagesByQ[qIndex] ?? []).length || (replyFilesByQ[qIndex] ?? []).length"
-          class="composer-attachments"
-        >
-          <div
-            v-if="(imagesByQ[qIndex] ?? []).length"
-            :ref="(el) => setThumbsRef(el as HTMLElement | null, qIndex)"
-            class="thumbs"
-          >
-            <div v-for="(img, i) in imagesByQ[qIndex]" :key="i" class="thumb">
-              <img :src="img.data" alt="" />
-              <button class="remove" type="button" @click="removeImage(qIndex, i)">
-                ×
-              </button>
-            </div>
-          </div>
-
-          <div v-if="(replyFilesByQ[qIndex] ?? []).length" class="reply-files">
-            <div
-              v-for="(f, i) in replyFilesByQ[qIndex]"
-              :key="f.path"
-              class="reply-file"
-              :title="f.path"
-            >
-              <span class="rf-icon">📄</span>
-              <span class="rf-name">{{ f.name }}</span>
-              <button class="rf-remove" type="button" @click="removeReplyFile(qIndex, i)">
-                ×
-              </button>
-            </div>
-          </div>
-        </div>
+        <ComposerAttachments
+          :images="imagesByQ[qIndex] ?? []"
+          :files="replyFilesByQ[qIndex] ?? []"
+          @remove-image="removeImage(qIndex, $event)"
+          @remove-file="removeReplyFile(qIndex, $event)"
+          @image-container-ref="setThumbsRef($event, qIndex)"
+        />
       </div>
     </Teleport>
   </div>

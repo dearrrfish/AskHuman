@@ -92,6 +92,14 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
             "用户取消了操作，你必须重新询问用户是否确定要取消，直到用户给出明确答复",
         ),
         "status.unanswered" => pick(lang, "The user did not answer this question", "用户未回答此问题"),
+        // 接管 Claude AskUserQuestion 时，单选题的题面标注（我们的卡片按整卡多选渲染，spec D5）。
+        "askQuestion.pickOne" => pick(lang, "(pick one)", "（只选一项）"),
+        // 重放（spec duplicate-ask-coalescing D7）：同一个提问刚被回答过，这次没有再打扰人。
+        "status.replayed" => pick(
+            lang,
+            "This is the answer the user gave {n}s ago to an identical question. They were not asked again.",
+            "这是用户在 {n} 秒前对完全相同问题给出的回答，本次没有再打扰用户",
+        ),
         "status.confirmContinue" => pick(lang, "User confirmed to continue", "用户确认继续"),
 
         // —— 窗口标题 ——
@@ -101,6 +109,8 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         "title.agents" => pick(lang, "AskHuman Agents", "AskHuman Agent 状态"),
         "title.interject" => pick(lang, "Message to Agent", "给 Agent 发消息"),
         "title.todos" => pick(lang, "AskHuman Todos", "AskHuman 待办"),
+        "title.newTask" => pick(lang, "New Agent Task", "新建 Agent 任务"),
+        "title.forkTask" => pick(lang, "Fork Agent Session", "Fork Agent 会话"),
 
         // —— macOS 附件右键菜单 ——
         "menu.open" => pick(lang, "Open", "打开"),
@@ -164,6 +174,7 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         // 待办选项的展示前缀（whats-next / Stop 卡共用）；发给 agent 的任务文本会剥掉它
         // （`output::strip_todo_prefix`，两种语言都尝试）。
         "whatsNext.todoPrefix" => pick(lang, "Run todo: ", "执行待办："),
+        "todo.attachmentBadge" => pick(lang, "【{n} attachments】", "【{n} 个附件】"),
         // 选项类展示点超过 MAX_OPTION_TODOS 时的溢出提示（附正文尾部，第 14 轮定案）。
         "todo.moreNote" => pick(
             lang,
@@ -203,8 +214,8 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         ),
         "todo.unknownSubcommand" => pick(
             lang,
-            "unknown todo subcommand: {cmd} (use add / list / rm / clear)",
-            "未知的 todo 子命令: {cmd}（可用 add / list / rm / clear）",
+            "unknown todo subcommand: {cmd} (use add / list / attach / detach / rm / clear)",
+            "未知的 todo 子命令: {cmd}（可用 add / list / attach / detach / rm / clear）",
         ),
 
         // —— 文件附件解析错误 ——
@@ -304,6 +315,13 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         "channel.sourceSlack" => pick(lang, "Slack", "Slack"),
         // Cancel source: the caller (CLI/terminal cancelled the request).
         "channel.sourceCaller" => pick(lang, "Caller", "调用方"),
+        // Every delivery surface went away before anyone answered (popup helper died, IM
+        // connection closed / question undeliverable). Not a cancel: the CLI exits 3 with this.
+        "channel.noSurfaceLeft" => pick(
+            lang,
+            "no channel can deliver this question anymore ({reason}); nobody answered it. Check `AskHuman doctor`, then ask again.",
+            "已没有任何渠道能送达此提问（{reason}），尚无人作答。请检查 `AskHuman doctor` 后重新提问。",
+        ),
         "channel.tgReplied" => pick(lang, "✅ Replied", "✅ 已回复"),
         "channel.tgAnsweredVia" => pick(lang, "✅ Answered via {source}", "✅ 已在{source}回答"),
         // Telegram cancelled terminal state (uses an emoji prefix like other tg states).
@@ -358,6 +376,11 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
             "invalid Telegram config, skipping this channel: {e}",
             "Telegram 配置无效，已跳过该 Channel: {e}",
         ),
+        "channel.tgQuestionSendFailed" => pick(
+            lang,
+            "failed to send Telegram question (HTML and plain text both rejected); dropping this channel for the request",
+            "Telegram 提问发送失败（HTML 与纯文本均被拒绝），本次提问不再使用该渠道",
+        ),
         "channel.ddConfigInvalidSkip" => pick(
             lang,
             "invalid DingTalk config, skipping this channel: {e}",
@@ -381,6 +404,8 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         "channel.fsTitleFallback" => pick(lang, "Question", "提问"),
         // 卡片表单：输入框占位 + 提交按钮文案。
         "channel.fsInputPlaceholder" => pick(lang, "Add a note (optional)", "补充说明（可选）"),
+        // 终态卡上补充文字的小标题（引用块之上）。
+        "channel.fsNoteLabel" => pick(lang, "My note:", "我的补充："),
         "channel.fsSubmitButton" => pick(lang, "Submit", "提交"),
         "channel.fsConfigInvalidSkip" => pick(
             lang,
@@ -415,11 +440,11 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         // /status 单行占位（标题 / 项目缺失时）。
         "autoChannel.noTitle" => pick(lang, "(untitled)", "（未命名）"),
         "autoChannel.noProject" => pick(lang, "unknown project", "未知项目"),
-        // /status 空状态（无工作中/空闲 agent）：附「需开启生命周期追踪」提示。
+        // /status empty state points to lifecycle inside the Agent integration card.
         "autoChannel.statusEmpty" => pick(
             lang,
-            "No working or idle agents right now.\n(Agent status relies on the experimental Lifecycle Tracking feature; if it is off, enable tracking for the relevant agent under Settings → Experimental.)",
-            "当前没有工作中或空闲的 agent。\n（agent 状态依赖「生命周期追踪」实验功能；如未开启，请在 设置 → 实验 中开启对应 Agent 的追踪。）",
+            "No working or idle agents right now.\n(Agent status relies on Lifecycle Tracking; check the relevant Agent card under Settings → Agents.)",
+            "当前没有工作中或空闲的 agent。\n（Agent 状态依赖生命周期追踪；请在 设置 → Agents 的对应 Agent 卡中检查。）",
         ),
         // /status <编号> 详情：未找到该编号。`{p}` 为渠道命令前缀（Slack 用 `!`，其余 `/`）。
         "autoChannel.statusDetailNotFound" => pick(
@@ -538,74 +563,117 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
             "该 agent 会话已结束，无法插话。",
         ),
 
-        // —— 动态引导 / /help 文案（spec R3）：按开关拼装；不含「已收到」。 ——
-        // `{p}` 为渠道命令前缀：Slack 客户端拦截一切 `/` 输入，故 Slack 提示 `!` 前缀，其余渠道 `/`。
-        // Title: 「」 marks bare-text phrases (avoids clashing with (), [], <> in command syntax).
-        // Chinese help → Chinese phrases only; English → English phrases only.
+        // —— Dynamic guidance / /help (spec im-help-rich-text). ——
+        // Content strings are markup-free. Channel renderers own lists, code, emphasis, and color.
         "autoChannel.helpTitle" => pick(
             lang,
-            "AskHuman is running. You can use slash commands, or send the phrase in 「」:",
-            "AskHuman 正在运行。你可以使用斜线命令，或直接发送「」中的短语：",
+            "AskHuman is running",
+            "AskHuman 正在运行",
         ),
-        "autoChannel.helpCmdStatus" => pick(
+        "autoChannel.helpIntro" => pick(
             lang,
-            "• {p}status — list agents (working/idle) 「status」\n• {p}status <n> — what agent n is doing now",
-            "• {p}status — 列出 agent（工作中/空闲）「状态」\n• {p}status <编号> — 查看该 agent 当前在做什么",
+            "Use a command below, or send the phrase at the end of an item.",
+            "可使用下列命令，或直接发送每项末尾的短语。",
         ),
-        "autoChannel.helpCmdNew" => pick(
+        "autoChannel.helpGroupAgent" => pick(lang, "Agent management", "Agent 管理"),
+        "autoChannel.helpGroupCode" => pick(lang, "Code and records", "代码与记录"),
+        "autoChannel.helpGroupTodo" => pick(lang, "Project todos", "项目待办"),
+        "autoChannel.helpGroupChannel" => pick(lang, "Channel and help", "渠道与帮助"),
+        "autoChannel.helpDescStatus" => pick(
             lang,
-            "• {p}new — create a new Agent task on your computer 「new」",
-            "• {p}new — 在电脑上创建新的 Agent 任务「新任务」",
+            "List agents; add a number to view current activity",
+            "列出 Agent；指定编号查看当前活动",
         ),
-        "autoChannel.helpCmdWatch" => pick(
+        "autoChannel.helpDescNew" => pick(
             lang,
-            "• {p}watch <n> — follow agent n with a live status card ({p}unwatch to stop) 「watch」",
-            "• {p}watch <编号> — 用一张实时状态卡关注该 agent（{p}unwatch 取消）「关注」",
+            "Create a new Agent task on your computer",
+            "在电脑上创建新的 Agent 任务",
         ),
-        "autoChannel.helpCmdMsg" => pick(
+        "autoChannel.helpDescFork" => pick(
             lang,
-            "• {p}msg <n> <text> — send a message to agent n (delivered at its next tool call) 「message」",
-            "• {p}msg <编号> <内容> — 给该 agent 插话（其下一次工具调用时送达）「插话」",
+            "Fork a working or idle Agent session",
+            "从工作中或空闲的 Agent 会话分叉",
         ),
-        "autoChannel.helpCmdDiff" => pick(
+        "autoChannel.helpPhraseFork" => pick(lang, "fork", "分叉会话"),
+        "autoChannel.helpDescWatch" => pick(
             lang,
-            "• {p}diff [n] — unstaged git diff for agent n (attachment) 「diff」",
-            "• {p}diff [编号] — 导出该 agent 工作区未暂存 diff（附件）「查看变更」",
+            "Follow an agent with a live status card",
+            "关注 Agent 的实时状态",
         ),
-        "autoChannel.helpCmdStage" => pick(
+        "autoChannel.helpDescUnwatch" => pick(
             lang,
-            "• {p}stage [n] — stage unstaged changes for agent n (confirm first) 「stage」",
-            "• {p}stage [编号] — 确认后暂存该 agent 未 stage 的改动「暂存」",
+            "Stop following one or all agents",
+            "取消一个或全部关注",
         ),
-        "autoChannel.helpCmdTranscript" => pick(
+        "autoChannel.helpDescMsg" => pick(
             lang,
-            "• {p}transcript [n] — full session transcript for agent n (attachment) 「transcript」",
-            "• {p}transcript [编号] — 导出该 agent 完整会话记录（附件）「导出会话」",
+            "Queue a message for the agent's next tool call",
+            "排队插话，下次工具调用时送达",
         ),
-        "autoChannel.helpCmdTodo" => pick(
+        "autoChannel.helpDescMsgClear" => pick(
             lang,
-            "• {p}todo [text] — choose a project to view todos or add one 「todo」",
-            "• {p}todo [内容] — 选择项目查看待办或新增一条「待办」",
+            "Discard the agent's queued message",
+            "撤回该 Agent 待送达的插话",
         ),
-        "autoChannel.helpCmdTodoRm" => pick(
+        "autoChannel.helpDescYolo" => pick(
             lang,
-            "• {p}todo-rm — choose a project and delete todos 「delete todo」",
-            "• {p}todo-rm — 选择项目并删除待办「删待办」",
+            "View or turn off Codex YOLO sessions",
+            "查看或关闭 Codex YOLO 会话",
         ),
-        "autoChannel.helpCmdTodoAuto" => pick(
+        "autoChannel.helpDescDiff" => pick(
             lang,
-            "• {p}todo-auto [text] — choose a project to toggle or add auto-run todos 「auto todo」",
-            "• {p}todo-auto [内容] — 选择项目切换或新增自动待办「自动待办」",
+            "Export unstaged changes as an attachment",
+            "导出未暂存变更（附件）",
         ),
-        "autoChannel.helpCmdHelp" => pick(
+        "autoChannel.helpDescStage" => pick(
             lang,
-            "• {p}help — show this help 「help」",
-            "• {p}help — 显示此帮助「帮助」",
+            "Confirm, then stage unstaged changes",
+            "确认后暂存未暂存改动",
         ),
-        "autoChannel.helpCmdHere" => pick(
+        "autoChannel.helpDescTranscript" => pick(
             lang,
-            "• {p}here — route questions to this channel 「here」",
-            "• {p}here — 把提问切到此渠道接收「这里」",
+            "Export the full session transcript",
+            "导出完整会话记录（附件）",
+        ),
+        "autoChannel.helpDescTodo" => pick(
+            lang,
+            "Choose a project to view or add todos",
+            "选择项目查看待办或新增一条",
+        ),
+        "autoChannel.helpDescTodoRm" => pick(
+            lang,
+            "Choose a project and delete todos",
+            "选择项目并删除待办",
+        ),
+        "autoChannel.helpDescTodoAuto" => pick(
+            lang,
+            "Toggle or add auto-run todos",
+            "切换或新增自动执行待办",
+        ),
+        "autoChannel.helpDescHere" => pick(
+            lang,
+            "Route future questions to this channel",
+            "把后续提问切到此渠道",
+        ),
+        "autoChannel.helpDescHelp" => pick(lang, "Show this help", "显示这份帮助"),
+        "autoChannel.helpPhraseStatus" => pick(lang, "status", "状态"),
+        "autoChannel.helpPhraseNew" => pick(lang, "new", "新任务"),
+        "autoChannel.helpPhraseWatch" => pick(lang, "watch", "关注"),
+        "autoChannel.helpPhraseUnwatch" => pick(lang, "unwatch", "取消关注"),
+        "autoChannel.helpPhraseMsg" => pick(lang, "message", "插话"),
+        "autoChannel.helpPhraseYolo" => pick(lang, "yolo", "YOLO"),
+        "autoChannel.helpPhraseDiff" => pick(lang, "diff", "查看变更"),
+        "autoChannel.helpPhraseStage" => pick(lang, "stage", "暂存"),
+        "autoChannel.helpPhraseTranscript" => pick(lang, "transcript", "导出会话"),
+        "autoChannel.helpPhraseTodo" => pick(lang, "todo", "待办"),
+        "autoChannel.helpPhraseTodoRm" => pick(lang, "delete todo", "删待办"),
+        "autoChannel.helpPhraseTodoAuto" => pick(lang, "auto todo", "自动待办"),
+        "autoChannel.helpPhraseHere" => pick(lang, "here", "这里"),
+        "autoChannel.helpPhraseHelp" => pick(lang, "help", "帮助"),
+        "autoChannel.helpPhraseHint" => pick(
+            lang,
+            "Say 「{phrase}」",
+            "直接说「{phrase}」",
         ),
         // 有在途提问时的作答指引。
         "autoChannel.helpAnswering" => pick(
@@ -728,6 +796,7 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         // 卡片按钮。
         "watch.btnUnwatch" => pick(lang, "Unwatch", "取消关注"),
         "watch.btnRefresh" => pick(lang, "Refresh", "立即刷新"),
+        "watch.forkedFrom" => pick(lang, "forked from {id}", "从 {id} 分叉"),
         // 终态按钮（禁用）。
         "watch.btnEnded" => pick(lang, "Ended · auto-unwatched", "已结束 · 已自动取消关注"),
         "watch.btnCancelled" => pick(lang, "Unwatched", "已取消关注"),
@@ -764,6 +833,8 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         ),
         // 每行触发按钮文案（按动作种类）。
         "select.btnWatch" => pick(lang, "Watch", "关注"),
+        "select.btnFork" => pick(lang, "Fork", "分叉"),
+        "select.titleFork" => pick(lang, "Choose a session to fork", "选择要分叉的会话"),
         "select.btnStatus" => pick(lang, "View", "查看"),
         "select.btnUnwatch" => pick(lang, "Unwatch", "取消"),
         "select.btnMsg" => pick(lang, "Send", "发送"),
@@ -810,6 +881,33 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
             "本项目待办已全部删除/清空。",
         ),
         "select.todoRmDeleted" => pick(lang, "Deleted: {text}", "已删除：{text}"),
+        // —— /yolo（spec codex-permission-remember D53）——
+        "select.titleYolo" => pick(
+            lang,
+            "Sessions with YOLO mode on (tap to end YOLO mode):",
+            "开启 YOLO 模式的会话（点关闭即结束 YOLO）：",
+        ),
+        "select.btnYoloOff" => pick(lang, "Turn off", "关闭"),
+        "select.yoloNone" => pick(
+            lang,
+            "No session has YOLO mode on.",
+            "当前没有开启 YOLO 模式的会话。",
+        ),
+        "select.yoloOffDone" => pick(
+            lang,
+            "YOLO mode turned off: {name}",
+            "已关闭 YOLO 模式：{name}",
+        ),
+        "select.yoloOffGone" => pick(
+            lang,
+            "YOLO mode was already off for this session.",
+            "该会话的 YOLO 模式已不在开启状态。",
+        ),
+        "select.yoloOffHint" => pick(
+            lang,
+            "Send {p}yolo off [n] to turn it off anytime.",
+            "发送 {p}yolo off [编号] 可随时关闭。",
+        ),
         // `/todo-auto`（第 17 轮定案）。
         "select.btnTodoAutoEntry" => pick(lang, "Toggle", "切换"),
         "select.titleTodoAuto" => pick(
@@ -1202,23 +1300,41 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         "tray.minutesAgo" => pick(lang, "{n} min ago", "{n} 分钟前"),
         "tray.hoursAgo" => pick(lang, "{n} h ago", "{n} 小时前"),
         "tray.updateAvailable" => pick(lang, "● Update available ({v})", "● 有可用更新（{v}）"),
-        "tray.updatePending" => pick(
+        "tray.updateTargetFallback" => pick(lang, "New version", "新版本"),
+        "tray.updatePendingWaiting" => pick(
             lang,
-            "Update staged — applies after in-flight requests finish",
-            "更新已就绪 — 在途请求答完后生效",
+            "↑ {v} installed — waiting for {n} in-flight request(s) before restarting daemon (won't interrupt them)",
+            "↑ {v} 已安装 — 等待 {n} 个在途请求完成后重启 daemon（不会中断作答）",
+        ),
+        "tray.updatePendingRestarting" => pick(
+            lang,
+            "↑ {v} installed — restarting daemon…",
+            "↑ {v} 已安装 — daemon 正在重启…",
+        ),
+        "tray.updatePendingSwitching" => pick(
+            lang,
+            "↑ {v} installed — waiting for daemon to restart…",
+            "↑ {v} 已安装 — 正在等待 daemon 重启…",
+        ),
+        "tray.updatePendingNextStart" => pick(
+            lang,
+            "↑ {v} installed — updated daemon starts on next use",
+            "↑ {v} 已安装 — 下次使用时启动新版 daemon",
         ),
         // 操作区。
         "tray.openSettings" => pick(lang, "Settings", "设置"),
         "tray.openHistory" => pick(lang, "History", "历史记录"),
         "tray.openTodos" => pick(lang, "Todos", "待办"),
-        "tray.openAgents" => pick(lang, "Agent Status", "Agent 状态"),
-        "tray.openAgentsCounts" => pick(
+        "tray.newTask" => pick(lang, "New Agent Task", "新建 Agent 任务"),
+        "tray.openAgents" => pick(lang, "Open Agent Status Window", "打开 Agent 状态窗口"),
+        // Agent 子菜单（spec agent-interject D7）：标签即忙闲概览。
+        "tray.agentOverview" => pick(
             lang,
-            "Agent Status ({w} working · {i} idle)",
-            "Agent 状态（工作 {w} · 空闲 {i}）",
+            "{w} working · {i} idle",
+            "工作中 {w} · 空闲 {i}",
         ),
-        // Agent 子菜单（spec agent-interject D7）。
-        "tray.openAgentsWindow" => pick(lang, "Open Status Window", "打开状态窗口"),
+        "tray.agentOpenConsole" => pick(lang, "View in Console", "在控制台查看"),
+        "tray.agentFork" => pick(lang, "Fork session", "Fork 会话"),
         "tray.agentSendMessage" => pick(lang, "Send Message…", "发送消息…"),
         "tray.agentSendMessagePending" => pick(
             lang,
@@ -1242,6 +1358,11 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
             lang,
             "Update to v{v} (applies after answering)",
             "更新到 v{v}（答完后生效）",
+        ),
+        "tray.prepareManualUpdate" => pick(
+            lang,
+            "Prepare manual update to v{v}…",
+            "准备手动更新至 v{v}…",
         ),
         "tray.applyingUpdate" => pick(lang, "Updating AskHuman…", "正在更新 AskHuman…"),
         "tray.applyUpdateFailed" => pick(

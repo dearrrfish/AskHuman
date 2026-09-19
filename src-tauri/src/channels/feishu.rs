@@ -10,7 +10,9 @@
 //! 编排逻辑复用 `conversation::run_conversation`，本文件提供传输实现 `FeishuSession`
 //! （`MessagingChannel`）+ 薄外层 `FeishuChannel`。
 
-use super::conversation::{run_conversation, MessagingChannel, QuestionCtx};
+use super::conversation::{
+    run_conversation, InboundReply, MessagingChannel, QuestionCtx, QuestionOutcome,
+};
 use super::{Channel, ConversationOrigin, Interruption, Preemption, ResultSink};
 use crate::config::FeishuChannelConfig;
 use crate::feishu::card;
@@ -27,6 +29,21 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Message（正文+附件）发完到发第一道题之间的等待时长，保证「先 message 后题目」的视觉顺序。
 const MESSAGE_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+async fn send_inbound_reply(client: &FeishuClient, reply: InboundReply, lang: Lang) {
+    match reply {
+        InboundReply::Text(text) => {
+            let _ = client.send_text(&text).await;
+        }
+        InboundReply::Help(view) => {
+            let rich = card::build_help_card(&view, lang);
+            if client.send_card(&rich).await.is_err() {
+                let plain = crate::autochannel::render_help_plain(&view, lang);
+                let _ = client.send_text(&plain).await;
+            }
+        }
+    }
+}
 
 /// Router 归属：单进程自建一个仅挂本会话的 Router；Daemon 复用共享且常热的 Router。
 #[derive(Clone)]
@@ -91,6 +108,7 @@ impl Channel for FeishuChannel {
                             i18n::warn_prefix(lang),
                             i18n::tr(lang, "channel.fsConfigInvalidSkip").replace("{e}", &e)
                         );
+                        sink.surface_lost("feishu", &e);
                         return;
                     }
                 },
@@ -103,6 +121,7 @@ impl Channel for FeishuChannel {
                     i18n::warn_prefix(lang),
                     i18n::tr(lang, "channel.fsConfigInvalidSkip").replace("{e}", &e)
                 );
+                sink.surface_lost("feishu", &e);
                 return;
             }
             run_conversation(&mut session, &request, &origin, preempt, sink).await;
@@ -205,7 +224,7 @@ impl MessagingChannel for FeishuSession {
         &mut self,
         ctx: &QuestionCtx<'_>,
         preempt: &Preemption,
-    ) -> Option<QuestionAnswer> {
+    ) -> QuestionOutcome {
         let title = if ctx.header.is_empty() {
             i18n::tr(ctx.lang, "channel.fsTitleFallback")
         } else {
@@ -217,11 +236,13 @@ impl MessagingChannel for FeishuSession {
             events,
             config,
         } = self;
-        let client = client.as_ref()?;
-        let events = events.as_mut()?;
+        let (Some(client), Some(events)) = (client.as_ref(), events.as_mut()) else {
+            return QuestionOutcome::Lost;
+        };
         let open_id = config.open_id.trim().to_string();
 
         let placeholder = i18n::tr(ctx.lang, "channel.fsInputPlaceholder");
+        let note_label_text = i18n::tr(ctx.lang, "channel.fsNoteLabel");
         let submit_label = i18n::tr(ctx.lang, "channel.fsSubmitButton");
         let recommended_prefix = i18n::tr(ctx.lang, "channel.feishuRecommendedPrefix");
         let todo_text_prefix = i18n::tr(ctx.lang, "whatsNext.todoPrefix");
@@ -268,7 +289,16 @@ impl MessagingChannel for FeishuSession {
         while !preempt.is_cancelled() {
             let ev = match tokio::time::timeout(POLL_INTERVAL, events.recv()).await {
                 Ok(Some(ev)) => ev,
-                Ok(None) => break,  // 长连接彻底断开
+                Ok(None) => {
+                    // The event source is gone for good (Router dropped). Transient disconnects
+                    // never reach here — the Router reconnects indefinitely — so this is a real
+                    // loss: leave the card untouched and let the coordinator drop this surface.
+                    if preempt.is_cancelled() {
+                        break;
+                    }
+                    events.clear_active(Some(&message_id), &open_id);
+                    return QuestionOutcome::Lost;
+                }
                 Err(_) => continue, // 超时：回到循环顶部重新检查 cancelled
             };
             match ev {
@@ -305,6 +335,7 @@ impl MessagingChannel for FeishuSession {
                                     selected: &selected_final,
                                     user_input: s.user_input.as_deref(),
                                     input_placeholder: placeholder,
+                                    note_label: note_label_text,
                                     button_label: i18n::tr(ctx.lang, "channel.fsSubmitted"),
                                     recommended_prefix,
                                     single: ctx.single,
@@ -325,12 +356,13 @@ impl MessagingChannel for FeishuSession {
                             events.clear_active(Some(&message_id), &open_id);
                             let images = std::mem::take(&mut *images.lock().unwrap());
                             let files = std::mem::take(&mut *files.lock().unwrap());
-                            return Some(QuestionAnswer {
+                            return QuestionOutcome::Answered(QuestionAnswer {
                                 selected_options: selected_final,
                                 user_input: s.user_input,
                                 images,
                                 files,
                                 todo_ids: Vec::new(),
+                                todo_selections: Vec::new(),
                             });
                         }
                         // 非提交回调：单选勾选器 toggle → 互斥更新选中态并重渲染卡片。
@@ -380,7 +412,7 @@ impl MessagingChannel for FeishuSession {
                         ) {
                             let ack_client = client.clone();
                             tauri::async_runtime::spawn(async move {
-                                let _ = ack_client.send_text(&reply).await;
+                                send_inbound_reply(&ack_client, reply, lang).await;
                             });
                         }
                         // 并发下载：spawn 后立刻回到循环收事件，避免大文件下载卡住提交处理。
@@ -395,9 +427,8 @@ impl MessagingChannel for FeishuSession {
             }
         }
 
-        // Interrupted (preempted / cancelled) or disconnected: best-effort PATCH the card to terminal.
-        // Preempted → "Answered via X"; cancelled (with/without source) → "Cancelled [by X]";
-        // disconnect with no reason → generic "Cancelled".
+        // Interrupted (preempted / cancelled): best-effort PATCH the card to terminal.
+        // Preempted → "Answered via X"; cancelled (with/without source) → "Cancelled [by X]".
         let status = match preempt.reason() {
             Some(Interruption::AnsweredBy(w)) => {
                 i18n::tr(ctx.lang, "channel.fsAnsweredVia").replace("{source}", &w)
@@ -417,6 +448,7 @@ impl MessagingChannel for FeishuSession {
                 selected: &[],
                 user_input: None,
                 input_placeholder: placeholder,
+                note_label: note_label_text,
                 button_label: &status,
                 recommended_prefix,
                 single: ctx.single,
@@ -425,9 +457,16 @@ impl MessagingChannel for FeishuSession {
             todo_text_prefix,
             todo_badge_prefix,
         );
-        let _ = client.patch_card(&message_id, &finalized).await;
+        let finalize_action = match client.patch_card(&message_id, &finalized).await {
+            Ok(()) => "card_finalize_succeeded",
+            Err(error) => {
+                eprintln!("[feishu] failed to finalize interrupted card: {error}");
+                "card_finalize_failed"
+            }
+        };
+        crate::daemon::lifecycle::log_runtime_event("channel_feishu", finalize_action, None);
         events.clear_active(Some(&message_id), &open_id);
-        None
+        QuestionOutcome::Interrupted
     }
 
     async fn close(&mut self) {
@@ -443,7 +482,7 @@ async fn ask_question_text(
     open_id: &str,
     ctx: &QuestionCtx<'_>,
     preempt: &Preemption,
-) -> Option<QuestionAnswer> {
+) -> QuestionOutcome {
     // 编号回复按原文映射（编号清单展示用显示文本，见 build_question_text）。
     let option_texts: Vec<String> = ctx.options.iter().map(|o| o.text.clone()).collect();
     let body = build_question_text(ctx);
@@ -453,6 +492,9 @@ async fn ask_question_text(
             i18n::warn_prefix(ctx.lang),
             i18n::tr(ctx.lang, "channel.fsQuestionSendFailed").replace("{e}", &e.to_string())
         );
+        // Neither the card nor the plain-text fallback reached the human: this surface cannot
+        // carry the question. Waiting here would only hide the failure from the caller.
+        return QuestionOutcome::Lost;
     }
 
     // 文本兜底无卡片：认领本 open_id 的聊天消息即可（不登记卡片精确路由）。
@@ -461,7 +503,13 @@ async fn ask_question_text(
     while !preempt.is_cancelled() {
         let ev = match tokio::time::timeout(POLL_INTERVAL, events.recv()).await {
             Ok(Some(ev)) => ev,
-            Ok(None) => break,
+            Ok(None) => {
+                if preempt.is_cancelled() {
+                    break;
+                }
+                events.clear_active(None, open_id);
+                return QuestionOutcome::Lost;
+            }
             Err(_) => continue,
         };
         match ev {
@@ -483,10 +531,10 @@ async fn ask_question_text(
                         "feishu",
                         ctx.lang,
                     ) {
-                        let _ = client.send_text(&reply).await;
+                        send_inbound_reply(client, reply, ctx.lang).await;
                     }
                     events.clear_active(None, open_id);
-                    return Some(answer);
+                    return QuestionOutcome::Answered(answer);
                 } else {
                     // 未接受 → 引导（spec R3）；命令交 handle_inbound，不回引导。
                     if let Some(reply) = super::conversation::answer_inbound_reply(
@@ -496,7 +544,7 @@ async fn ask_question_text(
                         "feishu",
                         ctx.lang,
                     ) {
-                        let _ = client.send_text(&reply).await;
+                        send_inbound_reply(client, reply, ctx.lang).await;
                     }
                 }
             }
@@ -507,7 +555,7 @@ async fn ask_question_text(
         }
     }
     events.clear_active(None, open_id);
-    None
+    QuestionOutcome::Interrupted
 }
 
 /// 累积聊天里收到的图片/文件（卡片作答期间）；纯文字等忽略。
@@ -634,6 +682,7 @@ async fn message_to_answer(
                 images: Vec::new(),
                 files: Vec::new(),
                 todo_ids: Vec::new(),
+                todo_selections: Vec::new(),
             })
         }
         // 严格模式禁附件：图片/文件回复忽略（继续等待编号选择）。
@@ -648,6 +697,7 @@ async fn message_to_answer(
                     images: vec![img],
                     files: Vec::new(),
                     todo_ids: Vec::new(),
+                    todo_selections: Vec::new(),
                 }),
                 Err(e) => {
                     let lang = Lang::current();
@@ -677,6 +727,7 @@ async fn message_to_answer(
                     images: Vec::new(),
                     files: vec![path],
                     todo_ids: Vec::new(),
+                    todo_selections: Vec::new(),
                 }),
                 Err(e) => {
                     let lang = Lang::current();

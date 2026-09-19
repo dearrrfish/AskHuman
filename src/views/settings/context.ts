@@ -13,19 +13,20 @@ import { useGeneralSettings } from "./useGeneralSettings";
 import { useAboutUpdates } from "./useAboutUpdates";
 import { useIntegration } from "./useIntegration";
 import { useAgentTasks } from "./useAgentTasks";
-import { useLifecycleSettings } from "./useLifecycleSettings";
 import { useChannels } from "./useChannels";
 import { useSettingsSearch } from "./useSearch";
-import { isMac, isWindows } from "../../lib/platform";
+import { isMac, isWindows, supportsAgentTasks } from "../../lib/platform";
 
-export { isMac, isWindows };
+export { isMac, isWindows, supportsAgentTasks };
 
 export type Tab = "general" | "integration" | "channel" | "advanced" | "experimental";
 export const TABS: readonly Tab[] = ["general", "integration", "channel", "advanced", "experimental"];
 
 function parseInitialTab(): Tab {
   // 初始定位 tab 经窗口 URL 传入（如托盘「渠道异常」行 → ?tab=channel），无监听时序问题。
-  const tab = new URLSearchParams(window.location.search).get("tab");
+  // 支持 `tab#elementId` 锚点后缀（跨窗口定位，spec gui-agent-task-launch G5）：此处只取 tab 段，
+  // 锚点滚动由 SettingsView 挂载完成后处理。
+  const tab = (new URLSearchParams(window.location.search).get("tab") ?? "").split("#")[0];
   return TABS.includes(tab as Tab) ? (tab as Tab) : "general";
 }
 
@@ -146,9 +147,8 @@ export function createSettingsContext() {
   const core = createCore();
   const general = useGeneralSettings(core);
   const updates = useAboutUpdates();
-  const integration = useIntegration(core);
   const tasks = useAgentTasks(core);
-  const lifecycle = useLifecycleSettings(tasks.refreshAgentTaskSettings);
+  const integration = useIntegration(core, tasks);
   const channels = useChannels(core);
   const search = useSettingsSearch({
     config: core.config,
@@ -158,12 +158,12 @@ export function createSettingsContext() {
   const ctx = {
     isMac,
     isWindows,
+    supportsAgentTasks,
     ...core,
     ...general,
     ...updates,
     ...integration,
     ...tasks,
-    ...lifecycle,
     ...channels,
     ...search,
   };

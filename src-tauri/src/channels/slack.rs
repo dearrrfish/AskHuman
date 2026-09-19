@@ -13,7 +13,9 @@
 //! 与飞书差异：终态不能「禁用控件保留外观」，故收尾用 `chat.update` 把卡片替换为**静态终态**
 //! （回显已选项 + 补充文字 + 状态行，移除控件）；ack 在 `ws` 层收帧即完成，无需 oneshot 回包。
 
-use super::conversation::{run_conversation, MessagingChannel, QuestionCtx};
+use super::conversation::{
+    run_conversation, InboundReply, MessagingChannel, QuestionCtx, QuestionOutcome,
+};
 use super::{Channel, ConversationOrigin, Interruption, Preemption, ResultSink};
 use crate::config::SlackChannelConfig;
 use crate::i18n::{self, Lang};
@@ -45,6 +47,25 @@ fn next_card_nonce() -> String {
 
 /// Message（正文+附件）发完到发第一道题之间的等待时长，保证「先 message 后题目」的视觉顺序。
 const MESSAGE_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+async fn send_inbound_reply(client: &SlackClient, dm: &str, reply: InboundReply, lang: Lang) {
+    match reply {
+        InboundReply::Text(text) => {
+            let _ = client.post_text(dm, &text).await;
+        }
+        InboundReply::Help(view) => {
+            let plain = crate::autochannel::render_help_plain(&view, lang);
+            let blocks = blockkit::build_help_blocks(&view, lang);
+            if client
+                .post_message(dm, Some(&blocks), &plain)
+                .await
+                .is_err()
+            {
+                let _ = client.post_text(dm, &plain).await;
+            }
+        }
+    }
+}
 
 /// Router 归属：单进程自建一个仅挂本会话的 Router；Daemon 复用共享且常热的 Router。
 #[derive(Clone)]
@@ -109,6 +130,7 @@ impl Channel for SlackChannel {
                             i18n::warn_prefix(lang),
                             i18n::tr(lang, "channel.slConfigInvalidSkip").replace("{e}", &e)
                         );
+                        sink.surface_lost("slack", &e);
                         return;
                     }
                 },
@@ -121,6 +143,7 @@ impl Channel for SlackChannel {
                     i18n::warn_prefix(lang),
                     i18n::tr(lang, "channel.slConfigInvalidSkip").replace("{e}", &e)
                 );
+                sink.surface_lost("slack", &e);
                 return;
             }
             run_conversation(&mut session, &request, &origin, preempt, sink).await;
@@ -220,7 +243,7 @@ impl MessagingChannel for SlackSession {
         &mut self,
         ctx: &QuestionCtx<'_>,
         preempt: &Preemption,
-    ) -> Option<QuestionAnswer> {
+    ) -> QuestionOutcome {
         let title = if ctx.header.is_empty() {
             i18n::tr(ctx.lang, "channel.slTitleFallback")
         } else {
@@ -233,9 +256,11 @@ impl MessagingChannel for SlackSession {
             config,
             dm_channel,
         } = self;
-        let client = client.as_ref()?;
-        let dm = dm_channel.as_deref()?;
-        let events = events.as_mut()?;
+        let (Some(client), Some(dm), Some(events)) =
+            (client.as_ref(), dm_channel.as_deref(), events.as_mut())
+        else {
+            return QuestionOutcome::Lost;
+        };
         let user_id = config.user_id.trim().to_string();
 
         let options_label = i18n::tr(ctx.lang, "channel.slOptionsLabel");
@@ -287,7 +312,16 @@ impl MessagingChannel for SlackSession {
         while !preempt.is_cancelled() {
             let ev = match tokio::time::timeout(POLL_INTERVAL, events.recv()).await {
                 Ok(Some(ev)) => ev,
-                Ok(None) => break,  // 长连接彻底断开
+                Ok(None) => {
+                    // Event source gone for good (Router dropped); transient disconnects are
+                    // absorbed by the Router's endless reconnect. Leave the card untouched and let
+                    // the coordinator drop this surface instead of stamping "cancelled" on it.
+                    if preempt.is_cancelled() {
+                        break;
+                    }
+                    events.clear_active(Some(&message_ts), &user_id);
+                    return QuestionOutcome::Lost;
+                }
                 Err(_) => continue, // 超时：回到循环顶部重新检查 cancelled
             };
             match ev {
@@ -349,12 +383,13 @@ impl MessagingChannel for SlackSession {
                     events.clear_active(Some(&message_ts), &user_id);
                     let images = std::mem::take(&mut *images.lock().unwrap());
                     let files = std::mem::take(&mut *files.lock().unwrap());
-                    return Some(QuestionAnswer {
+                    return QuestionOutcome::Answered(QuestionAnswer {
                         selected_options: s.selected_options,
                         user_input: s.user_input,
                         images,
                         files,
                         todo_ids: Vec::new(),
+                        todo_selections: Vec::new(),
                     });
                 }
                 SlInbound::Message(event) => {
@@ -372,7 +407,7 @@ impl MessagingChannel for SlackSession {
                             let ack_client = client.clone();
                             let ack_dm = dm.to_string();
                             tauri::async_runtime::spawn(async move {
-                                let _ = ack_client.post_text(&ack_dm, &reply).await;
+                                send_inbound_reply(&ack_client, &ack_dm, reply, lang).await;
                             });
                         }
                         let client = client.clone();
@@ -386,7 +421,7 @@ impl MessagingChannel for SlackSession {
             }
         }
 
-        // 被抢答 / 取消 / 断连：把卡片更新为静态终态（本端未作答 → 不回显选择，仅状态行）。
+        // 被抢答 / 取消：把卡片更新为静态终态（本端未作答 → 不回显选择，仅状态行）。
         let status = match preempt.reason() {
             Some(Interruption::AnsweredBy(w)) => {
                 i18n::tr(ctx.lang, "channel.slAnsweredVia").replace("{source}", &w)
@@ -408,7 +443,7 @@ impl MessagingChannel for SlackSession {
             .update_message(dm, &message_ts, Some(&finalized), &notify)
             .await;
         events.clear_active(Some(&message_ts), &user_id);
-        None
+        QuestionOutcome::Interrupted
     }
 
     async fn close(&mut self) {
@@ -425,7 +460,7 @@ async fn ask_question_text(
     user_id: &str,
     ctx: &QuestionCtx<'_>,
     preempt: &Preemption,
-) -> Option<QuestionAnswer> {
+) -> QuestionOutcome {
     // 编号回复按原文映射（编号清单展示用显示文本，见 build_question_text）。
     let option_texts: Vec<String> = ctx.options.iter().map(|o| o.text.clone()).collect();
     let body = build_question_text(ctx);
@@ -435,6 +470,9 @@ async fn ask_question_text(
             i18n::warn_prefix(ctx.lang),
             i18n::tr(ctx.lang, "channel.slQuestionSendFailed").replace("{e}", &e.to_string())
         );
+        // Neither the card nor the plain-text fallback reached the human: this surface cannot
+        // carry the question. Waiting here would only hide the failure from the caller.
+        return QuestionOutcome::Lost;
     }
 
     // 文本兜底无卡片：认领本 user_id 的聊天消息即可（不登记卡片精确路由）。
@@ -443,7 +481,13 @@ async fn ask_question_text(
     while !preempt.is_cancelled() {
         let ev = match tokio::time::timeout(POLL_INTERVAL, events.recv()).await {
             Ok(Some(ev)) => ev,
-            Ok(None) => break,
+            Ok(None) => {
+                if preempt.is_cancelled() {
+                    break;
+                }
+                events.clear_active(None, user_id);
+                return QuestionOutcome::Lost;
+            }
             Err(_) => continue,
         };
         match ev {
@@ -475,10 +519,10 @@ async fn ask_question_text(
                         "slack",
                         ctx.lang,
                     ) {
-                        let _ = client.post_text(dm, &reply).await;
+                        send_inbound_reply(client, dm, reply, ctx.lang).await;
                     }
                     events.clear_active(None, user_id);
-                    return Some(answer);
+                    return QuestionOutcome::Answered(answer);
                 } else {
                     // 未接受 → 引导（spec R3）；命令交 handle_inbound，不回引导。
                     if let Some(reply) = super::conversation::answer_inbound_reply(
@@ -488,7 +532,7 @@ async fn ask_question_text(
                         "slack",
                         ctx.lang,
                     ) {
-                        let _ = client.post_text(dm, &reply).await;
+                        send_inbound_reply(client, dm, reply, ctx.lang).await;
                     }
                 }
             }
@@ -497,7 +541,7 @@ async fn ask_question_text(
         }
     }
     events.clear_active(None, user_id);
-    None
+    QuestionOutcome::Interrupted
 }
 
 /// 累积聊天里收到的图片/文件（卡片作答期间）；纯文字等忽略。
@@ -640,6 +684,7 @@ async fn message_to_answer(
         images,
         files,
         todo_ids: Vec::new(),
+        todo_selections: Vec::new(),
     })
 }
 

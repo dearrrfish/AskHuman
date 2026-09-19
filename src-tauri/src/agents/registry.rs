@@ -60,6 +60,16 @@ pub struct AgentRecord {
     pub title: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Validated transcript path for agents with configurable session storage (currently Pi).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+    /// Direct parent session when this record was created by AskHuman's native Fork flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_session_id: Option<String>,
+    /// Inherited UUID for a task created through AskHuman's terminal launch bridge. Windows uses
+    /// it as the only stable terminal-focus identity; arbitrary lifecycle sessions leave it empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
     pub started_at: u64,
     pub last_activity: u64,
     /// Completed active intervals for this session, excluding time spent in the Idle state.
@@ -163,6 +173,49 @@ fn stop_active(rec: &mut AgentRecord, end: u64) -> bool {
     true
 }
 
+/// 「已结束孪生」并账（spec agent-lifecycle-tracking 2026-07-25）：历史版本在 resume 前不继承
+/// 累计时长，同一会话被拆成多条记录、时长归零重计（用户实证：跑一上午只显示 30 分钟）。
+/// 活动记录吸收全部同 (kind, session) 孪生的时长与最早起点；纯已结束的孪生合并到最新一条。
+/// 幂等，仅影响累计展示与列表去重。
+fn merge_ended_twins(active: &mut [AgentRecord], ended: &mut VecDeque<AgentRecord>) {
+    for a in active.iter_mut() {
+        ended.retain(|e| {
+            if e.session_id == a.session_id && e.kind == a.kind {
+                a.active_elapsed_secs = a.active_elapsed_secs.saturating_add(e.active_elapsed_secs);
+                a.started_at = a.started_at.min(e.started_at);
+                if a.transcript_path.is_none() {
+                    a.transcript_path = e.transcript_path.clone();
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+    let drained: Vec<AgentRecord> = ended.drain(..).collect();
+    for e in drained {
+        if let Some(m) = ended
+            .iter_mut()
+            .find(|m| m.session_id == e.session_id && m.kind == e.kind)
+        {
+            m.active_elapsed_secs = m.active_elapsed_secs.saturating_add(e.active_elapsed_secs);
+            m.started_at = m.started_at.min(e.started_at);
+            if e.ended_at > m.ended_at {
+                m.ended_at = e.ended_at;
+                m.last_activity = m.last_activity.max(e.last_activity);
+                if e.title.is_some() {
+                    m.title = e.title;
+                }
+                if e.transcript_path.is_some() {
+                    m.transcript_path = e.transcript_path;
+                }
+            }
+        } else {
+            ended.push_back(e);
+        }
+    }
+}
+
 /// Effective cumulative active time at `now`, including the current Working interval.
 fn active_elapsed_at(rec: &AgentRecord, now: u64) -> u64 {
     rec.active_elapsed_secs.saturating_add(
@@ -220,6 +273,10 @@ impl AgentRegistry {
             stop_active(&mut rec, end);
             push_ended(&mut inner.ended, rec);
         }
+        // 「已结束孪生」并账治愈（spec agent-lifecycle-tracking 2026-07-25）。
+        let mut ended = std::mem::take(&mut inner.ended);
+        merge_ended_twins(&mut inner.active, &mut ended);
+        inner.ended = ended;
         // 盘上旧 seq 一律忽略：按序（活动在前、已结束在后）重排，保证「当前 daemon 生命周期内」稳定、从 1 起。
         let mut seq = 1u64;
         for r in inner.active.iter_mut() {
@@ -231,6 +288,17 @@ impl AgentRegistry {
             seq += 1;
         }
         inner.next_seq = seq;
+        for record in inner.active.iter().chain(inner.ended.iter()) {
+            if record.kind == AgentKind::Pi {
+                if let Some(path) = record.transcript_path.as_deref() {
+                    let _ = super::session_paths::register_pi(
+                        &record.session_id,
+                        path,
+                        record.cwd.as_deref(),
+                    );
+                }
+            }
+        }
         drop(inner);
         reg
     }
@@ -261,6 +329,32 @@ impl AgentRegistry {
     pub fn clear_pid_cache(&self, session_id: &str) {
         let mut cache = self.pid_cache.lock().unwrap();
         cache.retain(|(sid, _), _| sid != session_id);
+    }
+
+    /// Retain an already validated transcript path and invalidate the lazily cached title.
+    pub fn set_transcript_path(&self, kind: AgentKind, session_id: &str, path: String) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let record = if let Some(record) = inner
+            .active
+            .iter_mut()
+            .find(|record| record.kind == kind && record.session_id == session_id)
+        {
+            record
+        } else if let Some(record) = inner
+            .ended
+            .iter_mut()
+            .find(|record| record.kind == kind && record.session_id == session_id)
+        {
+            record
+        } else {
+            return false;
+        };
+        if record.transcript_path.as_deref() == Some(path.as_str()) {
+            return false;
+        }
+        record.transcript_path = Some(path);
+        record.title = None;
+        true
     }
 
     /// 处理一次生命周期事件（spec D5/D6/D7）。返回是否有状态变化（供广播）。
@@ -309,25 +403,51 @@ impl AgentRegistry {
                 (i, false)
             }
             None => {
-                let seq = inner.alloc_seq();
-                inner.active.push(AgentRecord {
-                    seq,
-                    kind,
-                    session_id: session_id.to_string(),
-                    pid,
-                    title: None,
-                    cwd,
-                    started_at: now,
-                    last_activity: now,
-                    active_elapsed_secs: 0,
-                    active_since: None,
-                    state: AgentState::Idle,
-                    ended_at: None,
-                    terminal: None,
-                    current_tool: None,
-                    turn_steps: 0,
-                    turn_started_at: None,
-                });
+                // Resume（spec agent-lifecycle-tracking 2026-07-25）：同 (kind, session) 的已结束
+                // 记录 → **复活并继承**累计工作时长/起点/编号。此前每次「结束→事件再来」都新建
+                // 零时长记录，重启存活复核 + pid 误判会把同一会话拆成多条、累计时长归零重计
+                // （用户实证：跑一上午只显示 30 分钟）。
+                if let Some(pos) = inner
+                    .ended
+                    .iter()
+                    .position(|r| r.session_id == session_id && r.kind == kind)
+                {
+                    let mut r = inner.ended.remove(pos).expect("position is valid");
+                    r.state = AgentState::Idle;
+                    r.ended_at = None;
+                    r.active_since = None;
+                    if pid.is_some() {
+                        r.pid = pid;
+                    }
+                    if cwd.is_some() {
+                        r.cwd = cwd;
+                    }
+                    r.last_activity = now;
+                    inner.active.push(r);
+                } else {
+                    let seq = inner.alloc_seq();
+                    inner.active.push(AgentRecord {
+                        seq,
+                        kind,
+                        session_id: session_id.to_string(),
+                        pid,
+                        title: None,
+                        cwd,
+                        transcript_path: None,
+                        forked_from_session_id: None,
+                        launch_id: None,
+                        started_at: now,
+                        last_activity: now,
+                        active_elapsed_secs: 0,
+                        active_since: None,
+                        state: AgentState::Idle,
+                        ended_at: None,
+                        terminal: None,
+                        current_tool: None,
+                        turn_steps: 0,
+                        turn_started_at: None,
+                    });
+                }
                 (inner.active.len() - 1, true)
             }
         };
@@ -518,6 +638,9 @@ impl AgentRegistry {
                 pid,
                 title: None,
                 cwd,
+                transcript_path: None,
+                forked_from_session_id: None,
+                launch_id: None,
                 started_at: now,
                 last_activity: now,
                 active_elapsed_secs: 0,
@@ -676,6 +799,85 @@ impl AgentRegistry {
         inner.active.iter().map(|r| r.session_id.clone()).collect()
     }
 
+    /// 弹窗 → Agent 状态窗口的严格寻址门控：只有家族与会话 ID 同时命中活动记录才算匹配。
+    /// 不按 pid / cwd / 家族单独猜测，避免并发会话时把快捷入口指向错误 Agent。
+    pub fn has_active_session(&self, kind: AgentKind, session_id: &str) -> bool {
+        if session_id.is_empty() {
+            return false;
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .active
+            .iter()
+            .any(|record| record.kind == kind && record.session_id == session_id)
+    }
+
+    /// Persist the direct parent of a newly matched fork. The child may have already ended by the
+    /// time the lifecycle event is processed, so both active and retained ended records are valid.
+    pub fn set_fork_parent(&self, session_id: &str, parent_session_id: &str) -> bool {
+        if session_id.is_empty() || parent_session_id.is_empty() || session_id == parent_session_id
+        {
+            return false;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let Inner { active, ended, .. } = &mut *inner;
+        let Some(record) = active
+            .iter_mut()
+            .chain(ended.iter_mut())
+            .find(|record| record.session_id == session_id)
+        else {
+            return false;
+        };
+        if record.forked_from_session_id.as_deref() == Some(parent_session_id) {
+            return false;
+        }
+        record.forked_from_session_id = Some(parent_session_id.to_string());
+        true
+    }
+
+    /// Bind an inherited AskHuman launch UUID to a lifecycle session. Invalid values are ignored;
+    /// callers may invoke this on every hook event so daemon restarts can recover the association.
+    pub fn set_launch_id(&self, session_id: &str, launch_id: &str) -> bool {
+        let Ok(id) = uuid::Uuid::parse_str(launch_id) else {
+            return false;
+        };
+        let id = id.hyphenated().to_string();
+        let mut inner = self.inner.lock().unwrap();
+        let Inner { active, ended, .. } = &mut *inner;
+        let Some(record) = active
+            .iter_mut()
+            .chain(ended.iter_mut())
+            .find(|record| record.session_id == session_id)
+        else {
+            return false;
+        };
+        if record.launch_id.is_some() {
+            // A session keeps the identity inherited at launch. A later hook must not retarget it.
+            return false;
+        }
+        record.launch_id = Some(id);
+        #[cfg(target_os = "windows")]
+        {
+            record.terminal =
+                Some(crate::integrations::terminal_focus::windows_terminal_kind().to_string());
+        }
+        true
+    }
+
+    /// Resolve only daemon-registered focus fields for a live session.
+    pub fn focus_identity(
+        &self,
+        session_id: &str,
+    ) -> Option<(AgentKind, Option<u32>, Option<String>)> {
+        let inner = self.inner.lock().unwrap();
+        let record = inner
+            .active
+            .iter()
+            .find(|record| record.session_id == session_id)?;
+        Some((record.kind, record.pid, record.launch_id.clone()))
+    }
+
     /// 权限授权管理面板的分组增强（spec codex-permission-remember §6.3）：按 session_id 在
     /// 活动与已结束记录中查标题 / 项目名（标题惰性解析并缓存）。不在册返回 None，面板回退
     /// 显示缩短的 session id。
@@ -717,7 +919,13 @@ impl AgentRegistry {
                 }
             }
         }
-        let mut list: Vec<&AgentRecord> = inner.active.iter().collect();
+        let mut list: Vec<AgentRecord> = inner.active.clone();
+        let session_seqs: std::collections::HashMap<String, u64> = inner
+            .active
+            .iter()
+            .chain(inner.ended.iter())
+            .map(|record| (record.session_id.clone(), record.seq))
+            .collect();
         list.sort_by(|a, b| {
             let rank = |r: &AgentRecord| match r.state {
                 AgentState::Working => 0u8,
@@ -727,12 +935,17 @@ impl AgentRegistry {
                 .cmp(&rank(b))
                 .then(b.last_activity.cmp(&a.last_activity))
         });
+        drop(inner);
         list.into_iter()
             .map(|r| crate::ipc::TrayAgentInfo {
                 session_id: r.session_id.clone(),
                 seq: r.seq,
                 kind: r.kind.as_str().to_string(),
                 title: r.title.clone().unwrap_or_default(),
+                forked_from_seq: r
+                    .forked_from_session_id
+                    .as_ref()
+                    .and_then(|parent_id| session_seqs.get(parent_id).copied()),
                 project_name: r
                     .cwd
                     .as_deref()
@@ -745,13 +958,20 @@ impl AgentRegistry {
                 }
                 .to_string(),
                 pending_interject: false,
-                // 与前端 `lib/terminals.ts` 的支持清单一致（Terminal.app / iTerm2）。
-                focusable: r.pid.is_some()
-                    && matches!(
-                        r.terminal.as_deref(),
-                        Some("apple-terminal") | Some("iterm2")
-                    ),
+                focusable: match r.terminal.as_deref() {
+                    Some("apple-terminal") | Some("iterm2") => r.pid.is_some(),
+                    Some("windows-terminal") => r.launch_id.is_some(),
+                    _ => false,
+                },
+                forkable: r
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|cwd| std::path::Path::new(cwd).is_dir())
+                    && crate::integrations::agent_launch::fork_readiness(r.kind).ready
+                    && crate::agents::transcript_full::transcript_mtime(r.kind, &r.session_id)
+                        .is_some(),
                 pid: r.pid,
+                launch_id: r.launch_id.clone(),
             })
             .collect()
     }
@@ -784,6 +1004,7 @@ impl AgentRegistry {
         for r in inner.ended.iter() {
             list.push(r.clone());
         }
+        drop(inner);
         // Inject transient turn/tool state and replace persisted completed time with the effective
         // cumulative value for the current snapshot.
         let now = now_secs();
@@ -808,6 +1029,17 @@ impl AgentRegistry {
                     if let Some(ts) = r.turn_started_at {
                         obj.insert("turnStartedAt".to_string(), serde_json::json!(ts));
                     }
+                    let fork_ready = r.state != AgentState::Ended
+                        && r.cwd
+                            .as_deref()
+                            .is_some_and(|cwd| std::path::Path::new(cwd).is_dir())
+                        && crate::integrations::agent_launch::fork_readiness(r.kind).ready
+                        && crate::agents::transcript_full::transcript_mtime(
+                            r.kind,
+                            &r.session_id,
+                        )
+                        .is_some();
+                    obj.insert("forkReady".to_string(), serde_json::json!(fork_ready));
                 }
                 v
             })
@@ -903,6 +1135,49 @@ mod tests {
             120,
         );
         assert_eq!(r.working_count(), 0);
+    }
+
+    #[test]
+    fn active_session_match_requires_exact_kind_for_every_agent_family() {
+        let r = reg();
+        for (index, kind) in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Cursor,
+            AgentKind::Grok,
+            AgentKind::Pi,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session_id = format!("session-{index}");
+            r.apply_event(
+                kind,
+                LifecycleEvent::SessionStart,
+                &session_id,
+                None,
+                None,
+                100 + index as u64,
+            );
+            assert!(r.has_active_session(kind, &session_id));
+            assert!(!r.has_active_session(AgentKind::Codex, "missing"));
+            let other_kind = if kind == AgentKind::Claude {
+                AgentKind::Codex
+            } else {
+                AgentKind::Claude
+            };
+            assert!(!r.has_active_session(other_kind, &session_id));
+        }
+        assert!(!r.has_active_session(AgentKind::Codex, ""));
+        r.apply_event(
+            AgentKind::Codex,
+            LifecycleEvent::SessionEnd,
+            "session-1",
+            None,
+            None,
+            200,
+        );
+        assert!(!r.has_active_session(AgentKind::Codex, "session-1"));
     }
 
     #[test]
@@ -1275,6 +1550,101 @@ mod tests {
         assert_ne!(withpid["state"], "ended");
     }
 
+    /// Resume 继承（spec agent-lifecycle-tracking 2026-07-25）：结束后同 session 事件再来 →
+    /// 复活原记录并延续累计时长/起点，不产生零时长新记录与已结束孪生。
+    #[test]
+    fn resumed_session_inherits_active_total() {
+        let r = reg();
+        r.apply_event(
+            AgentKind::Cursor,
+            LifecycleEvent::TurnStart,
+            "s",
+            None,
+            None,
+            100,
+        );
+        // 结束：冻结 100→400 = 300s。
+        r.apply_event(
+            AgentKind::Cursor,
+            LifecycleEvent::SessionEnd,
+            "s",
+            None,
+            None,
+            400,
+        );
+        // 事件再来（resume）：复活原记录。
+        r.apply_event(
+            AgentKind::Cursor,
+            LifecycleEvent::TurnStart,
+            "s",
+            None,
+            None,
+            1000,
+        );
+        r.apply_event(
+            AgentKind::Cursor,
+            LifecycleEvent::TurnEnd,
+            "s",
+            None,
+            None,
+            1600,
+        );
+        let arr = r.snapshot();
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "复活而非孪生");
+        assert_eq!(arr[0]["state"], "idle");
+        assert_eq!(arr[0]["startedAt"], 100);
+        assert_eq!(arr[0]["activeElapsedSecs"], 900); // 300 + 600
+    }
+
+    /// 「已结束孪生」并账：活动记录吸收全部孪生；纯已结束孪生合并到最新一条。
+    #[test]
+    fn merge_ended_twins_folds_totals() {
+        let mk = |sid: &str, elapsed: u64, started: u64, ended_at: u64| AgentRecord {
+            seq: 0,
+            kind: AgentKind::Cursor,
+            session_id: sid.into(),
+            pid: None,
+            title: None,
+            cwd: None,
+            transcript_path: None,
+            forked_from_session_id: None,
+            launch_id: None,
+            started_at: started,
+            last_activity: ended_at,
+            active_elapsed_secs: elapsed,
+            active_since: None,
+            state: AgentState::Ended,
+            ended_at: Some(ended_at),
+            terminal: None,
+            current_tool: None,
+            turn_steps: 0,
+            turn_started_at: None,
+        };
+        let mut active = vec![AgentRecord {
+            state: AgentState::Working,
+            ended_at: None,
+            active_elapsed_secs: 500,
+            started_at: 5_000,
+            ..mk("a", 0, 5_000, 0)
+        }];
+        let mut ended: VecDeque<AgentRecord> = VecDeque::from(vec![
+            mk("a", 1_000, 1_000, 2_000),
+            mk("a", 2_000, 2_500, 4_000),
+            mk("b", 700, 100, 900),
+            mk("b", 300, 1_000, 2_000),
+        ]);
+        merge_ended_twins(&mut active, &mut ended);
+        // 活动记录吸收两条 a 孪生：500+1000+2000，起点取最早。
+        assert_eq!(active[0].active_elapsed_secs, 3_500);
+        assert_eq!(active[0].started_at, 1_000);
+        // b 的两条合并为一条：时长求和、结束时刻取最新。
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].active_elapsed_secs, 1_000);
+        assert_eq!(ended[0].started_at, 100);
+        assert_eq!(ended[0].ended_at, Some(2_000));
+    }
+
     #[test]
     fn ended_capped_at_ten() {
         let r = reg();
@@ -1323,6 +1693,51 @@ mod tests {
             1,
         );
         assert!(r.touch_activity(AgentKind::Claude, "s1", Some(9)));
+    }
+
+    #[test]
+    fn fork_parent_is_persisted_in_child_snapshot() {
+        let r = reg();
+        r.apply_event(
+            AgentKind::Claude,
+            LifecycleEvent::TurnStart,
+            "child-session",
+            None,
+            None,
+            1,
+        );
+        assert!(r.set_fork_parent("child-session", "parent-session"));
+        assert!(!r.set_fork_parent("child-session", "parent-session"));
+        assert!(!r.set_fork_parent("child-session", "child-session"));
+        let snapshot = r.snapshot();
+        assert_eq!(
+            snapshot[0]["forkedFromSessionId"],
+            serde_json::json!("parent-session")
+        );
+    }
+
+    #[test]
+    fn launch_identity_is_validated_stable_and_exposed_for_focus() {
+        let r = reg();
+        r.apply_event(
+            AgentKind::Codex,
+            LifecycleEvent::TurnStart,
+            "launched-session",
+            Some(42),
+            None,
+            1,
+        );
+        assert!(!r.set_launch_id("launched-session", "not-a-uuid"));
+        let launch_id = "123e4567-e89b-12d3-a456-426614174000";
+        assert!(r.set_launch_id("launched-session", launch_id));
+        assert!(!r.set_launch_id("launched-session", launch_id));
+        assert!(!r.set_launch_id("launched-session", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
+        assert_eq!(
+            r.focus_identity("launched-session"),
+            Some((AgentKind::Codex, Some(42), Some(launch_id.to_string())))
+        );
+        let snapshot = r.snapshot();
+        assert_eq!(snapshot[0]["launchId"], serde_json::json!(launch_id));
     }
 
     #[test]

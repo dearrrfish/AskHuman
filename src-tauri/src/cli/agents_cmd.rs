@@ -13,7 +13,7 @@ use crate::integrations::{
 use serde_json::Value;
 use std::process::exit;
 
-const AGENTS: [&str; 4] = ["cursor", "claude", "codex", "grok"];
+const AGENTS: [&str; 5] = ["cursor", "claude", "codex", "grok", "pi"];
 
 pub fn dispatch(args: &[String], lang: Lang) {
     // 无子命令 → 打印 help（与 channel/config 一致；不再默认开状态窗口）。
@@ -26,6 +26,7 @@ pub fn dispatch(args: &[String], lang: Lang) {
         "permission" => permission_cmd(rest, lang),
         "stop" => stop_cmd(rest, lang),
         "lifecycle" => lifecycle_cmd(rest, lang),
+        "cleanup" => cleanup_cmd(rest, lang),
         "install" | "uninstall" => Err(legacy_write_error(sub, lang)),
         "show" => show(rest, lang),
         "help" | "-h" | "--help" => {
@@ -50,48 +51,38 @@ fn monitor(args: &[String], lang: Lang) -> Result<(), String> {
     let json = args.iter().any(|a| a == "--json");
     let text = args.iter().any(|a| a == "--text");
 
-    #[cfg(unix)]
-    {
-        if !json && !text && gui_available() {
-            // 彻底路由到统一 GUI 宿主（全局单窗，spec D3）：宿主在则聚焦/新建 Agent 窗口、不在则拉起。
-            if crate::gui_host::host_open(crate::gui_host::WindowKind::Agents, false, None, None)
-                .is_ok()
-            {
-                exit(0);
-            }
-            // 兜底（宿主起不来）：本进程直接建窗。run_agents 进入事件循环并不会返回（-> !）。
-            crate::app::run_agents(crate::config::AppConfig::load_without_secrets());
+    if !json && !text && gui_available() {
+        if crate::gui_host::host_open(crate::gui_host::WindowKind::Agents, false, None, None, None)
+            .is_ok()
+        {
+            exit(0);
         }
-        match cfgio::block_on(crate::client::request_agents_snapshot()) {
-            Some(v) if json => {
-                print_line(&serde_json::to_string_pretty(&v).unwrap_or_default());
-                Ok(())
-            }
-            Some(v) => {
-                print_line(&render_text(&v, lang));
-                Ok(())
-            }
-            None => Err(cfgio::t(lang, "daemon not running", "daemon 未运行")),
-        }
+        crate::app::run_agents(crate::config::AppConfig::load_without_secrets());
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (json, text);
-        Err(cfgio::t(
-            lang,
-            "agents monitor requires the daemon (unsupported on this platform)",
-            "agents monitor 依赖 daemon（当前平台暂不支持）",
-        ))
+    match cfgio::block_on(crate::client::request_agents_snapshot()) {
+        Some(v) if json => {
+            print_line(&serde_json::to_string_pretty(&v).unwrap_or_default());
+            Ok(())
+        }
+        Some(v) => {
+            print_line(&render_text(&v, lang));
+            Ok(())
+        }
+        None => Err(cfgio::t(lang, "daemon not running", "daemon 未运行")),
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn gui_available() -> bool {
     true
 }
 #[cfg(all(unix, not(target_os = "macos")))]
 fn gui_available() -> bool {
     std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+#[cfg(not(any(unix, windows)))]
+fn gui_available() -> bool {
+    false
 }
 
 /// 把快照（AgentRecord 数组）渲染为分组文本：工作中 / 空闲 / 已结束。
@@ -182,8 +173,8 @@ fn mode_cmd(args: &[String], lang: Lang) -> Result<(), String> {
     let target = AgentTarget::parse(agent).ok_or_else(|| {
         cfgio::t(
             lang,
-            &format!("unknown agent: {agent} (expected cursor|claude|codex|grok)"),
-            &format!("未知 agent: {agent}（应为 cursor|claude|codex|grok）"),
+            &format!("unknown agent: {agent} (expected cursor|claude|codex|grok|pi)"),
+            &format!("未知 agent: {agent}（应为 cursor|claude|codex|grok|pi）"),
         )
     })?;
     let kind = AgentKind::parse(agent).unwrap();
@@ -278,8 +269,8 @@ fn parse_target(agent: &str, lang: Lang) -> Result<AgentTarget, String> {
     AgentTarget::parse(agent).ok_or_else(|| {
         cfgio::t(
             lang,
-            &format!("unknown agent: {agent} (expected cursor|claude|codex|grok)"),
-            &format!("未知 agent: {agent}（应为 cursor|claude|codex|grok）"),
+            &format!("unknown agent: {agent} (expected cursor|claude|codex|grok|pi)"),
+            &format!("未知 agent: {agent}（应为 cursor|claude|codex|grok|pi）"),
         )
     })
 }
@@ -387,8 +378,8 @@ fn stop_cmd(args: &[String], lang: Lang) -> Result<(), String> {
     if !agent_stop::supported(kind) {
         return Err(cfgio::t(
             lang,
-            "Stop confirmation is supported only for claude, codex, and cursor on Unix",
-            "结束确认仅在 Unix 上支持 claude、codex 与 cursor",
+            "Stop confirmation is supported only for claude, codex, and cursor",
+            "结束确认仅支持 claude、codex 与 cursor",
         ));
     }
     if let Some(value) = args.get(1) {
@@ -434,9 +425,14 @@ fn lifecycle_cmd(args: &[String], lang: Lang) -> Result<(), String> {
     }
     let status = agent_lifecycle::status(kind);
     print_line(&format!(
-        "[{agent}] {}{}",
-        if status.installed { "on" } else { "off" },
-        if status.outdated {
+        "[{agent}] {}; {}{}",
+        if status.enabled { "on" } else { "off" },
+        if status.installed {
+            cfgio::t(lang, "configured", "已配置")
+        } else {
+            cfgio::t(lang, "not configured", "未配置")
+        },
+        if status.needs_update {
             cfgio::t(lang, " (needs update)", "（需更新）")
         } else {
             String::new()
@@ -445,11 +441,44 @@ fn lifecycle_cmd(args: &[String], lang: Lang) -> Result<(), String> {
     Ok(())
 }
 
+fn cleanup_cmd(args: &[String], lang: Lang) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err(cfgio::t(
+            lang,
+            "usage: agents cleanup",
+            "用法: agents cleanup",
+        ));
+    }
+
+    let mut errors = Vec::new();
+    for (target, kind) in [
+        (AgentTarget::Cursor, AgentKind::Cursor),
+        (AgentTarget::ClaudeCode, AgentKind::Claude),
+        (AgentTarget::Codex, AgentKind::Codex),
+        (AgentTarget::Grok, AgentKind::Grok),
+        (AgentTarget::Pi, AgentKind::Pi),
+    ] {
+        if let Err(error) = agent_mode::set(target, agent_mode::Mode::None) {
+            errors.push(format!("{} integration: {error}", kind.label()));
+        }
+    }
+    if errors.is_empty() {
+        print_line(&cfgio::t(
+            lang,
+            "Removed all AskHuman-managed Agent integrations.",
+            "已移除全部由 AskHuman 托管的 Agent 集成。",
+        ));
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
 fn legacy_write_error(command: &str, lang: Lang) -> String {
     cfgio::t(
         lang,
-        &format!("agents {command} was removed; use `agents mode <agent> <cli|mcp|none>`, `agents update [agent]`, or the independent permission/lifecycle commands"),
-        &format!("agents {command} 已移除；请改用 `agents mode <agent> <cli|mcp|none>`、`agents update [agent]` 或独立的 permission/lifecycle 命令"),
+        &format!("agents {command} was removed; use `agents mode <agent> <cli|mcp|none>`, `agents update [agent]`, or an integration capability command"),
+        &format!("agents {command} 已移除；请改用 `agents mode <agent> <cli|mcp|none>`、`agents update [agent]` 或集成内 capability 命令"),
     )
 }
 
@@ -470,10 +499,13 @@ fn show(args: &[String], lang: Lang) -> Result<(), String> {
         _ => AGENTS.to_vec(),
     };
 
-    // 参考提示词：单独查看 Grok 时给「skill 正文」（其指令载体是 skill、非 shell 版规则），
-    // 其余（含默认列出全部）沿用共享的 CLI 参考正文。
+    // Show the target-specific body for a single agent. The all-agent view keeps the generic
+    // reference because one shared block cannot represent Codex and non-Codex scope rules.
     if targets == ["grok"] {
         print_line(&crate::prompts::grok_skill_body());
+    } else if targets.len() == 1 {
+        let kind = AgentKind::parse(targets[0]).unwrap();
+        print_line(&crate::prompts::cli_reference_for(kind));
     } else {
         print_line(&crate::prompts::cli_reference());
     }
@@ -538,12 +570,20 @@ fn show(args: &[String], lang: Lang) -> Result<(), String> {
                 &upd,
             ),
             AgentTarget::Codex | AgentTarget::Grok => na.clone(),
+            AgentTarget::Pi => hook_state(
+                agent_mode::timeout_hook_is_installed(target),
+                agent_mode::timeout_hook_needs_update(target),
+                &yes,
+                &no,
+                &upd,
+            ),
         };
-        print_line(&format!(
-            "  {}: {}",
-            cfgio::t(lang, "timeout hook", "超时 hook"),
-            hook
-        ));
+        let hook_label = if target == AgentTarget::Pi {
+            cfgio::t(lang, "runtime extension", "运行时 Extension")
+        } else {
+            cfgio::t(lang, "timeout hook", "超时 hook")
+        };
+        print_line(&format!("  {}: {}", hook_label, hook));
 
         let permission = agent_permission::status(target);
         let permission_text = if !permission.supported {
@@ -580,7 +620,9 @@ fn show(args: &[String], lang: Lang) -> Result<(), String> {
         ));
 
         // MCP 配置（用户级全局）
-        let mcp = if mcp_config::is_installed(target) {
+        let mcp = if !mcp_config::supported(target) {
+            na.clone()
+        } else if mcp_config::is_installed(target) {
             format!(
                 "{yes}{}",
                 if mcp_config::needs_update(target) {
@@ -592,36 +634,40 @@ fn show(args: &[String], lang: Lang) -> Result<(), String> {
         } else {
             no.clone()
         };
-        print_line(&format!(
-            "  {}: {} — {}",
-            cfgio::t(lang, "mcp config", "MCP 配置"),
-            mcp,
-            mcp_config::display_path(target)
-        ));
+        if mcp_config::supported(target) {
+            print_line(&format!(
+                "  {}: {} — {}",
+                cfgio::t(lang, "mcp config", "MCP 配置"),
+                mcp,
+                mcp_config::display_path(target)
+            ));
+        } else {
+            print_line(&format!(
+                "  {}: {}",
+                cfgio::t(lang, "mcp config", "MCP 配置"),
+                mcp
+            ));
+        }
 
-        // Lifecycle（实验性）
+        // Lifecycle capability owned by the active automatic integration.
         let st = agent_lifecycle::status(kind);
         let lc = if !st.supported {
             na.clone()
-        } else if st.installed {
+        } else {
             format!(
-                "{yes}{}",
-                if st.outdated {
+                "{}; {}{}",
+                if st.enabled { "on" } else { "off" },
+                if st.installed { &yes } else { &no },
+                if st.needs_update {
                     upd.clone()
                 } else {
                     String::new()
                 }
             )
-        } else {
-            no.clone()
         };
         print_line(&format!(
             "  {}: {}",
-            cfgio::t(
-                lang,
-                "lifecycle hook (experimental)",
-                "生命周期 hook（实验性）"
-            ),
+            cfgio::t(lang, "lifecycle tracking", "生命周期追踪"),
             lc
         ));
         print_line("");
@@ -640,31 +686,35 @@ fn hook_state(installed: bool, needs_update: bool, yes: &str, no: &str, upd: &st
 fn help(lang: Lang) -> String {
     cfgio::t(
         lang,
-        "AskHuman agents — agent status + integrations (cursor | claude | codex | grok)\n\
+        "AskHuman agents — agent status + integrations (cursor | claude | codex | grok | pi)\n\
 \n\
   agents monitor [--json|--text]     Live agent status (opens a window when a GUI is available)\n\
   agents mode <agent> [none|cli|mcp] Switch the integration mode (omit to query); auto-swaps products\n\
   agents update [<agent>]            Refresh each current mode's complete managed bundle\n\
   agents permission <claude|codex> [on|off]  Query or set permission approval\n\
-  agents stop <claude|codex|cursor> [on|off]  Query or set Stop confirmation\n\
-  agents lifecycle <agent> [on|off]  Query or set lifecycle tracking\n\
+  agents stop <claude|codex|cursor|pi> [on|off]  Query or set Stop confirmation\n\
+  agents lifecycle <agent> [on|off]  Query or set lifecycle tracking inside an active integration\n\
+  agents cleanup                     Remove every AskHuman-managed Agent artifact\n\
   agents show [<agent>]              Manual-integration prompt + paste paths + install status\n\
 \n\
-  Modes: cli = rules + timeout hook;  mcp = rules/skill + MCP server config;  none = remove.\n\
+  Modes: cli = rules + runtime + default-on lifecycle; mcp = rules/skill + MCP + default-on lifecycle; none = remove.\n\
   Grok only supports none | mcp (skill + MCP config); it has no CLI mode and no timeout hook.\n\
+  Pi only supports none | cli; its runtime artifact is a managed Extension and Stop defaults on.\n\
   Legacy install/uninstall and per-artifact write flags have been removed.",
-        "AskHuman agents —— agent 状态 + 集成（cursor | claude | codex | grok）\n\
+        "AskHuman agents —— agent 状态 + 集成（cursor | claude | codex | grok | pi）\n\
 \n\
   agents monitor [--json|--text]     实时 agent 状态（有 GUI 时开窗）\n\
   agents mode <agent> [none|cli|mcp] 切换集成模式（省略则查询）；自动切换底层产物\n\
   agents update [<agent>]            更新当前模式的完整托管产物包\n\
   agents permission <claude|codex> [on|off]  查询或设置权限审批\n\
-  agents stop <claude|codex|cursor> [on|off]  查询或设置结束确认\n\
-  agents lifecycle <agent> [on|off]  查询或设置生命周期追踪\n\
+  agents stop <claude|codex|cursor|pi> [on|off]  查询或设置结束确认\n\
+  agents lifecycle <agent> [on|off]  查询或设置已启用集成内的生命周期追踪\n\
+  agents cleanup                     移除全部由 AskHuman 托管的 Agent 产物\n\
   agents show [<agent>]              手动集成提示词 + 粘贴位置 + 安装状态\n\
 \n\
-  模式: cli = 规则 + 超时 hook；mcp = 规则/skill + MCP server 配置；none = 移除。\n\
+  模式: cli = 规则 + runtime + 默认开启的生命周期；mcp = 规则/skill + MCP + 默认开启的生命周期；none = 移除。\n\
   Grok 仅支持 none | mcp（skill + MCP 配置）；无 CLI 模式、无超时 hook。\n\
+  Pi 仅支持 none | cli；运行时产物为托管 Extension，Stop 默认开启。\n\
   旧 install/uninstall 与逐产物写 flags 已移除。",
     )
 }

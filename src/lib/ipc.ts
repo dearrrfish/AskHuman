@@ -18,9 +18,15 @@ import type {
   ClaudeHookStatus,
   HistoryEntry,
   HistoryInit,
+  HistorySessionTitleRequest,
+  HistorySessionTitleResult,
   HookStatus,
   InterjectInit,
+  InterjectPending,
   LifecycleStatus,
+  NewTaskInit,
+  NewTaskProject,
+  ForkTaskInit,
   PopupInit,
   PermissionDiffModel,
   PopupSoundSupport,
@@ -38,10 +44,14 @@ import type {
   SlackWaitArgs,
   TelegramTestArgs,
   ThemeMode,
+  DiffFileView,
+  DiffStatPage,
+  ImageAttachment,
   TodoDoneEntry,
   TodoEntry,
   TodoProjectInfo,
   TodosInit,
+  TranscriptPage,
   UpdateInfo,
   WindowEffect,
 } from "./types";
@@ -63,7 +73,7 @@ export const popupAgentTerminal = (pid: number) =>
 export const popupAgentResolved = () =>
   invoke<PushedAgent>("popup_agent_resolved");
 
-/** 方案6：预热弹窗把本次请求内容绘制完成后调用，让后端把隐藏的窗口上屏（延后 show，杜绝闪现）。 */
+/** Report that popup content is ready; daemon authorizes foreground or background presentation. */
 export const popupShowWindow = () => invoke<void>("popup_show_window");
 
 export const submitPopup = (submission: PopupSubmission) =>
@@ -109,16 +119,17 @@ export const agentTaskWorkspaces = (refresh = false) =>
   invoke<AgentTaskWorkspace[]>("agent_task_workspaces", { refresh });
 export const agentTaskWorkspaceAdd = (path: string) =>
   invoke<AgentTaskWorkspace>("agent_task_workspace_add", { path });
-export const agentTaskWorkspacePick = () =>
-  invoke<string | null>("agent_task_workspace_pick");
 export const agentTaskWorkspacePin = (path: string, pinned: boolean) =>
   invoke<void>("agent_task_workspace_pin", { path, pinned });
 export const agentTaskWorkspaceHide = (path: string, hidden: boolean) =>
   invoke<void>("agent_task_workspace_hide", { path, hidden });
 export const agentTaskWorkspaceForget = (path: string) =>
   invoke<void>("agent_task_workspace_forget", { path });
-export const agentTaskReadiness = () =>
-  invoke<AgentTaskReadiness[]>("agent_task_readiness");
+export const agentTaskReadiness = (opts?: { kind?: AgentKind; force?: boolean }) =>
+  invoke<AgentTaskReadiness[]>(
+    "agent_task_readiness",
+    opts ? { kind: opts.kind, force: opts.force } : undefined,
+  );
 export const agentTaskTestTerminal = () =>
   invoke<void>("agent_task_test_terminal");
 
@@ -149,6 +160,9 @@ export const updateTheme = (theme: ThemeMode) =>
 export const openSettings = (tab?: string) =>
   invoke<void>("open_settings", { tab: tab ?? null });
 
+/** 打开 Agent Window 并定位到 daemon 为当前弹窗严格匹配的会话。 */
+export const openAgentConsole = () => invoke<void>("open_agent_console");
+
 export const popupImTipVisible = () =>
   invoke<boolean>("popup_im_tip_visible");
 
@@ -164,6 +178,47 @@ export const agentsInit = () => invoke<AgentsInit>("agents_init");
 export const agentsStartSubscription = () =>
   invoke<void>("agents_start_subscription");
 
+// ===== Agent 控制台（spec gui-agent-console）=====
+
+/** 控制台焦点会话（C8）：daemon 对焦点会话按签名推 `agent-detail` 帧；null＝取消焦点。 */
+export const agentsFocus = (sessionId: string | null) =>
+  invoke<void>("agents_focus", { sessionId });
+
+/** 「去回答」（C7）：请求 daemon 聚焦对应请求的弹窗（托盘同款链路）。 */
+export const focusRequest = (requestId: string) =>
+  invoke<void>("focus_request", { requestId });
+
+/** 控制台输入框发消息（C3 追加语义，同 IM /msg）。 */
+export const interjectAppend = (
+  sessionId: string,
+  text: string,
+  filePaths: string[] = [],
+  pastedImages: ImageAttachment[] = [],
+) => invoke<void>("interject_append", { sessionId, text, filePaths, pastedImages });
+
+/** 待送达气泡内容查询；daemon 未运行时返回空状态。 */
+export const interjectPeek = (sessionId: string) =>
+  invoke<InterjectPending>("interject_peek", { sessionId });
+
+/** 完整会话分页（C14）：`before` 为事件绝对下标游标（null＝末尾），每页默认 200 条。 */
+export const consoleTranscript = (
+  kind: string,
+  sessionId: string,
+  before: number | null,
+) => invoke<TranscriptPage>("console_transcript", { kind, sessionId, before, limit: null });
+
+/** 项目未暂存变更统计（C15 第一级）。busy/超时以 Err 返回，调用方跳过本次刷新。 */
+export const consoleDiffStat = (project: string) =>
+  invoke<DiffStatPage>("console_diff_stat", { project });
+
+/** 单文件 hunk 视图（C15 第二级，展开时才调）。 */
+export const consoleDiffFile = (project: string, path: string) =>
+  invoke<DiffFileView>("console_diff_file", { project, path });
+
+/** 暂存指定路径（单文件与全部共用），返回实际暂存数。 */
+export const consoleStage = (project: string, paths: string[]) =>
+  invoke<number>("console_stage", { project, paths });
+
 export const getHistory = (project: string | null, all: boolean) =>
   invoke<HistoryEntry[]>("get_history", { project, all });
 
@@ -175,8 +230,17 @@ export const historyCount = () => invoke<number>("history_count");
 export const trimHistory = (limit: number) =>
   invoke<number>("trim_history", { limit });
 
-export const clearHistory = (all: boolean, project: string | null) =>
-  invoke<void>("clear_history", { all, project });
+export const deleteHistoryEntries = (ids: string[]) =>
+  invoke<number>("delete_history_entries", { ids });
+
+export const clearAllHistory = () => invoke<number>("clear_all_history");
+
+export const resolveHistorySessionTitles = (
+  requests: HistorySessionTitleRequest[]
+) =>
+  invoke<HistorySessionTitleResult[]>("resolve_history_session_titles", {
+    requests,
+  });
 
 export const applyWindowEffect = (effect: WindowEffect) =>
   invoke<void>("apply_window_effect", { effect });
@@ -250,6 +314,9 @@ export const agentPermissionSet = (agent: AgentId, enabled: boolean) =>
 export const agentStopSet = (agent: AgentId, enabled: boolean) =>
   invoke<void>("agent_stop_set", { agent, enabled });
 
+export const agentAskQuestionSet = (agent: AgentId, enabled: boolean) =>
+  invoke<void>("agent_ask_question_set", { agent, enabled });
+
 export const mcpConfigReveal = (agent: AgentId) =>
   invoke<void>("mcp_config_reveal", { agent });
 
@@ -273,9 +340,11 @@ export const agentLifecycleInstall = (agent: AgentKind) =>
 export const agentLifecycleUninstall = (agent: AgentKind) =>
   invoke<string>("agent_lifecycle_uninstall", { agent });
 
-/** 聚焦某 Agent 所在终端（v1 仅 macOS / Terminal.app）。失败抛错由调用方静默处理。 */
-export const focusAgentTerminal = (pid: number) =>
-  invoke<void>("focus_agent_terminal", { pid });
+/** Focus the exact registered terminal surface. Failures are handled silently by callers. */
+export const focusAgentTerminal = (
+  pid?: number | null,
+  launchId?: string | null
+) => invoke<void>("focus_agent_terminal", { pid, launchId });
 
 /** 手动把某 agent 置为「空闲」（纠正漏 hook 卡「工作中」）。即发即走，daemon 改后推回新快照。 */
 export const agentForceIdle = (sessionId: string) =>
@@ -293,8 +362,12 @@ export const interjectInit = (sessionId: string) =>
   invoke<InterjectInit>("interject_init", { sessionId });
 
 /** 提交插话（整体覆盖待送达队列；空文本＝清空），随后后端关连接、关窗口。 */
-export const interjectSubmit = (sessionId: string, text: string) =>
-  invoke<void>("interject_submit", { sessionId, text });
+export const interjectSubmit = (
+  sessionId: string,
+  text: string,
+  filePaths: string[] = [],
+  pastedImages: ImageAttachment[] = [],
+) => invoke<void>("interject_submit", { sessionId, text, filePaths, pastedImages });
 
 /** 取消插话（队列不动），后端关连接、关窗口。 */
 export const interjectCancel = (sessionId: string) =>
@@ -352,6 +425,8 @@ export const updateGetVersionNotes = (version: string) =>
 
 export const updateApply = () => invoke<void>("update_apply");
 
+export const updatePrepare = () => invoke<void>("update_prepare");
+
 export const updateDismiss = (version: string) =>
   invoke<void>("update_dismiss", { version });
 
@@ -369,8 +444,69 @@ export const popupUpdateState = () =>
 export const todosList = (project: string) =>
   invoke<TodoEntry[]>("todos_list", { project });
 
-export const todosAdd = (project: string, text: string, auto = false) =>
-  invoke<TodoEntry | null>("todos_add", { project, text, auto });
+export const todosAdd = (
+  project: string,
+  text: string,
+  auto = false,
+  filePaths: string[] = [],
+  pastedImages: ImageAttachment[] = []
+) =>
+  invoke<TodoEntry>("todos_add", {
+    project,
+    text,
+    auto,
+    filePaths,
+    pastedImages,
+  });
+
+export const todosUpdate = (
+  project: string,
+  id: string,
+  expectedText: string,
+  expectedAttachmentIds: string[],
+  text: string,
+  keepAttachmentIds: string[],
+  addPaths: string[]
+) =>
+  invoke<TodoEntry>("todos_update", {
+    project,
+    id,
+    expectedText,
+    expectedAttachmentIds,
+    text,
+    keepAttachmentIds,
+    addPaths,
+  });
+
+export const todosUpdateAttachments = (
+  project: string,
+  id: string,
+  addPaths: string[] = [],
+  removeAttachmentIds: string[] = []
+) =>
+  invoke<TodoEntry>("todos_update_attachments", {
+    project,
+    id,
+    addPaths,
+    removeAttachmentIds,
+  });
+
+export const todosAttachPastedImages = (
+  project: string,
+  id: string,
+  images: ImageAttachment[]
+) => invoke<TodoEntry>("todos_attach_pasted_images", { project, id, images });
+
+export const todoAttachmentThumbnail = (
+  project: string,
+  todoId: string,
+  attachmentId: string
+) =>
+  invoke<string | null>("todo_attachment_thumbnail", {
+    project,
+    todoId,
+    attachmentId,
+  });
 
 /** 切换自动执行标记；返回新状态（条目不存在返回 null）。 */
 export const todosSetAuto = (project: string, id: string, auto: boolean) =>
@@ -420,3 +556,58 @@ export const todosProjectsEnriched = () =>
 /** 打开（或聚焦）项目待办窗口（经统一宿主路由，全局单窗）；`dir` 为预选项目定位目录。 */
 export const openTodos = (dir: string | null) =>
   invoke<void>("open_todos", { dir });
+
+// ===== 「新建 Agent 任务」窗口（spec gui-agent-task-launch）=====
+
+/** 打开（或聚焦）新建任务窗口；可带预选项目 key 与待办 id（待办行入口）。 */
+export const openNewTask = (project?: string | null, todo?: string | null) =>
+  invoke<void>("open_new_task", { project: project ?? null, todo: todo ?? null });
+
+/** 新建任务窗口初始化：主题 + 语言 + 提交快捷键 + 权限选择方式。 */
+export const newTaskInit = () => invoke<NewTaskInit>("new_task_init");
+
+/** 项目候选（本地快路径：workspace 索引 + 待办项目）。 */
+export const newTaskProjects = () =>
+  invoke<NewTaskProject[]>("new_task_projects");
+
+/** 项目候选（含五家有界冷扫描合并）；首屏后后台调用。 */
+export const newTaskProjectsRefreshed = () =>
+  invoke<NewTaskProject[]>("new_task_projects_refreshed");
+
+/** 目录 → 项目 key（git 根，回退自身）；按所选 workspace 读取所属项目待办。 */
+export const projectKeyOf = (dir: string) =>
+  invoke<string>("project_key_of", { dir });
+
+/** Start a task through the private LaunchRecord and platform-terminal bridge. */
+export const newTaskLaunch = (payload: {
+  workspace: string;
+  kind: string;
+  permission: "agent-default" | "yolo";
+  task: string;
+  todoProject?: string | null;
+  todoId?: string | null;
+  todoAttachments?: import("./types").TodoAttachmentSnapshot[];
+}) =>
+  invoke<void>("new_task_launch", {
+    workspace: payload.workspace,
+    kind: payload.kind,
+    permission: payload.permission,
+    task: payload.task,
+    todoProject: payload.todoProject ?? null,
+    todoId: payload.todoId ?? null,
+    todoAttachments: payload.todoAttachments ?? [],
+  });
+
+// ===== Native Agent session Fork =====
+
+export const openForkTask = (session: string) =>
+  invoke<void>("open_fork_task", { session });
+
+export const forkTaskInit = (session: string) =>
+  invoke<ForkTaskInit>("fork_task_init", { session });
+
+export const forkTaskLaunch = (payload: {
+  session: string;
+  permission: "agent-default" | "yolo";
+  task: string;
+}) => invoke<void>("fork_task_launch", payload);

@@ -7,7 +7,9 @@
     "core:default",
     "core:window:allow-start-dragging",
     "core:window:allow-set-always-on-top",
+    "core:window:allow-close",
     "drag:default",
+    "dialog:allow-open",
     "liquid-glass:default"
   ]
 }

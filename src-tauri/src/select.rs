@@ -44,6 +44,8 @@ pub enum SelectAction {
     TaskWorkspace,
     TaskAgent,
     TaskPermission,
+    TaskInputSource,
+    Fork,
     Watch,
     Status,
     Unwatch,
@@ -67,6 +69,8 @@ pub enum SelectAction {
     TodoAuto,
     /// 待办自动执行切换卡（选项＝待办条目，已自动的带 ⚡ 徽标；按钮「切换」，点击即开/关）。
     TodoAutoEntry,
+    /// `/yolo` 的会话选择卡（选项＝开着 YOLO 的 Codex 会话；按钮「关闭」，点击即关）。
+    Yolo,
 }
 
 impl SelectAction {
@@ -76,6 +80,8 @@ impl SelectAction {
             SelectAction::TaskWorkspace => "select.btnChoose",
             SelectAction::TaskAgent => "select.btnChoose",
             SelectAction::TaskPermission => "select.btnChoose",
+            SelectAction::TaskInputSource => "select.btnChoose",
+            SelectAction::Fork => "select.btnFork",
             SelectAction::Watch => "select.btnWatch",
             SelectAction::Status => "select.btnStatus",
             SelectAction::Unwatch => "select.btnUnwatch",
@@ -89,6 +95,7 @@ impl SelectAction {
             SelectAction::TodoRmEntry => "select.btnTodoRmEntry",
             SelectAction::TodoAuto => "select.btnChoose",
             SelectAction::TodoAutoEntry => "select.btnTodoAutoEntry",
+            SelectAction::Yolo => "select.btnYoloOff",
         };
         i18n::tr(lang, key).to_string()
     }
@@ -156,6 +163,9 @@ pub fn title_watch(lang: Lang) -> String {
 pub fn title_status(lang: Lang) -> String {
     i18n::tr(lang, "select.titleStatus").to_string()
 }
+pub fn title_fork(lang: Lang) -> String {
+    i18n::tr(lang, "select.titleFork").to_string()
+}
 pub fn title_unwatch(lang: Lang) -> String {
     i18n::tr(lang, "select.titleUnwatch").to_string()
 }
@@ -176,6 +186,9 @@ pub fn title_todo(lang: Lang) -> String {
 }
 pub fn title_todo_rm(lang: Lang) -> String {
     i18n::tr(lang, "select.titleTodoRm").to_string()
+}
+pub fn title_yolo(lang: Lang) -> String {
+    i18n::tr(lang, "select.titleYolo").to_string()
 }
 
 /// `/todo-rm` 逐条删除卡标题：`「<项目名>」的待办（点删除即移除）：`。
@@ -251,6 +264,14 @@ pub fn title_task_permission(lang: Lang) -> String {
     .to_string()
 }
 
+pub fn title_task_input_source(lang: Lang) -> String {
+    match lang {
+        Lang::En => "Choose a task source",
+        Lang::Zh => "选择任务来源",
+    }
+    .to_string()
+}
+
 /// Build one agent option from a registry snapshot. Cumulative active time comes precomputed in
 /// `activeElapsedSecs`; `now` remains in the shared call shape for compatibility with callers.
 fn option_from_record(
@@ -259,6 +280,7 @@ fn option_from_record(
     watching: &HashSet<String>,
     now: u64,
     lang: Lang,
+    fork_parent: Option<String>,
 ) -> SelectOption {
     let dot = match rec.get("state").and_then(|v| v.as_str()) {
         Some("working") => Some(SelectDot::Working),
@@ -282,7 +304,7 @@ fn option_from_record(
         primary: primary_text(rec, lang),
         badge,
         elapsed,
-        secondary: Some(title_text(rec, lang)),
+        secondary: Some(title_text(rec, fork_parent.as_deref(), lang)),
     }
 }
 
@@ -319,13 +341,35 @@ fn primary_text(rec: &Value, lang: Lang) -> String {
 }
 
 /// 次行标题（缺省 → noTitle）。
-fn title_text(rec: &Value, lang: Lang) -> String {
-    rec.get("title")
+fn title_text(rec: &Value, fork_parent: Option<&str>, lang: Lang) -> String {
+    let title = rec
+        .get("title")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| i18n::tr(lang, "autoChannel.noTitle").to_string())
+        .unwrap_or_else(|| i18n::tr(lang, "autoChannel.noTitle").to_string());
+    match fork_parent {
+        Some(parent) => format!(
+            "{} · {title}",
+            i18n::tr(lang, "watch.forkedFrom").replace("{id}", parent)
+        ),
+        None => title,
+    }
+}
+
+fn fork_parent_label(snapshot: &[Value], rec: &Value) -> Option<String> {
+    let parent_id = rec.get("forkedFromSessionId")?.as_str()?;
+    let parent_seq = snapshot.iter().find_map(|candidate| {
+        (candidate.get("sessionId").and_then(Value::as_str) == Some(parent_id))
+            .then(|| candidate.get("seq").and_then(Value::as_u64))
+            .flatten()
+    });
+    Some(
+        parent_seq
+            .map(|seq| format!("#{seq}"))
+            .unwrap_or_else(|| parent_id.chars().take(8).collect()),
+    )
 }
 
 /// 由注册表快照（`AgentRegistry::snapshot()` 的 Value 数组）组装 agent 选项：仅取「工作中 / 空闲」
@@ -354,7 +398,70 @@ pub fn agent_options(
         if sid.is_empty() {
             continue;
         }
-        bucket.push(option_from_record(rec, sid, watching, now, lang));
+        bucket.push(option_from_record(
+            rec,
+            sid,
+            watching,
+            now,
+            lang,
+            fork_parent_label(list, rec),
+        ));
+    }
+    working.extend(idle);
+    working
+}
+
+/// Native-fork candidates are active records whose Agent family passed the runtime capability
+/// probe and whose canonical working directory is still available.
+pub fn fork_options(
+    snapshot: &Value,
+    ready_kinds: &HashSet<crate::agents::AgentKind>,
+    now: u64,
+    lang: Lang,
+) -> Vec<SelectOption> {
+    let empty = Vec::new();
+    let list = snapshot.as_array().unwrap_or(&empty);
+    let mut working = Vec::new();
+    let mut idle = Vec::new();
+    for rec in list {
+        let bucket = match rec.get("state").and_then(Value::as_str) {
+            Some("working") => &mut working,
+            Some("idle") => &mut idle,
+            _ => continue,
+        };
+        let Some(kind) = rec
+            .get("kind")
+            .and_then(Value::as_str)
+            .and_then(crate::agents::AgentKind::parse)
+        else {
+            continue;
+        };
+        if !ready_kinds.contains(&kind) {
+            continue;
+        }
+        let Some(cwd) = rec.get("cwd").and_then(Value::as_str) else {
+            continue;
+        };
+        if !std::path::Path::new(cwd).is_dir() {
+            continue;
+        }
+        let sid = rec
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if sid.is_empty() || crate::agents::transcript_full::transcript_mtime(kind, &sid).is_none()
+        {
+            continue;
+        }
+        bucket.push(option_from_record(
+            rec,
+            sid,
+            &HashSet::new(),
+            now,
+            lang,
+            fork_parent_label(list, rec),
+        ));
     }
     working.extend(idle);
     working
@@ -383,7 +490,14 @@ pub fn watch_options(
         if sid.is_empty() {
             continue;
         }
-        out.push(option_from_record(rec, sid, watching, now, lang));
+        out.push(option_from_record(
+            rec,
+            sid,
+            watching,
+            now,
+            lang,
+            fork_parent_label(list, rec),
+        ));
     }
     out
 }
@@ -414,7 +528,14 @@ pub fn msg_options(
         if sid.is_empty() {
             continue;
         }
-        out.push(option_from_record(rec, sid, watching, now, lang));
+        out.push(option_from_record(
+            rec,
+            sid,
+            watching,
+            now,
+            lang,
+            fork_parent_label(list, rec),
+        ));
     }
     out
 }
@@ -432,7 +553,16 @@ pub fn agent_option_by_session(
         l.iter()
             .find(|r| r.get("sessionId").and_then(|v| v.as_str()) == Some(session_id))
     }) {
-        let mut opt = option_from_record(rec, session_id.to_string(), &HashSet::new(), now, lang);
+        let mut opt = option_from_record(
+            rec,
+            session_id.to_string(),
+            &HashSet::new(),
+            now,
+            lang,
+            snapshot
+                .as_array()
+                .and_then(|list| fork_parent_label(list, rec)),
+        );
         // 订阅侧的稳定展示编号优先（快照 seq 与订阅 seq 一致，缺省时兜底）。
         opt.seq = opt.seq.or(Some(seq));
         opt
@@ -446,6 +576,56 @@ pub fn agent_option_by_session(
             elapsed: None,
             secondary: Some(i18n::tr(lang, "autoChannel.noTitle").to_string()),
         }
+    }
+}
+
+/// 组装单个 YOLO 会话选项（`/yolo` 单选卡，spec codex-permission-remember D53）：按
+/// session_id 在快照定位记录，与其余 agent 卡同口径（主文本 = 类型 · 项目名，副文本 =
+/// 标题，圆点 / 编号 / 工作时长），外加 YOLO 徽标。不在册（agent 已结束，规则未过期仍可
+/// 关）时用注册表存档的 `(标题, 项目名)` 降级；YOLO 仅 Codex 会话，类型标签固定。
+pub fn yolo_option_by_session(
+    snapshot: &Value,
+    session_id: &str,
+    display: Option<(String, String)>,
+    now: u64,
+    lang: Lang,
+) -> SelectOption {
+    let badge = Some("YOLO".to_string());
+    if let Some(rec) = snapshot.as_array().and_then(|l| {
+        l.iter()
+            .find(|r| r.get("sessionId").and_then(|v| v.as_str()) == Some(session_id))
+    }) {
+        let mut opt = option_from_record(
+            rec,
+            session_id.to_string(),
+            &HashSet::new(),
+            now,
+            lang,
+            snapshot
+                .as_array()
+                .and_then(|list| fork_parent_label(list, rec)),
+        );
+        opt.badge = badge;
+        return opt;
+    }
+    let kind_label = crate::agents::AgentKind::Codex.label();
+    let (title, project) = display.unwrap_or_default();
+    SelectOption {
+        id: session_id.to_string(),
+        dot: None,
+        seq: None,
+        primary: if project.is_empty() {
+            kind_label.to_string()
+        } else {
+            format!("{kind_label} · {project}")
+        },
+        badge,
+        elapsed: None,
+        secondary: Some(if title.is_empty() {
+            i18n::tr(lang, "autoChannel.noTitle").to_string()
+        } else {
+            title
+        }),
     }
 }
 
@@ -463,6 +643,37 @@ mod tests {
             {"seq":2,"kind":"claude","sessionId":"s-work","state":"working","title":"忙着","cwd":"/tmp/api-server","activeElapsedSecs":360},
             {"seq":3,"kind":"codex","sessionId":"s-end","state":"ended","title":"完了","cwd":"/tmp/proj","activeElapsedSecs":100},
         ])
+    }
+
+    #[test]
+    fn yolo_option_matches_agent_card_shape_with_fallback() {
+        // 在册：与其余 agent 卡同口径（类型 · 项目 / 标题 / 圆点 / 编号）+ YOLO 徽标。
+        let opt = yolo_option_by_session(&snap(), "s-work", None, NOW, Lang::Zh);
+        assert_eq!(opt.primary, "Claude Code · api-server");
+        assert_eq!(opt.secondary.as_deref(), Some("忙着"));
+        assert_eq!(opt.dot, Some(SelectDot::Working));
+        assert_eq!(opt.seq, Some(2));
+        assert_eq!(opt.badge.as_deref(), Some("YOLO"));
+        // 不在册：注册表存档的 (标题, 项目名) 降级，类型标签固定 Codex。
+        let opt = yolo_option_by_session(
+            &snap(),
+            "s-gone",
+            Some(("修权限弹窗".to_string(), "my-proj".to_string())),
+            NOW,
+            Lang::Zh,
+        );
+        assert_eq!(opt.primary, "Codex · my-proj");
+        assert_eq!(opt.secondary.as_deref(), Some("修权限弹窗"));
+        assert_eq!(opt.dot, None);
+        assert_eq!(opt.seq, None);
+        assert_eq!(opt.badge.as_deref(), Some("YOLO"));
+        // 完全无存档信息：仅类型 + 无标题占位。
+        let opt = yolo_option_by_session(&snap(), "s-gone", None, NOW, Lang::Zh);
+        assert_eq!(opt.primary, "Codex");
+        assert_eq!(
+            opt.secondary.as_deref(),
+            Some(i18n::tr(Lang::Zh, "autoChannel.noTitle"))
+        );
     }
 
     #[test]
@@ -484,6 +695,26 @@ mod tests {
         assert_eq!(opts[1].elapsed, None);
         // 无徽标。
         assert!(opts[0].badge.is_none());
+    }
+
+    #[test]
+    fn agent_options_mark_forked_sessions_with_parent_sequence() {
+        let mut snapshot = snap();
+        snapshot.as_array_mut().unwrap().push(json!({
+            "seq": 4,
+            "kind": "codex",
+            "sessionId": "s-child",
+            "forkedFromSessionId": "s-work",
+            "state": "working",
+            "title": "忙着",
+            "cwd": "/tmp/api-server",
+            "activeElapsedSecs": 30
+        }));
+        let opts = agent_options(&snapshot, &HashSet::new(), NOW, Lang::Zh);
+        let child = opts.iter().find(|option| option.id == "s-child").unwrap();
+        assert_eq!(child.secondary.as_deref(), Some("从 #2 分叉 · 忙着"));
+        let parent = opts.iter().find(|option| option.id == "s-work").unwrap();
+        assert_eq!(parent.secondary.as_deref(), Some("忙着"));
     }
 
     #[test]
@@ -551,6 +782,7 @@ mod tests {
                 created_at_ms: 1,
                 agent_kind: None,
                 auto: false,
+                attachments: Vec::new(),
             },
             crate::todos::TodoEntry {
                 id: "id-b".into(),
@@ -558,6 +790,7 @@ mod tests {
                 created_at_ms: 2,
                 agent_kind: None,
                 auto: false,
+                attachments: Vec::new(),
             },
         ];
         let opts = todo_rm_options(&entries);
@@ -580,6 +813,7 @@ mod tests {
                 created_at_ms: 1,
                 agent_kind: None,
                 auto: true,
+                attachments: Vec::new(),
             },
             crate::todos::TodoEntry {
                 id: "id-b".into(),
@@ -587,6 +821,7 @@ mod tests {
                 created_at_ms: 2,
                 agent_kind: None,
                 auto: false,
+                attachments: Vec::new(),
             },
         ];
         let opts = todo_auto_options(&entries, Lang::Zh);

@@ -7,6 +7,7 @@ use super::DingTalkError;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
+use tokio::time::{self, Instant, Interval};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
@@ -14,6 +15,8 @@ pub const TOPIC_BOT_MESSAGE: &str = "/v1.0/im/bot/messages/get";
 pub const TOPIC_CARD_CALLBACK: &str = "/v1.0/card/instances/callback";
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 上抛给上层的事件（`data` 为已解析的 JSON）。
 pub enum StreamEvent {
@@ -30,6 +33,8 @@ pub struct StreamConn {
     client_secret: String,
     topics: Vec<String>,
     ws: Ws,
+    heartbeat: Interval,
+    awaiting_pong: bool,
 }
 
 impl StreamConn {
@@ -48,28 +53,58 @@ impl StreamConn {
             client_secret: client_secret.to_string(),
             topics,
             ws,
+            heartbeat: heartbeat_interval(),
+            awaiting_pong: false,
         })
     }
 
-    /// 收下一个业务事件；内部处理 SYSTEM ping / ACK / 断线重连。
-    /// 返回 `None` 表示重连多次仍失败（上层据此结束）。
+    /// 收下一个业务事件；内部处理 SYSTEM ping / ACK / 半开探测 / 断线重连。
+    ///
+    /// Reconnects indefinitely with capped exponential backoff, so this only returns `None` when
+    /// the caller aborts the task; in-flight cards stay valid across outages.
     pub async fn recv(&mut self) -> Option<StreamEvent> {
         loop {
-            match self.ws.next().await {
-                Some(Ok(Message::Text(txt))) => {
+            let frame = tokio::select! {
+                frame = self.ws.next() => Some(frame),
+                _ = self.heartbeat.tick() => None,
+            };
+            match frame {
+                None => {
+                    // A sleeping Mac or a network handoff can leave the TCP socket half-open:
+                    // REST sends keep working while this reader waits forever. Probe the WebSocket
+                    // explicitly and rebuild it when the previous probe received no response.
+                    if self.awaiting_pong
+                        || self
+                            .ws
+                            .send(Message::Ping(Vec::new().into()))
+                            .await
+                            .is_err()
+                    {
+                        eprintln!(
+                            "[dingtalk-stream] connection unresponsive to probes; reconnecting"
+                        );
+                        self.reconnect().await;
+                    } else {
+                        self.awaiting_pong = true;
+                    }
+                }
+                Some(Some(Ok(Message::Text(txt)))) => {
+                    self.awaiting_pong = false;
                     if let Some(ev) = self.handle_frame(txt.as_str()).await {
                         return Some(ev);
                     }
                 }
-                Some(Ok(Message::Ping(p))) => {
+                Some(Some(Ok(Message::Ping(p)))) => {
+                    self.awaiting_pong = false;
                     let _ = self.ws.send(Message::Pong(p)).await;
+                }
+                Some(Some(Ok(Message::Pong(_)))) => {
+                    self.awaiting_pong = false;
                 }
                 // Cannot collapse into a match guard: `.await` is not allowed there.
                 #[allow(clippy::collapsible_match)]
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                    if !self.reconnect().await {
-                        return None;
-                    }
+                Some(Some(Ok(Message::Close(_)))) | Some(Some(Err(_))) | Some(None) => {
+                    self.reconnect().await;
                 }
                 _ => {}
             }
@@ -137,11 +172,14 @@ impl StreamConn {
         let _ = self.ws.send(Message::Text(frame.to_string().into())).await;
     }
 
-    /// 断线重连：重新 open 拿新 ticket 再连。最多重试若干次。
-    async fn reconnect(&mut self) -> bool {
-        for attempt in 0..5u32 {
-            tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1))).await;
-            if let Ok(ws) = open_ws(
+    /// 断线重连：重新 open 拿新 ticket 再连，指数退避（0.5 s 起、上限 30 s）直到成功。
+    /// 期间在渠道健康表登记「重连中」，成功即清除；首三次及之后每十次记一行日志。
+    async fn reconnect(&mut self) {
+        use crate::channels::health;
+        let mut attempt: u32 = 0;
+        loop {
+            tokio::time::sleep(health::reconnect_delay(attempt)).await;
+            match open_ws(
                 &self.http,
                 &self.client_id,
                 &self.client_secret,
@@ -149,12 +187,38 @@ impl StreamConn {
             )
             .await
             {
-                self.ws = ws;
-                return true;
+                Ok(ws) => {
+                    self.ws = ws;
+                    self.heartbeat = heartbeat_interval();
+                    self.awaiting_pong = false;
+                    health::clear("dingding");
+                    eprintln!(
+                        "[dingtalk-stream] reconnected after {} attempt(s)",
+                        attempt.saturating_add(1)
+                    );
+                    return;
+                }
+                Err(e) => {
+                    let e = e.to_string();
+                    if health::should_log_reconnect(attempt) {
+                        eprintln!(
+                            "[dingtalk-stream] reconnect attempt {} failed: {e}; next try in {:?}",
+                            attempt.saturating_add(1),
+                            health::reconnect_delay(attempt.saturating_add(1))
+                        );
+                    }
+                    health::report("dingding", health::reconnecting_message(attempt, &e));
+                    attempt = attempt.saturating_add(1);
+                }
             }
         }
-        false
     }
+}
+
+fn heartbeat_interval() -> Interval {
+    let mut interval = time::interval_at(Instant::now() + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    interval
 }
 
 /// 注册长连接 + 建 WebSocket。
@@ -207,4 +271,33 @@ async fn open_ws(
         .await
         .map_err(|e| DingTalkError::Network(format!("WebSocket connection failed: {}", e)))?;
     Ok(ws)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn missed_heartbeats_preserve_full_pong_window() {
+        let mut heartbeat = heartbeat_interval();
+
+        // Model a suspended runtime that misses more than two heartbeat periods.
+        time::advance(HEARTBEAT_INTERVAL * 3).await;
+        heartbeat.tick().await;
+
+        // recv() sends Ping on the overdue tick above. The following tick is the
+        // earliest point at which awaiting_pong can trigger a reconnect, so it must
+        // remain pending for the entire response window.
+        let mut next_tick = Box::pin(heartbeat.tick());
+        time::advance(HEARTBEAT_INTERVAL - Duration::from_millis(1)).await;
+        tokio::select! {
+            biased;
+            _ = &mut next_tick => panic!("heartbeat fired before the pong window elapsed"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        time::advance(Duration::from_millis(1)).await;
+        next_tick.await;
+    }
 }

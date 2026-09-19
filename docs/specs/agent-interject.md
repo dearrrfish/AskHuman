@@ -1,6 +1,6 @@
 # Agent 插话（Interject）：工作中主动向 agent 发消息
 
-> 状态：已实现（Claude Code / Codex / Cursor；Grok 不支持）。
+> 状态：已实现（Claude Code / Codex / Cursor / Pi；Grok 不支持）。
 > 实现计划见 `docs/plans/agent-interject.md`。
 
 > **实现期补充（2026-07）**：GUI composer、状态窗口、托盘和 IM `/msg` 均已接入；发送入口收敛为
@@ -9,6 +9,14 @@
 > `docs/specs/im-msg-compose-card.md` 与 `docs/plans/im-msg-compose-card.md`。
 > 排队消息真正被 PreToolUse hook 消费后，Daemon 向原 IM 来源回推“已阅读”回执；即时送达、撤回、覆盖或
 > 会话结束时未消费的消息不回执。
+>
+> **附件补充（2026-08）**：桌面 composer 与 Agent 控制台支持文件/图片附件及仅附件插话；IM `/msg`
+> 仍为纯文本。普通文件始终引用源文件绝对路径，不复制、不托管；没有源路径的剪贴板图片复用问答弹窗的
+> `temp/askhuman` 临时目录，由既有 24 小时 GC 清理。
+>
+> **Pi 补充（2026-08-19）**：受管 Pi Extension 在 `tool_call` 调用同一 `__agent-hook pi activity`
+> 轮询，daemon 的 deny 结果转换为 Pi 原生 `{block:true, reason}`。其队列、等待、附件和阅读回执语义
+> 与其它支持家族相同；完整设计见 `docs/plans/pi-agent-integration.md`。
 
 ## 1. 需求
 
@@ -59,18 +67,31 @@
   ——触发时在上报 activity 之余顺带向 daemon 查询/等待插话。
 - **Grok 首期排除**：不改其 hook 行为，AgentsView / 托盘对 grok 会话不显示「发送消息」入口。
   理由：无可靠「传话」通道（见 §2），deny-only 只能拦停不能解释，体验差；等 Grok hook 能力演进。
-- Unix only（生命周期追踪/托盘/宿主本就 Unix only）。
+- macOS、Linux 与 Windows 共用 lifecycle hook、daemon 队列和 GUI Host；Grok 仍排除。
 
 ### D2 消息模型：每 session 一份条目列表（queue of entries）
 
-- daemon 内存中按 `session_id` 维护 `{ entries: Vec<String>, composer_open: bool }`。
-- **弹窗**：打开时把现有全部条目按空行拼接**预填**，用户在其上编辑，提交＝**整体覆盖**队列
-  （连续第二次点「发送消息」看到上次未消费的内容、可直接编辑覆盖——用户定案）；取消＝不动队列。
+- daemon 内存中按 `session_id` 维护
+  `{ entries: Vec<InterjectEntry { text, attachments }>, composer_open: bool }`。每个条目可以同时有文本和
+  附件，也可以仅有附件；文本与附件均为空不入队。附件是 `FileAttachment` 元数据及绝对路径引用。
+- **弹窗**：打开时把现有全部条目文本按空行拼接预填，并恢复待送达附件；用户在其上编辑，提交＝
+  **整体覆盖**队列（连续第二次点「发送消息」看到上次未消费内容与附件、可直接编辑覆盖——用户定案）；
+  取消＝不动队列。已消失的源文件显示为不可用引用，用户可以移除。
+- **Agent 控制台**：文本与附件都采用**追加**语义；待送达区域同时显示条目数和附件数。
 - **IM**：`/msg <编号> <内容>`＝**追加**条目（IM 看不到旧文本，覆盖会静默丢内容）；工作中目标的
   `/msg <编号>` 打开一次性输入卡，空闲目标仍回显当前待送达全文；无参 `/msg` 可先选目标再输入；
-  `/msg-clear <编号>`（`/撤回`）＝清空。回执告知当前共几条。
-- **送达**：hook 消费时全部条目按空行拼成一条消息一次性带给模型，随后清空。
+  `/msg-clear <编号>`（`/撤回`）＝清空。回执告知当前共几条。当前 IM 入口仍只接收文本，不接收附件。
+- **送达**：hook 消费时全部非空文本按空行拼成一条消息，所有附件按条目顺序展平为路径列表，一次性
+  带给模型，随后清空。socket 写失败时必须把原始条目边界、文本、附件与 IM 已阅读回执渠道完整回到
+  队首，不能用一次覆盖提交折叠或覆盖期间新入队的内容。
 - **生命周期**：留队直到被消费；AgentsView 显示「待送达」徽标并可撤回；会话结束（ended）自动清空。
+
+附件文件的生命周期：
+
+- 从文件选择器或拖拽得到的文件只记录 canonical 绝对路径；AskHuman 不复制、不接管、不删除源文件。
+- 剪贴板图片没有可引用的源路径，提交时写入现有 `temp/askhuman/interject-<uuid>/q1/` 请求临时目录，
+  与问答弹窗一样由 24 小时 GC 清理，不引入长期托管目录。
+- 队列保存超过源文件寿命或临时图片 24 小时寿命时，路径可能失效；插话通常会很快消费，接受这一权衡。
 
 ### D3 hook 三态协议（PreToolUse 触发时）
 
@@ -97,8 +118,16 @@ the same call if still appropriate.
 {message}
 </user_message>
 
+<attachments>
+- "/absolute/path/to/file"
+</attachments>
+These are local file paths. Open and use them as inputs to the user's interjection.
+
 Adjust your plan if needed. If anything is unclear, ask the user as instructed.
 ```
+
+没有附件时省略整个 `<attachments>` 块；仅附件插话的 `<user_message>` 内容为空。路径用 JSON 字符串
+转义，避免空格、引号等字符破坏协议。
 
 （用户三轮定形：精简版正文；消息块用 XML tag；末句不点名具体提问工具——提问入口可能经脚本
 封装、名字不一定叫 AskHuman，用最短的 "as instructed"。）
@@ -122,12 +151,12 @@ Cursor 若按其文档语义改用 `agent_message` 也不断；代价是 Cursor 
 - **热路径零文件 IO**：队列在 daemon 内存（HashMap，O(1) 查询）；`interject.json` 只在**变更时**
   （提交/追加/撤回/消费/会话结束）原子落盘、daemon 启动时读一次（D8）。**hook 不读任何文件**。
 - **复用既有连接**：activity hook 本就 spawn `AskHuman __agent-hook` 并连 daemon 发 `AgentEvent`；
-  插话只在同一连接上**多一次请求-响应往返**（本地 UDS，微秒~毫秒级）。无新进程、无新连接。
+  插话只在同一连接上**多一次请求-响应往返**（本地 Unix socket / Windows named pipe，通常为微秒～毫秒级）。无新进程、无新连接。
 - 协议：`ClientMsg::AgentEvent` 增 `interject_poll: bool`（serde default，旧 daemon 忽略）。
   daemon 收到 `interject_poll=true` 立即回一帧三选一：
   - `None` → hook 直接 allow 退出；
-  - `Message(text)` → hook 输出 deny JSON 退出；
-  - `Hold` →（composer 打开中）hook 继续阻塞读第二帧 `Message(text)` / `Release`（取消）。
+  - `Message(text, attachments)` → hook 输出含用户文本与附件路径块的 deny JSON 后退出；
+  - `Hold` →（composer 打开中）hook 继续阻塞读第二帧 `Message(text, attachments)` / `Release`（取消）。
 - **旧 daemon 兼容 / daemon 不可达**：hook 对首帧回复设短超时（~300ms），超时/断连一律 allow
   （fail-open，插话绝不拖慢正常工具调用）。
 - 只有 **PreToolUse** 且通过既有去重（`running == intended`）的那次上报才 poll；PostToolUse 不 poll。
@@ -147,11 +176,12 @@ Cursor 若按其文档语义改用 `agent_message` 也不断；代价是 Cursor 
    增加「PreToolUse 条目 `timeout == 86400`」（Claude/Cursor/Codex 三家；Grok 不动）。
    Codex 另有信任哈希校验：期望哈希按 hooks.json 实际 timeout 计算，旧安装（无 timeout、
    哈希按 600 算）自动判不匹配 → `outdated: true`。
-2. **自动迁移**：daemon 启动即调 `migrate_outdated()`——对「已安装且 outdated」的家族幂等重装
-   （重写条目补 timeout、重算并写 Codex 信任哈希）。用户升级二进制后 daemon 重启
-   （自更新 graceful drain / 登录自启 / 按需拉起）即自动完成，**无需任何手动操作**。
-3. **手动兜底**：设置页实验区该家族显示「需更新」徽标 + 更新按钮；CLI `agents update <agent>
-   --lifecycle` 与 `doctor`（`needsUpdate: true`）同口径。
+2. **现行迁移（2026-08-19）**：lifecycle 已归入自动集成。Daemon 启动不再单独调用
+   `agent_lifecycle::migrate_outdated()`；旧产物继续判 `outdated`，由「Agents」Tab 对应卡片、托盘更新
+   提示和 `doctor` 显示“需更新”，用户点击 Hook/全部更新后幂等重装。缺失 lifecycle 与 None 旧孤立
+   产物使用同一显式更新入口，不在状态查询或 daemon 启动时写盘。
+3. **CLI 兜底**：`agents update <agent>` 更新当前自动集成整包；`agents lifecycle <agent> on|off`
+   切换 active 集成内偏好；`doctor` 的 `needsUpdate: true` 与设置页同口径。
 4. 重装只触碰本功能标记（`__agent-hook`）条目，用户其它 hook 与文件格式保留（既有 CST/toml_edit 编辑）。
 
 ### D6 不做 Stop hook 兜底（用户定案）
@@ -163,26 +193,35 @@ Cursor 若按其文档语义改用 `agent_message` 也不断；代价是 Cursor 
 ### D7 入口与 composer 窗口
 
 - **AgentsView**：每个工作中、非 grok 的 agent 卡片加「发送消息」按钮；有待送达时显示徽标 + 撤回。
-- **托盘**：「Agent 状态（工作 w · 空闲 i）」父项改为**子菜单**——首项「打开状态窗口」（原点击行为）
-  + 分隔线 + 逐 agent 子菜单（标签＝类型+项目名，工作中在前，ended 不列）；每个 agent 下挂：
-  **发送消息**（仅工作中、非 grok）、**聚焦终端**（沿用现有 pid+受支持终端条件）。「置为空闲」需二次确认，
-  不进托盘、仍留状态窗口。`TrayState` 扩展 agent 摘要列表；菜单 diff 机制（`tray_menu.rs`）沿用。
+- **托盘**（2026-07 随 gui-agent-console 改版调整为独立分组）：分隔线 +
+  「打开 Agent 状态窗口」直达项 + **忙闲概览子菜单**（标签即「工作中 w · 空闲 i」）+
+  「新建 Agent 任务」末项（生命周期未开启时该项留在窗口区兜底）——
+  逐 agent 子菜单（标签＝类型+项目名，工作中在前，ended 不列）；每个 agent 下挂：
+  **在控制台查看**、**发送消息**（仅工作中、非 grok）、**添加待办**、**聚焦终端**
+  （沿用现有 pid+受支持终端条件）。「置为空闲」需二次确认，不进托盘、仍留状态窗口。
+  `TrayState` 扩展 agent 摘要列表；菜单 diff 机制（`tray_menu.rs`）沿用。
 - **composer 窗口**：GUI 宿主新窗口类型（`WindowKind::Interject`，URL 带 session 参数），
   **每 session 全局唯一**（聚焦或新建），观感按弹窗风格做；托盘/AgentsView 都经宿主路由
   （`host_open`），宿主不在则拉起，全程失败回退本进程建窗。
 - **composer 状态与 daemon 同步**：窗口打开即经自己的 daemon 连接登记 `composer_open`（连接断开＝
   自动视为关闭，杜绝宿主崩溃后的僵尸「打开中」状态挂起 hook）；提交/取消发对应消息。
   该连接同样不计入空闲保活。
+- **附件交互**：composer 与 Agent 控制台均支持选择/拖入任意文件和粘贴图片，也支持仅附件发送；
+  composer 重开时恢复队列中的附件引用，默认随编辑后的整体提交保留。附件缩略图读取只发生在桌面 UI，
+  不进入 hook 热路径。
 
 ### D8 持久化
 
 `~/.askhuman/state/interject.json`（与 `watch.json` 同模式：原子写、best-effort）。只存 entries
 （composer_open 是连接态不持久化）；daemon 换新（graceful drain 升级为常态）/重启后恢复，
-会话结束清理对应条目。
+会话结束清理对应条目。为兼容既有文件，`sessions` 继续保存文本字符串数组，新增可选的 `attachments`
+map 按 session 与条目下标对齐保存附件数组；旧文件缺少该字段时按无附件加载，附件-only 条目以空文本
+占位保存。
 
 ### D9 IM `/msg`（已实现）
 
-命令语义见 D2。与 `/status` 同门控（daemon 存活即可用、不依赖 autoActivation 开关）；编号复用
+命令语义见 D2。当前四个 IM 渠道保持纯文本，不提供文件选择/上传入口。与 `/status` 同门控
+（daemon 存活即可用、不依赖 autoActivation 开关）；编号复用
 `/status` 的稳定 seq；grok 会话回「该 agent 不支持插话」。空命令输入卡是一次性的，展示待送达
 首尾预览，服务端限制 3000 个 Unicode 字符并在提交时重验目标；有效提交先原子消费卡台账，再复用
 `deliver_msg`，成功只在原卡显示即时送达/排队结果（卡内不显示队列总条数）。30 分钟 TTL 与不含正文的最小恢复账本负责重启、
@@ -197,8 +236,8 @@ Cursor 若按其文档语义改用 `agent_message` 也不断；代价是 Cursor 
 |---|---|---|
 | 进程 spawn | 已有（`__agent-hook`） | **不变**（复用同一进程） |
 | daemon 连接 | 已有（发 AgentEvent） | **不变**（复用同一连接） |
-| 消息往返 | 0（即发即走） | **+1 次 UDS 请求-响应**（daemon 侧 O(1) 内存查表） |
-| 文件 IO | 0 | **0**（持久化只在插话变更时写、启动读一次） |
+| 消息往返 | 0（即发即走） | **+1 次本地 IPC 请求-响应**（daemon 侧 O(1) 内存查表） |
+| 文件 IO | 0 | **0**（hook 热路径不读附件；持久化只在插话变更时写、启动读一次） |
 
 - 无插话时增量 ≈ 一次本地 socket 往返（微秒~毫秒级），相对 hook 进程 spawn 本身（几十 ms 量级）可忽略。
 - daemon 不可达/旧版本：300ms 上限后放行，不阻塞。
@@ -215,3 +254,5 @@ Cursor 若按其文档语义改用 `agent_message` 也不断；代价是 Cursor 
   自动迁移 + 设置页/CLI 手动兜底）；deny 包装文案三轮定形——`[USER INTERJECTION]` 前缀 + 说明拦截
   只为送信非禁用工具；末句不点名 AskHuman（选最短版 "as instructed"）；正文取精简版；
   消息块用 XML tag（`<user_message>`）。
+- （2026-08-19）生命周期归入自动集成后，旧 `migrate_outdated()` 后台路径由 Agent 卡显式更新取代；
+  过期判定与重装内容不变，迁移时机改为用户点击更新。

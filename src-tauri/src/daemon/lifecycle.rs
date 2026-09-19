@@ -1,9 +1,9 @@
-//! Daemon 生命周期支撑：二进制指纹、运行元信息（daemon.json）、单实例锁（flock）。
+//! Daemon 生命周期支撑：二进制指纹、运行元信息（daemon.json）、跨平台单实例锁。
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 可执行文件指纹：用 size + 内容哈希判定「盘上二进制内容是否变化」。
 ///
@@ -149,6 +149,13 @@ pub fn lock_path() -> PathBuf {
     crate::paths::config_dir().join("daemon.lock")
 }
 
+/// Spawn serialization lock `~/.askhuman/spawn.lock`: held by whichever client is currently
+/// starting the daemon and waiting for it to become ready, so concurrent starters queue up and
+/// re-check instead of each launching (and, on macOS, `bootout`-killing) their own instance.
+pub fn spawn_lock_path() -> PathBuf {
+    crate::paths::config_dir().join("spawn.lock")
+}
+
 /// 运行元信息文件 `~/.askhuman/daemon.json`。
 pub fn meta_path() -> PathBuf {
     crate::paths::config_dir().join("daemon.json")
@@ -157,6 +164,157 @@ pub fn meta_path() -> PathBuf {
 /// 运行日志 `~/.askhuman/daemon.log`。
 pub fn log_path() -> PathBuf {
     crate::paths::config_dir().join("daemon.log")
+}
+
+/// Privacy-safe audit context for a guard decision ("suppressed" or "passed") taken before
+/// any side effects.
+///
+/// Keep this deliberately identifier-only: prompts, answers, transcript paths, and arbitrary
+/// metadata must never enter the daemon log through this interface. `thread_source` carries
+/// the raw Codex thread origin label so future host-side renames are diagnosable from logs.
+#[derive(Debug, Clone, Copy)]
+pub struct GuardAudit<'a> {
+    pub component: &'a str,
+    pub action: &'static str,
+    pub reason: &'a str,
+    pub tool: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub thread_source: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub thread_id: Option<&'a str>,
+    pub turn_id: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GuardAuditLine<'a> {
+    timestamp_ms: u64,
+    pid: u32,
+    event: &'static str,
+    component: &'a str,
+    action: &'static str,
+    reason: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_source: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<&'a str>,
+}
+
+fn guard_audit_line_at(audit: GuardAudit<'_>, timestamp_ms: u64, pid: u32) -> Option<String> {
+    serde_json::to_string(&GuardAuditLine {
+        timestamp_ms,
+        pid,
+        event: "askhuman_guard",
+        component: audit.component,
+        action: audit.action,
+        reason: audit.reason,
+        tool: audit.tool,
+        agent: audit.agent,
+        thread_source: audit.thread_source,
+        session_id: audit.session_id,
+        thread_id: audit.thread_id,
+        turn_id: audit.turn_id,
+    })
+    .ok()
+}
+
+/// Append one structured guard decision to `daemon.log` (best-effort).
+///
+/// The write is disabled in unit-test builds so handler tests never touch the user's real log.
+pub fn log_guard_audit(audit: GuardAudit<'_>) {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let Some(mut line) = guard_audit_line_at(audit, timestamp_ms, std::process::id()) else {
+        return;
+    };
+    line.push('\n');
+
+    #[cfg(not(test))]
+    {
+        use std::io::Write;
+
+        let path = log_path();
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
+    #[cfg(test)]
+    let _ = line;
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeEventLine<'a> {
+    timestamp_ms: u64,
+    pid: u32,
+    event: &'static str,
+    component: &'a str,
+    action: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<&'a str>,
+}
+
+/// Append one privacy-safe process/window lifecycle event to `daemon.log` (best-effort).
+///
+/// Only fixed action labels and an opaque request UUID are accepted. Prompt text, answers,
+/// attachments, paths, channel identities, and arbitrary error strings must not use this API.
+pub fn log_runtime_event(component: &str, action: &str, request_id: Option<&str>) {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let Ok(mut line) = serde_json::to_string(&RuntimeEventLine {
+        timestamp_ms,
+        pid: std::process::id(),
+        event: "askhuman_runtime",
+        component,
+        action,
+        request_id,
+    }) else {
+        return;
+    };
+    line.push('\n');
+
+    #[cfg(not(test))]
+    {
+        use std::io::Write;
+
+        let path = log_path();
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
 }
 
 /// daemon.log 轮转阈值：超过即把现有内容挪到 `daemon.log.1`（覆盖上一代）并清空当前文件。
@@ -205,44 +363,21 @@ pub fn write_meta(meta: &DaemonMeta) -> std::io::Result<()> {
     std::fs::write(meta_path(), data)
 }
 
-/// 持有期间代表「本进程为唯一 Daemon」。Drop（文件关闭）时锁自动释放。
-#[cfg(unix)]
-pub struct LockGuard {
-    _file: std::fs::File,
-}
+/// 持有期间代表「本进程为唯一 Daemon」。Drop 时系统文件锁自动释放。
+pub type LockGuard = crate::file_lock::FileLock;
 
 /// 尝试获取单实例锁（非阻塞）。
 /// - `Ok(Some(guard))`：成功，本进程是唯一 Daemon。
 /// - `Ok(None)`：已有其它 Daemon 持锁。
 /// - `Err`：其它 IO 错误。
-#[cfg(unix)]
 pub fn acquire_lock() -> std::io::Result<Option<LockGuard>> {
     acquire_lock_at(&lock_path())
 }
 
-/// 在指定路径上尝试获取 flock 单实例锁（非阻塞）。供 daemon（`daemon.lock`）与
+/// 在指定路径上尝试获取单实例文件锁（非阻塞）。供 daemon（`daemon.lock`）与
 /// GUI 宿主（`gui-host.lock`）共用。返回值语义同 `acquire_lock`。
-#[cfg(unix)]
 pub fn acquire_lock_at(path: &Path) -> std::io::Result<Option<LockGuard>> {
-    use std::os::unix::io::AsRawFd;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path)?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        // 已被其它进程持有（EWOULDBLOCK 与 EAGAIN 在各 Unix 上同值）。
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            return Ok(None);
-        }
-        return Err(err);
-    }
-    Ok(Some(LockGuard { _file: file }))
+    crate::file_lock::FileLock::try_exclusive(path)
 }
 
 #[cfg(test)]
@@ -331,5 +466,65 @@ mod tests {
         assert_eq!(back.version, "9.9.9");
         assert_eq!(back.fingerprint.size, 6);
         assert_eq!(back.fingerprint.hash, 5);
+    }
+
+    #[test]
+    fn guard_audit_is_structured_and_omits_missing_or_sensitive_fields() {
+        let line = guard_audit_line_at(
+            GuardAudit {
+                component: "mcp_tool",
+                action: "suppressed",
+                reason: "codex_blocked_thread_source",
+                tool: Some("whats_next"),
+                agent: Some("codex"),
+                thread_source: Some("ambient_suggestions"),
+                session_id: Some("session-1"),
+                thread_id: Some("thread-1"),
+                turn_id: None,
+            },
+            123,
+            456,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["timestampMs"], 123);
+        assert_eq!(value["pid"], 456);
+        assert_eq!(value["event"], "askhuman_guard");
+        assert_eq!(value["component"], "mcp_tool");
+        assert_eq!(value["action"], "suppressed");
+        assert_eq!(value["reason"], "codex_blocked_thread_source");
+        assert_eq!(value["tool"], "whats_next");
+        assert_eq!(value["agent"], "codex");
+        assert_eq!(value["threadSource"], "ambient_suggestions");
+        assert_eq!(value["sessionId"], "session-1");
+        assert_eq!(value["threadId"], "thread-1");
+        assert!(value.get("turnId").is_none());
+        assert!(!line.contains("prompt"));
+        assert!(!line.contains("transcript"));
+    }
+
+    #[test]
+    fn guard_audit_pass_action_omits_thread_source_when_absent() {
+        let line = guard_audit_line_at(
+            GuardAudit {
+                component: "mcp_tool",
+                action: "passed",
+                reason: "codex_thread_source_missing",
+                tool: Some("ask"),
+                agent: Some("codex"),
+                thread_source: None,
+                session_id: None,
+                thread_id: Some("thread-2"),
+                turn_id: None,
+            },
+            123,
+            456,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["action"], "passed");
+        assert_eq!(value["reason"], "codex_thread_source_missing");
+        assert!(value.get("threadSource").is_none());
+        assert_eq!(value["threadId"], "thread-2");
     }
 }

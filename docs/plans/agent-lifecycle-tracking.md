@@ -1,5 +1,8 @@
 # 实现计划：Agent 生命周期追踪 + 状态窗口（实验性功能）
 
+> Windows 注（2026-08）：本文保留首期 Unix 实施步骤；Windows 已由平台对齐项目实现 native process
+> inspection、`commandWindows` hooks、named-pipe 上报与 GUI Host，以下平台限制仅作历史记录。
+
 > 关联需求：`docs/specs/agent-lifecycle-tracking.md`（决策编号 D1–D24）
 > 关联调研：`demo/agent-lifecycle/FINDINGS.md`（事件 / env / 去重 / 标题来源 / Codex 信任算法，均实测）
 > 平台：仅 Unix（macOS/Linux）；Windows 全程编译进去但 UI 与命令对用户隐藏（D2）。
@@ -187,7 +190,7 @@ agent 调 AskHuman 提问 → client 顺带上报身份 → 刷新最近活动 +
 ### P-1 `agents/detect.rs`：识别共享 app-server → 记 None
 
 - 新增 `fn is_shared_app_server(entry: &ProcEntry) -> bool`（判据 D27，纯函数、可单测）：
-  - **主判据**：`argv0 basename` 含 `codex` **且** 命令行 whitespace 分词后存在等于 `app-server` 的令牌（覆盖 `codex app-server --listen unix://` 与 `stdio://`）。
+  - **主判据**：命令行 whitespace 分词后，找到 basename=`codex` 的 token，**跳过其后前导全局选项**（`-c`/`--config` 及其值、`--flag=value`、其它 `-…` flag），第一个非选项 token 为 `app-server`（覆盖 `codex app-server …`、`node …/codex app-server …`、ChatGPT Desktop 的 `codex -c features.…=true app-server …`）。**不是**「任意位置出现 `app-server` 令牌」。
   - **可选兜底**：`entry` 无 tty（`ps -o tty=` 为空/`??`）**且** 父链上溯到 PID 1（`process_chain` 末端 ppid==1）。默认可只用主判据（更专一、少一次 `ps`）；是否叠加兜底见评审结论。
 - `walk_agent_pid(kind, start_pid)`：命中的 Codex 祖先若 `is_shared_app_server` → 返回 `None`（该会话无可用 pid）。**仅对 Codex 生效**（其它家族不变）。
 - `walk_any_agent(start_pid)`（MCP 兜底）：跳过 `is_shared_app_server` 的节点（继续上溯）；若最终只剩 app-server → 返回 `None`（不按共享 pid 做 `touch_activity_by_pid`，规避跨 session 串味）。
@@ -200,7 +203,7 @@ agent 调 AskHuman 提问 → client 顺带上报身份 → 刷新最近活动 +
 
 ### P-3 测试
 
-- `detect.rs` 单测：`is_shared_app_server` 命中 `codex app-server --listen unix://`/`stdio://`；不命中纯 `codex`（TUI）、不命中 argv 里恰好含 "app-server" 字样但 argv0 非 codex 的进程；`walk_agent_pid(Codex, …)` 对构造链（app-server 祖先）返回 `None`。
+- `detect.rs` 单测：`is_shared_app_server` 命中 `codex app-server --listen unix://`/`stdio://`、Desktop `codex -c features.…=true app-server`；不命中纯 `codex`（TUI）、`codex exec … app-server …`、argv 里恰好含 "app-server" 但 basename 非 codex 的进程；`walk_agent_pid(Codex, …)` 对构造链（app-server 祖先）返回 `None`。
 - 复用既有 registry 无 pid 用例（`ttl_only_affects_pidless_records` / `working_backstop_*`）即覆盖生命周期治理，无需新增注册表测试。
 
 ### P-4 验证

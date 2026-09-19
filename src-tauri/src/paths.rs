@@ -50,6 +50,21 @@ pub fn request_temp_dir(request_id: &str) -> PathBuf {
     std::env::temp_dir().join("askhuman").join(request_id)
 }
 
+/// Managed original files and thumbnail caches owned by project todos.
+pub fn todo_attachments_dir() -> PathBuf {
+    state_dir().join("todo-attachments")
+}
+
+/// Managed files for one todo. Callers must validate `todo_id` as a UUID first.
+pub fn todo_attachment_dir(todo_id: &str) -> PathBuf {
+    todo_attachments_dir().join(todo_id)
+}
+
+/// Request-scoped copies delivered to an Agent. The existing daemon temp GC removes the parent.
+pub fn todo_delivery_dir(request_id: &str) -> PathBuf {
+    request_temp_dir(request_id).join("todo-files")
+}
+
 /// 回复历史文件 `~/.askhuman/history.jsonl`（每行一条 JSON）。
 pub fn history_file() -> PathBuf {
     config_dir().join("history.jsonl")
@@ -58,6 +73,16 @@ pub fn history_file() -> PathBuf {
 /// 回复历史写入锁 `~/.askhuman/history.lock`（写/裁剪/清空时持有）。
 pub fn history_lock() -> PathBuf {
     config_dir().join("history.lock")
+}
+
+/// Private overwrite-only files used when a recovered AskHuman Message exceeds stdout limits.
+pub fn show_last_dir() -> PathBuf {
+    state_dir().join("show-last")
+}
+
+/// Private schema-hidden MCP session tokens, consumed once by AskHuman MCP handlers.
+pub fn session_token_dir() -> PathBuf {
+    state_dir().join("session-tokens")
 }
 
 /// 版本自更新状态文件 `~/.askhuman/update.json`（最新版本/检查时间/忽略集合/待生效）。
@@ -91,6 +116,17 @@ pub fn permission_preferences_file() -> PathBuf {
 /// Per-agent Stop confirmation preference; independent from lifecycle tracking and integration mode.
 pub fn stop_preferences_file() -> PathBuf {
     config_dir().join("stop-preferences.json")
+}
+
+/// Per-agent lifecycle tracking preference. Tracking is available only while the corresponding
+/// automatic Agent integration is active, but the explicit preference survives mode changes.
+pub fn lifecycle_preferences_file() -> PathBuf {
+    config_dir().join("lifecycle-preferences.json")
+}
+
+/// Claude 提问接管的开关（spec claude-ask-user-question D3），与 permission / stop 偏好同级。
+pub fn ask_question_preferences_file() -> PathBuf {
+    config_dir().join("ask-question-preferences.json")
 }
 
 /// Agent 生命周期追踪状态文件 `~/.askhuman/agents.json`（daemon 持久化、重启复核用）。
@@ -143,11 +179,12 @@ pub fn agent_launch_dir() -> PathBuf {
 
 /// GUI 宿主进程的 IPC socket `~/.askhuman/gui-host.sock`（与 daemon socket 解耦，
 /// 使 daemon 未运行时也能打开设置/历史窗口，spec D13）。
+#[cfg(unix)]
 pub fn gui_host_sock() -> PathBuf {
     config_dir().join("gui-host.sock")
 }
 
-/// GUI 宿主进程的单实例锁 `~/.askhuman/gui-host.lock`（flock，保证全局唯一宿主）。
+/// GUI 宿主进程的跨平台单实例锁 `~/.askhuman/gui-host.lock`。
 pub fn gui_host_lock() -> PathBuf {
     config_dir().join("gui-host.lock")
 }
@@ -162,9 +199,13 @@ pub fn cursor_hooks_json() -> PathBuf {
     cursor_dir().join("hooks.json")
 }
 
-/// `~/.cursor/hooks/askhuman-timeout.sh`。
+/// AskHuman-owned Cursor timeout hook (`.sh` on Unix, `.ps1` on Windows).
 pub fn cursor_hook_script() -> PathBuf {
-    cursor_dir().join("hooks").join("askhuman-timeout.sh")
+    cursor_dir().join("hooks").join(if cfg!(windows) {
+        "askhuman-timeout.ps1"
+    } else {
+        "askhuman-timeout.sh"
+    })
 }
 
 /// 旧版 hook 脚本 `~/.cursor/hooks/humaninloop-timeout.sh`（仅用于向后兼容清理）。
@@ -208,9 +249,13 @@ pub fn claude_json() -> PathBuf {
     home().join(".claude.json")
 }
 
-/// Claude Code hook 脚本 `~/.claude/hooks/askhuman-timeout.sh`。
+/// AskHuman-owned Claude Code timeout hook (`.sh` on Unix, `.ps1` on Windows).
 pub fn claude_hook_script() -> PathBuf {
-    claude_dir().join("hooks").join("askhuman-timeout.sh")
+    claude_dir().join("hooks").join(if cfg!(windows) {
+        "askhuman-timeout.ps1"
+    } else {
+        "askhuman-timeout.sh"
+    })
 }
 
 /// Codex 配置目录 `~/.codex`。
@@ -268,6 +313,31 @@ pub fn grok_sessions_dir() -> PathBuf {
     grok_dir().join("sessions")
 }
 
+/// Pi coding-agent user directory `~/.pi/agent`.
+pub fn pi_agent_dir() -> PathBuf {
+    home().join(".pi").join("agent")
+}
+
+/// Pi global instructions file `~/.pi/agent/AGENTS.md`.
+pub fn pi_agents_md() -> PathBuf {
+    pi_agent_dir().join("AGENTS.md")
+}
+
+/// AskHuman-owned Pi extension directory.
+pub fn pi_extension_dir() -> PathBuf {
+    pi_agent_dir().join("extensions").join("askhuman")
+}
+
+/// AskHuman-owned Pi extension entry point.
+pub fn pi_extension_file() -> PathBuf {
+    pi_extension_dir().join("index.ts")
+}
+
+/// Pi's default session root. Custom session directories are reported by the extension at runtime.
+pub fn pi_sessions_dir() -> PathBuf {
+    pi_agent_dir().join("sessions")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,9 +348,9 @@ mod tests {
 
     #[test]
     fn config_dir_respects_askhuman_home() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let prev = std::env::var_os(crate::dev_instance::ASKHUMAN_HOME_ENV);
-        let custom = PathBuf::from("/tmp/askhuman-home-test-xyz");
+        let custom = std::env::temp_dir().join("askhuman-home-test-xyz");
         std::env::set_var(crate::dev_instance::ASKHUMAN_HOME_ENV, &custom);
         assert_eq!(config_dir(), custom);
         match prev {
@@ -291,11 +361,11 @@ mod tests {
 
     #[test]
     fn dev_presets_dir_not_under_askhuman_home() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let prev = std::env::var_os(crate::dev_instance::ASKHUMAN_HOME_ENV);
         std::env::set_var(
             crate::dev_instance::ASKHUMAN_HOME_ENV,
-            "/tmp/instance-home-only",
+            std::env::temp_dir().join("instance-home-only"),
         );
         assert_eq!(
             dev_presets_dir(),

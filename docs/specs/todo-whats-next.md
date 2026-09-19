@@ -44,15 +44,17 @@ Interject 是「打断进行中」的纠偏语义，不适合），希望：
 
 - 归属：**项目级**（`project.rs` 的 git 根路径 key，回退 cwd）。同项目的新会话 / 新
   agent / 多 agent 共享一份队列；不随 session 结束清理，长期保留直到出队或删除。
-- 条目：`{ id: uuid, text: String, created_at_ms, auto: bool, agent_kind?: String }`。纯文本，首期不支持附件。
+- 条目：`{ id: uuid, text: String, created_at_ms, auto: bool, agent_kind?: String }`。当前已实现版本为
+  纯文本；图片 / 文件附件的后续扩展已定案，见 `docs/specs/todo-attachments.md`，在该需求实现前
+  本节以下仍描述现行无附件模型。
   `auto`＝**自动执行**标记（第 17 轮定案，见 D2；`false` 不落盘，旧文件兼容）；从历史
   恢复的条目恒为 `auto: false`。`agent_kind` 只在识别到 Agent 调用 CLI `todo add` 时记录
   家族（`claude / codex / cursor / grok`）；人工、GUI、IM 新增和旧数据均为空。
 - 顺序：FIFO 追加；顺序可在 GUI 待办窗口拖拽调整（第 14 轮定案，见 D9），头部条目在
   选项类展示点优先出现。
 - 存储（第 9 轮定案，实现简化）：`~/.askhuman/state/todos.json` 即**唯一数据源**，
-  所有进程直读直写；写操作（读-改-写）持 flock 串行化（与 `history.jsonl` 跨进程写锁
-  同模式；Windows 无锁 best-effort，与 history 现状一致）。**不做** daemon 内存运行态
+  所有进程直读直写；写操作（读-改-写）持跨平台文件锁串行化（Unix `flock` / Windows
+  `LockFileEx` 语义由 `fs2` 统一，与 `history.jsonl` 跨进程写锁同模式）。**不做** daemon 内存运行态
   ——todo 无热路径（whats-next 每轮一次、增删查是人操作频率），双层结构无收益。
   文件形态：`{ "projects": { "<project_key>": [ {id,text,createdAtMs,agentKind?}, … ] },
   "history": { "<project_key>": [ {id,text,createdAtMs,agentKind?,doneAtMs}, … ] } }`，
@@ -61,7 +63,7 @@ Interject 是「打断进行中」的纠偏语义，不适合），希望：
 - **执行历史**（第 16 轮定案，GUI 勾选完成补充）：**「出队进历史」**路径（whats-next /
   Stop 卡 / 弹窗点选 → `take`，以及 GUI 待办窗口圆形复选框完成 → 同一 `take`）进入
   `history`（时间正序追加，展示倒序）；手动删除（✕）、清空**不记**。每项目按设置
-  「待办历史保留条数」（`general.todoHistoryLimit`，默认 20）裁剪最旧；`0`＝停止新增、
+  「待办历史保留条数」（`general.todoHistoryLimit`，默认 100）裁剪最旧；`0`＝停止新增、
   既有历史保留（与回复历史 `historyLimit` 同语义）。GUI 待办窗口的「历史」折叠区可查看
   （相对时间＋来源 agent）并用复选框**一键恢复**回待办队列末尾（hover 显示恢复图标）。
 - 附带收益：CLI `todo` / `--whats-next` 的待办读写**不依赖 daemon 存活**；
@@ -89,6 +91,10 @@ Interject 是「打断进行中」的纠偏语义，不适合），希望：
   无建议、无待办时只有「结束本轮」+ 自由输入框。
   发给 agent 的任务文本剥掉前缀、还原待办原文。whats-next 弹窗**不渲染** D7 待办区
   （待办已是选项本体）。
+- 本地 Popup 打开期间监听 `todos.json`：建议任务与末尾结束项保持不变，中间待办选项按最新队列、
+  排序和剩余容量实时重建，溢出数量同步更新；已选待办按 id 保留，若被删除或移出可见容量则清除。
+  提交动态待办时以原文 + id 回传，保持派发文本和 best-effort 出队语义。已发送的 IM 卡保持请求快照，
+  避免首答竞争期间各渠道选项漂移；下一轮 whats-next 自然读取最新队列。
 - 回答**写入回复历史**（它承载完成报告，是 agent 的正式提问；区别于 Stop 确认卡的
   hook 兜底卡不写历史）。
 - **自动执行接管**（第 17 轮定案）：发问前先查队列，若存在 `auto` 待办则**不发卡**，
@@ -100,8 +106,8 @@ Interject 是「打断进行中」的纠偏语义，不适合），希望：
 **MCP**：server 的 `whats_next`（与 `ask` 并列）入参
 `{ message?, options?: [{ text, recommended? }], files? }`；工具描述将其定位为**任务完成后的交接**，
 当前任务内的问题、决策或下一步仍走普通 `ask`；`options` 仅放具体下一任务，不含内置结束项，
-薄壳将其翻译为 `-o` / `-o!`，再 spawn `AskHuman --whats-next --output
-json …` 子进程，结果映射进 structuredContent。
+薄壳将其翻译为 `-o` / `-o!`，再 spawn `AskHuman --whats-next …` 子进程（默认文本输出），
+结果文本原样透传（与 `ask` 同为纯文本，见 spec mcp.md D5）。
 
 **提交结果 → 语义映射**（纯函数，完整单测）：
 
@@ -175,6 +181,10 @@ MCP 版 `mcp_reference()` 对应前两行调整为：
   覆盖完成报告之外的中间产物。
 - Grok skill 正文复用 `mcp_reference()`，自动跟随。
 - rules 是托管产物：升级二进制后按现有 `agents update` / 过期徽标机制更新四家安装文案。
+- （2026-07-24 补充）Codex Rules 不再为 task-suggestion generator 增加 scope exception，以便实际
+  观察模型对 `whats_next` 等 AskHuman 工具的调用。可信 `thread_source ∈ {system,
+  ambient_suggestions}` guard 会在弹窗、IM 和 todo 副作用前拒绝，并将拒绝原因写入 `daemon.log`；
+  因此 Rules 行为不承担后台线程的安全边界。
 - （2026-07-17 补充）Rules 在用户明确要求添加待办，或把一个**具体任务 / 已提出的建议明确延后**
   （如“稍后再做”）时要求 Agent 添加项目待办；不得把 Agent 自己的内部计划或尚未被用户接受的建议
   擅自入队。CLI 版调用 `<program> todo add "<concise task>"`，MCP 版与 Grok skill 调用
@@ -211,9 +221,9 @@ AskHuman todo rm <编号>            # 删除一条
 AskHuman todo clear                # 清空本项目（需交互确认，或 --yes 跳过）
 ```
 
-- Unix 经 daemon（连接或拉起，daemon 内存为准）；非 Unix 直接文件 + 锁。
+- macOS、Linux 与 Windows 均经 shared daemon（连接或拉起）；`todos.json` 仍是唯一数据源，所有独立进程写入由跨平台文件锁串行化。
 - 输出人类可读；后续需要时再加 `--output json`（首期不做）。
-- `todo add` 复用提问调用方识别：先读 Agent 环境变量，无法识别时 Unix 沿父进程树兜底；
+- `todo add` 复用提问调用方识别：先读 Agent 环境变量，无法识别时沿平台原生父进程树兜底；
   识别成功则把 Agent 家族写入待办来源。来源不改变 CLI 输出，人工调用保持无来源。
 - `--agent-help` 用两行简述项目待办：它用于提醒用户操作，或记录用户要求稍后执行的任务，
   不是 Agent 的内部工作计划；用户要求添加或明确延后具体任务时用 `todo add` 添加。另给出软建议：
@@ -228,6 +238,8 @@ AskHuman todo clear                # 清空本项目（需交互确认，或 --y
     「另外看一下这个待办任务：{text}」整行并入**最后一题**回答（手输文本在前、
     空行分隔，进 `[user_input]`），并按 id **best-effort 出队**；
   - 每条行内**删除**按钮；**不提供新增**（第 11 轮定案：新增走 CLI/GUI/IM，界面更干净）；
+  - 普通提问的 Popup 宿主监听 `todos.json` 并投递 `todos-updated`；提问保持打开时，从独立待办窗口、CLI、
+    MCP 或 IM 新增/删除/完成待办后，本项目列表与数量实时重载，已被移除条目的本地选中态同步清除；
   - sequential 多题模式只在最后一题的面板显示；严格选择（select-only，禁自由文本）
     下仅可删除、不可点选。
 - **点选作答多题也启用**（第 11 轮定案，取代「仅单题」旧规）：选中文本恒并入最后一题。
@@ -235,7 +247,7 @@ AskHuman todo clear                # 清空本项目（需交互确认，或 --y
 - IM 普通提问卡**不加**待办区（评审定案：任务中途的提问用待办作答易答非所问，
   且多题卡歧义；IM 侧待办送达统一走 whats-next 卡）。
 
-### D8 入口三：IM `/todo`、`/todo-rm`（Unix，daemon 入站命令层）
+### D8 入口三：IM `/todo`、`/todo-rm`（跨平台 daemon 入站命令层）
 
 - `/todo`（无参）→ 复用现有跨渠道**单选卡**选一个项目；`/todo <text>` → 把文本
   暂存在 picker payload，选中项目后直接新增。旧 `/todo <n> [text]`（n＝`/status`
@@ -261,7 +273,7 @@ AskHuman todo clear                # 清空本项目（需交互确认，或 --y
   `/todo-auto` 或 GUI 设置。
 - 没有任何项目候选时回提示；不要求存在存活 Agent。与 `/status` 同门控（daemon 存活即可用）。
 
-### D9 入口四：GUI 独立待办窗口 + 托盘（Unix，GUI Host 承载）
+### D9 入口四：GUI 独立待办窗口 + 托盘（macOS/Linux/Windows GUI Host 承载）
 
 - 新窗口类型（`WindowKind::Todo`，全局唯一），入口：托盘菜单「待办…」+ 所有提问/确认弹窗
   顶栏「项目待办」+ Agent 状态窗口各 agent 卡片 + 托盘各 agent 子菜单「添加待办…」
@@ -291,11 +303,11 @@ AskHuman todo clear                # 清空本项目（需交互确认，或 --y
 
 | 能力 | macOS / Linux | Windows |
 |---|---|---|
-| `--whats-next` / MCP `whats_next` | ✅（提问经 daemon；待办直读文件） | ✅ 单进程回退 |
-| CLI `todo` 子命令 | ✅ 直接文件 + flock | ✅ 直接文件（无锁 best-effort） |
+| `--whats-next` / MCP `whats_next` | ✅（提问经 daemon；待办直读文件） | ✅（提问经 named-pipe daemon；待办直读文件） |
+| CLI `todo` 子命令 | ✅ 直接文件 + 跨进程锁 | ✅ 直接文件 + 跨进程锁 |
 | Popup 折叠待办区 | ✅ 直读文件 | ✅ 直读文件 |
-| IM `/todo`、`/todo-rm`、`/todo-auto` | ✅ | —（无 daemon） |
-| GUI 待办窗口 / 托盘入口 | ✅ | —（无 GUI Host / 托盘） |
+| IM `/todo`、`/todo-rm`、`/todo-auto` | ✅ | ✅ |
+| GUI 待办窗口 / 托盘入口 | ✅ | ✅ |
 
 ### D11 竞态与边界
 
@@ -314,7 +326,7 @@ AskHuman todo clear                # 清空本项目（需交互确认，或 --y
 
 ## 4. 单元测试要求（骨架，实现计划再展开）
 
-- 队列存储：add/rm/clear/出队幂等、persist 往返、空项目剪除、文件锁（非 Unix 路径）。
+- 队列存储：add/rm/clear/出队幂等、persist 往返、空项目剪除、Unix/Windows 文件锁。
 - whats-next 参数解析：与 `-q` 互斥，接受 `-o`/`-o!` 建议任务，覆盖 Message/`--stdin`/`-f` 组合。
 - 提交映射五分支（D2 表）纯函数全覆盖；出队 best-effort（条目已删）分支。
 - 输出契约：任务文本（含补充拼接）/ 固定结束句 / 取消 `[status]` 三种渲染；

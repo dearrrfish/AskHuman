@@ -74,6 +74,21 @@ pub struct ShellWorkerOutput {
     /// The amendment came from the model's own `prefix_rule` (D38 session prefix tier).
     #[serde(default)]
     pub amendment_from_prefix_rule: bool,
+    /// Validated generalizations of `amendment` (D51): the amendment itself first, then
+    /// shorter truncations (longest to shortest) that pass the banned-prefix and
+    /// dangerous-command checks and would approve every segment (prefix hit or the
+    /// segment independently evaluates to allow). Empty iff `amendment` is None.
+    #[serde(default)]
+    pub amendment_candidates: Vec<Vec<String>>,
+    /// Per-segment (parallel to `segments`): the segment independently evaluates to
+    /// allow, i.e. it would not itself prompt (all policy matches and the heuristics
+    /// fallback agree on allow).
+    #[serde(default)]
+    pub segment_allows: Vec<bool>,
+    /// Any explicit policy rule with decision prompt matched some segment: native
+    /// prompts regardless of amendments, and relaxed mode must never auto-allow (D52).
+    #[serde(default)]
+    pub policy_prompt_any: bool,
 }
 
 impl ShellWorkerOutput {
@@ -86,6 +101,9 @@ impl ShellWorkerOutput {
             dangerous_any: false,
             amendment: None,
             amendment_from_prefix_rule: false,
+            amendment_candidates: Vec::new(),
+            segment_allows: Vec::new(),
+            policy_prompt_any: false,
         }
     }
 }
@@ -196,7 +214,8 @@ pub fn run_stdio() -> Option<String> {
     let checker = CodexCliChecker {
         codex_bin: PathBuf::from(&input.codex_bin),
     };
-    let output = analyze(&input, &checker, Path::new("/etc/codex"));
+    let system_config = codex_system_config_dir();
+    let output = analyze(&input, &checker, &system_config);
     serde_json::to_string(&output).ok()
 }
 
@@ -245,8 +264,15 @@ pub fn analyze(
         return ShellWorkerOutput::disabled(&reason);
     }
 
-    let argv = vec!["bash".to_string(), "-lc".to_string(), input.script.clone()];
-    let Some(segments) = crate::shell_safety::parse_shell_lc_plain_commands(&argv) else {
+    #[cfg(windows)]
+    let segments = crate::shell_safety::parse_powershell_plain_commands(&input.script);
+    #[cfg(not(windows))]
+    let segments = crate::shell_safety::parse_shell_lc_plain_commands(&[
+        "bash".to_string(),
+        "-lc".to_string(),
+        input.script.clone(),
+    ]);
+    let Some(segments) = segments else {
         return ShellWorkerOutput::disabled("script is not a plain word-only sequence");
     };
     if segments.is_empty() || segments.len() > MAX_SEGMENTS {
@@ -289,6 +315,22 @@ pub fn analyze(
         }
     }
 
+    // Per-segment rank: a segment "independently allows" when every decision that
+    // applies to it (policy matches plus the heuristics fallback) is allow.
+    let segment_allows: Vec<bool> = evals
+        .iter()
+        .map(|eval| {
+            eval.policy_decisions
+                .iter()
+                .map(String::as_str)
+                .chain(eval.heuristic)
+                .map(decision_rank)
+                .max()
+                .unwrap_or(1)
+                == 0
+        })
+        .collect();
+
     let decision = evals
         .iter()
         .flat_map(|eval| {
@@ -306,9 +348,7 @@ pub fn analyze(
             .iter()
             .all(|eval| eval.policy_decisions.iter().any(|d| d == "allow"));
 
-    let dangerous_any = segments
-        .iter()
-        .any(|segment| crate::shell_safety::is_dangerous_command(segment));
+    let dangerous_any = segments.iter().any(|segment| segment_is_dangerous(segment));
 
     let any_policy_match = evals.iter().any(|eval| !eval.policy_decisions.is_empty());
     let policy_prompt = evals
@@ -367,6 +407,29 @@ pub fn analyze(
         amendment_from_prefix_rule = false;
     }
 
+    // Candidate generalizations (D51): the amendment itself plus validated truncations.
+    // A truncation qualifies when it is not banned, not itself a dangerous command, and
+    // would approve every segment (prefix hit or the segment independently allows).
+    let mut amendment_candidates: Vec<Vec<String>> = Vec::new();
+    if let Some(base) = amendment.as_ref() {
+        amendment_candidates.push(base.clone());
+        for len in (1..base.len()).rev() {
+            let candidate = &base[..len];
+            if crate::shell_safety::is_banned_prefix(candidate) || segment_is_dangerous(candidate) {
+                continue;
+            }
+            let covers_all = segments
+                .iter()
+                .zip(&segment_allows)
+                .all(|(segment, allows)| {
+                    (segment.len() >= len && segment[..len] == candidate[..]) || *allows
+                });
+            if covers_all {
+                amendment_candidates.push(candidate.to_vec());
+            }
+        }
+    }
+
     ShellWorkerOutput {
         disabled_reason: None,
         segments,
@@ -375,13 +438,16 @@ pub fn analyze(
         dangerous_any,
         amendment,
         amendment_from_prefix_rule,
+        amendment_candidates,
+        segment_allows,
+        policy_prompt_any: policy_prompt,
     }
 }
 
 /// Replicates `render_decision_for_unmatched_command` (Unix subset, plain parsing only).
 fn fallback_decision(segment: &[String], input: &ShellWorkerInput) -> &'static str {
-    let dangerous = crate::shell_safety::is_dangerous_command(segment);
-    let known_safe = crate::shell_safety::is_known_safe_command(segment);
+    let dangerous = segment_is_dangerous(segment);
+    let known_safe = segment_is_known_safe(segment);
 
     if known_safe && input.approval_policy == "untrusted" {
         return "allow";
@@ -409,6 +475,28 @@ fn fallback_decision(segment: &[String], input: &ShellWorkerInput) -> &'static s
         },
         // Unknown policy value from a newer Codex: be conservative.
         _ => "prompt",
+    }
+}
+
+fn segment_is_dangerous(segment: &[String]) -> bool {
+    #[cfg(windows)]
+    {
+        crate::shell_safety::is_dangerous_powershell_words(segment)
+    }
+    #[cfg(not(windows))]
+    {
+        crate::shell_safety::is_dangerous_command(segment)
+    }
+}
+
+fn segment_is_known_safe(segment: &[String]) -> bool {
+    #[cfg(windows)]
+    {
+        crate::shell_safety::is_safe_powershell_words(segment)
+    }
+    #[cfg(not(windows))]
+    {
+        crate::shell_safety::is_known_safe_command(segment)
     }
 }
 
@@ -530,24 +618,70 @@ fn parent_process_exe() -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{ppid}/exe")).ok()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn parent_process_exe() -> Option<PathBuf> {
+    let mut pid = std::process::id();
+    for _ in 0..12 {
+        let identity = crate::agents::detect::inspect_process(pid)?;
+        pid = identity.parent_pid;
+        let executable = identity.executable.map(PathBuf::from);
+        if executable.as_ref().is_some_and(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.to_ascii_lowercase().contains("codex"))
+        }) {
+            return executable;
+        }
+        if pid == 0 {
+            break;
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn parent_process_exe() -> Option<PathBuf> {
     None
 }
 
 fn which_codex() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in path_var.split(':') {
-            if !dir.is_empty() {
-                candidates.push(Path::new(dir).join("codex"));
-            }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            #[cfg(windows)]
+            candidates.push(dir.join("codex.exe"));
+            candidates.push(dir.join("codex"));
         }
     }
-    // Daemon contexts (launchd) may run with a minimal PATH.
+    // Daemon contexts (launchd/systemd) may run with a minimal PATH.
+    #[cfg(target_os = "macos")]
     candidates.push(PathBuf::from("/opt/homebrew/bin/codex"));
+    #[cfg(unix)]
     candidates.push(PathBuf::from("/usr/local/bin/codex"));
+    #[cfg(windows)]
+    if let Some(app_data) = std::env::var_os("APPDATA") {
+        let npm = PathBuf::from(app_data).join("npm/node_modules/@openai/codex/node_modules");
+        candidates.push(
+            npm.join("@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/codex/codex.exe"),
+        );
+        candidates.push(
+            npm.join("@openai/codex-win32-arm64/vendor/aarch64-pc-windows-msvc/codex/codex.exe"),
+        );
+    }
     candidates.into_iter().find(|path| is_executable(path))
+}
+
+#[cfg(windows)]
+fn codex_system_config_dir() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("OpenAI/Codex")
+}
+
+#[cfg(not(windows))]
+fn codex_system_config_dir() -> PathBuf {
+    PathBuf::from("/etc/codex")
 }
 
 #[cfg(unix)]
@@ -923,6 +1057,112 @@ mod tests {
         let output = analyze(&env.input("cargo build"), &checker, env.system.path());
         assert_eq!(output.decision, "prompt");
         assert_eq!(output.amendment, None);
+        assert!(output.policy_prompt_any);
+        assert!(output.amendment_candidates.is_empty());
+    }
+
+    #[test]
+    fn amendment_candidates_list_validated_truncations() {
+        let env = Env::new();
+        let checker = FakeChecker::new(Some((0, 144)));
+
+        // Single segment: every truncation is a prefix hit -> full ladder.
+        let output = analyze(
+            &env.input("cargo build --release"),
+            &checker,
+            env.system.path(),
+        );
+        let full: Vec<String> = vec!["cargo".into(), "build".into(), "--release".into()];
+        assert_eq!(output.amendment, Some(full.clone()));
+        assert_eq!(
+            output.amendment_candidates,
+            vec![
+                full,
+                vec!["cargo".to_string(), "build".to_string()],
+                vec!["cargo".to_string()],
+            ]
+        );
+        assert!(!output.policy_prompt_any);
+
+        // Banned truncations are skipped (["git"] is banned since 0.145).
+        let output = analyze(
+            &env.input("git push origin main"),
+            &checker,
+            env.system.path(),
+        );
+        assert_eq!(
+            output.amendment_candidates,
+            vec![
+                vec![
+                    "git".to_string(),
+                    "push".to_string(),
+                    "origin".to_string(),
+                    "main".to_string()
+                ],
+                vec!["git".to_string(), "push".to_string(), "origin".to_string()],
+                vec!["git".to_string(), "push".to_string()],
+            ]
+        );
+
+        // Multi-segment: a truncation must cover every segment (prefix hit or the
+        // segment allows on its own).
+        let output = analyze(
+            &env.input("cargo build && cargo test"),
+            &checker,
+            env.system.path(),
+        );
+        assert_eq!(output.amendment, Some(vec!["cargo".into(), "build".into()]));
+        assert_eq!(
+            output.amendment_candidates,
+            vec![
+                vec!["cargo".to_string(), "build".to_string()],
+                vec!["cargo".to_string()],
+            ]
+        );
+
+        // ls under override prompts on its own and is not covered by ["cargo"]:
+        // only the base amendment survives.
+        let output = analyze(&env.input("cargo build && ls"), &checker, env.system.path());
+        assert_eq!(output.segment_allows, vec![false, false]);
+        assert_eq!(
+            output.amendment_candidates,
+            vec![vec!["cargo".to_string(), "build".to_string()]]
+        );
+
+        // Under untrusted policy ls is known-safe (allows on its own), so ["cargo"]
+        // only needs to cover the cargo segment.
+        let mut input = env.input("cargo build && ls");
+        input.approval_policy = "untrusted".to_string();
+        let output = analyze(&input, &checker, env.system.path());
+        assert_eq!(output.segment_allows, vec![false, true]);
+        assert_eq!(
+            output.amendment_candidates,
+            vec![
+                vec!["cargo".to_string(), "build".to_string()],
+                vec!["cargo".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn amendment_candidates_skip_dangerous_truncations() {
+        let env = Env::new();
+        let checker = FakeChecker::new(Some((0, 144)));
+        let output = analyze(&env.input("rm -rf /tmp/x"), &checker, env.system.path());
+        // Base amendment is the prompting segment itself; ["rm"] is banned and
+        // ["rm", "-rf"] is dangerous, so no generalization is offered.
+        assert_eq!(
+            output.amendment,
+            Some(vec!["rm".into(), "-rf".into(), "/tmp/x".into()])
+        );
+        assert_eq!(
+            output.amendment_candidates,
+            vec![vec![
+                "rm".to_string(),
+                "-rf".to_string(),
+                "/tmp/x".to_string()
+            ]]
+        );
     }
 
     #[test]
@@ -1055,8 +1295,8 @@ mod tests {
         std::fs::write(
             home.path().join("config.toml"),
             format!(
-                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-                root.to_string_lossy()
+                "[projects.{}]\ntrust_level = \"trusted\"\n",
+                toml_edit::Value::from(root.to_string_lossy().as_ref())
             ),
         )
         .unwrap();

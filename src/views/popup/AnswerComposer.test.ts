@@ -55,6 +55,7 @@ function popupContext(dockedComposerQ = ref<number | null>(null)): PopupContext 
     speechErrorText: (value: string) => value,
     speechStatusText: (value: string) => value,
     toggleSpeech: vi.fn(),
+    focusQuestionAction: vi.fn(),
     setActive: vi.fn(),
     pickFiles: vi.fn(),
     removeImage: vi.fn(),
@@ -63,6 +64,43 @@ function popupContext(dockedComposerQ = ref<number | null>(null)): PopupContext 
 }
 
 describe("AnswerComposer", () => {
+  it("marks collapsible composers for stable compact geometry", () => {
+    dockTarget();
+    const wrapper = mount(AnswerComposer, {
+      props: { qIndex: 0, collapsible: true },
+      attachTo: document.body,
+      global: {
+        plugins: [i18n],
+        provide: { [PopupCtxKey as symbol]: popupContext() },
+      },
+    });
+
+    expect(wrapper.get(".answer-composer").classes()).toContain("is-collapsible");
+    wrapper.unmount();
+  });
+
+  it("moves actions to a real second row when text is present", async () => {
+    dockTarget();
+    const wrapper = mount(AnswerComposer, {
+      props: { qIndex: 0, collapsible: true },
+      attachTo: document.body,
+      global: {
+        plugins: [i18n],
+        provide: { [PopupCtxKey as symbol]: popupContext() },
+      },
+    });
+
+    const inputWrap = wrapper.get(".input-wrap");
+    expect(inputWrap.classes()).not.toContain("has-text");
+    expect(inputWrap.element.children[0]).toBe(wrapper.get("textarea").element);
+    expect(inputWrap.element.children[1]).toBe(wrapper.get(".composer-actions").element);
+
+    await wrapper.get("textarea").setValue("draft");
+
+    expect(inputWrap.classes()).toContain("has-text");
+    wrapper.unmount();
+  });
+
   it("moves the same textarea node through Teleport", async () => {
     const target = dockTarget();
     const dockedComposerQ = ref<number | null>(null);

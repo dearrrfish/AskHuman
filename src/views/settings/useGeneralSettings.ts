@@ -1,7 +1,6 @@
 // 「通用」tab 相关状态与动作：外观 / 弹窗行为 / 菜单栏 / 历史 / 语音 / 窗口材质。
 // （daemonLifecycle 虽展示在「高级」tab，但同属 general 配置段，也放这里。）
 import { computed, onBeforeUnmount, ref } from "vue";
-import { useI18n } from "vue-i18n";
 import { applyLanguage } from "../../i18n";
 import {
   applyWindowEffect,
@@ -16,6 +15,7 @@ import { isMac } from "../../lib/platform";
 import { applyTheme, applyWindowMaterial } from "../../lib/theme";
 import {
   eventToSpec,
+  formatModifierPreview,
   isModifierOnly,
   shortcutConflict,
   specToString,
@@ -34,7 +34,6 @@ import type {
 import type { SettingsCore } from "./context";
 
 export function useGeneralSettings(core: SettingsCore) {
-  const { t } = useI18n();
   const { config, activeTab, persist } = core;
 
   async function changeTheme(theme: ThemeMode) {
@@ -149,15 +148,6 @@ export function useGeneralSettings(core: SettingsCore) {
   const shortcutError = ref<ConflictReason | null>(null);
   let shortcutHandler: ((e: KeyboardEvent) => void) | null = null;
 
-  function previewModifiers(e: KeyboardEvent): string {
-    let o = "";
-    if (e.ctrlKey) o += "⌃";
-    if (e.altKey) o += "⌥";
-    if (e.shiftKey) o += "⇧";
-    if (e.metaKey) o += "⌘";
-    return o ? o + "…" : "";
-  }
-
   function stopRecordShortcut() {
     recordingShortcut.value = false;
     shortcutPreview.value = "";
@@ -173,7 +163,7 @@ export function useGeneralSettings(core: SettingsCore) {
     shortcutError.value = null;
     shortcutPreview.value = "";
     shortcutHandler = (e: KeyboardEvent) => {
-      // 捕获阶段拦截，避免触发浏览器/窗口默认行为（如 ⌘W 关窗）。
+      // Capture before the webview handles platform shortcuts such as close-window.
       e.preventDefault();
       e.stopPropagation();
       if (e.key === "Escape") {
@@ -181,7 +171,7 @@ export function useGeneralSettings(core: SettingsCore) {
         return;
       }
       if (isModifierOnly(e)) {
-        shortcutPreview.value = previewModifiers(e);
+        shortcutPreview.value = formatModifierPreview(e);
         return;
       }
       const spec = eventToSpec(e);
@@ -239,10 +229,6 @@ export function useGeneralSettings(core: SettingsCore) {
     await persist();
   }
 
-  function lifecycleLabel(kind: string): string {
-    return t(`settings.experimental.${kind}`);
-  }
-
   // 通用域初始化：历史条数、弹窗声音支持、Liquid Glass 支持探测。
   async function initGeneral() {
     historyTotal.value = await historyCount();
@@ -258,6 +244,20 @@ export function useGeneralSettings(core: SettingsCore) {
         glassSupported.value = false;
       }
     }
+  }
+
+  let generalReady = false;
+  let generalInflight: Promise<void> | null = null;
+
+  async function ensureGeneral() {
+    if (generalReady) return;
+    if (generalInflight) return generalInflight;
+    const run = initGeneral().finally(() => {
+      if (generalInflight === run) generalInflight = null;
+      generalReady = true;
+    });
+    generalInflight = run;
+    return run;
   }
 
   return {
@@ -286,7 +286,7 @@ export function useGeneralSettings(core: SettingsCore) {
     effectiveWindowEffect,
     changeWindowEffect,
     toggleExperimental,
-    lifecycleLabel,
     initGeneral,
+    ensureGeneral,
   };
 }

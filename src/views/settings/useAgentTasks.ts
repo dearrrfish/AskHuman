@@ -1,19 +1,29 @@
-// 「从 IM 创建 Agent 任务」（实验 tab）域：开启确认弹层、就绪度、工作目录管理面板。
+// Agent task settings: enable confirmation, readiness, and working-directory management.
 import { nextTick, onBeforeUnmount, ref } from "vue";
 import { useI18n } from "vue-i18n";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   agentTaskReadiness,
   agentTaskTestTerminal,
   agentTaskWorkspaceAdd,
   agentTaskWorkspaceForget,
   agentTaskWorkspaceHide,
-  agentTaskWorkspacePick,
   agentTaskWorkspacePin,
   agentTaskWorkspaces,
   openPath,
 } from "../../lib/ipc";
 import type { AgentKind, AgentTaskReadiness, AgentTaskWorkspace } from "../../lib/types";
+import { supportsAgentTasks } from "../../lib/platform";
 import type { SettingsCore } from "./context";
+
+/** Agent 官方安装文档（readiness「CLI ×」跳转；新建任务窗口复用）。 */
+export const AGENT_INSTALL_DOCS: Record<AgentKind, string> = {
+  claude: "https://docs.anthropic.com/en/docs/claude-code/getting-started",
+  codex: "https://developers.openai.com/codex/cli/",
+  cursor: "https://cursor.com/docs/cli/installation",
+  grok: "https://docs.x.ai/build/overview",
+  pi: "https://github.com/earendil-works/pi",
+};
 
 export function useAgentTasks(core: SettingsCore) {
   const { t } = useI18n();
@@ -25,6 +35,8 @@ export function useAgentTasks(core: SettingsCore) {
   const taskSettingsMessage = ref("");
   const workspacePanelOpen = ref(false);
   const workspaceMenuPath = ref<string | null>(null);
+  let taskSettingsInflight: Promise<void> | null = null;
+  let piReadinessInflight: Promise<AgentTaskReadiness | undefined> | null = null;
 
   async function refreshAgentTaskSettings(scan = false) {
     taskSettingsBusy.value = true;
@@ -32,13 +44,45 @@ export function useAgentTasks(core: SettingsCore) {
     try {
       [taskWorkspaces.value, taskReadiness.value] = await Promise.all([
         agentTaskWorkspaces(scan),
-        agentTaskReadiness(),
+        agentTaskReadiness({ force: scan }),
       ]);
     } catch (e) {
       taskSettingsMessage.value = String(e);
     } finally {
       taskSettingsBusy.value = false;
     }
+  }
+
+  async function ensureAgentTaskSettings(force = false) {
+    if (!supportsAgentTasks) return;
+    if (taskSettingsInflight) {
+      await taskSettingsInflight;
+      if (!force) return;
+    }
+    const run = refreshAgentTaskSettings(force);
+    taskSettingsInflight = run.finally(() => {
+      if (taskSettingsInflight === run) taskSettingsInflight = null;
+    });
+    await taskSettingsInflight;
+  }
+
+  async function ensurePiReadiness(): Promise<AgentTaskReadiness | undefined> {
+    const existing = taskReadiness.value.find((item) => item.kind === "pi");
+    if (existing) return existing;
+    if (piReadinessInflight) return piReadinessInflight;
+    const run = (async () => {
+      const items = await agentTaskReadiness({ kind: "pi" });
+      const item = items.find((entry) => entry.kind === "pi") ?? items[0];
+      if (item) {
+        const rest = taskReadiness.value.filter((entry) => entry.kind !== "pi");
+        taskReadiness.value = [...rest, item];
+      }
+      return item;
+    })();
+    piReadinessInflight = run.finally(() => {
+      if (piReadinessInflight === run) piReadinessInflight = null;
+    });
+    return piReadinessInflight;
   }
 
   // 开启走确认弹层（列出保活/登录项等副作用，用户点「继续开启」才生效）；关闭直接持久化。
@@ -70,7 +114,12 @@ export function useAgentTasks(core: SettingsCore) {
     taskSettingsBusy.value = true;
     taskSettingsMessage.value = "";
     try {
-      const path = await agentTaskWorkspacePick();
+      const selection = await openDialog({
+        directory: true,
+        multiple: false,
+        title: t("settings.agentTasks.chooseWorkspace"),
+      });
+      const path = Array.isArray(selection) ? selection[0] : selection;
       if (!path) return;
       await agentTaskWorkspaceAdd(path);
       await refreshAgentTaskSettings(false);
@@ -101,7 +150,7 @@ export function useAgentTasks(core: SettingsCore) {
     workspaceMenuPath.value = null;
     taskSettingsMessage.value = "";
     workspacePanelOpen.value = true;
-    // 冷扫描只在真正管理工作目录时做（onMounted 不扫）：扫描要读四家 Agent 的会话元数据，
+    // 冷扫描只在真正管理工作目录时做（onMounted 不扫）：扫描要读五家 Agent 的会话元数据，
     // 打开设置页就扫既浪费也曾连环触发 macOS 文件权限弹窗。
     void refreshAgentTaskSettings(true);
   }
@@ -122,6 +171,7 @@ export function useAgentTasks(core: SettingsCore) {
       codex: "Codex",
       cursor: "Cursor",
       grok: "Grok",
+      pi: "Pi",
     };
     return workspace.agents.map((kind) => labels[kind]).join(" · ");
   }
@@ -136,21 +186,10 @@ export function useAgentTasks(core: SettingsCore) {
   type ReadinessIssue = "binary" | "lifecycle" | "integration";
   const settingsTargetHighlight = ref("");
   let settingsTargetTimer: number | undefined;
-  const AGENT_INSTALL_DOCS: Record<AgentKind, string> = {
-    claude: "https://docs.anthropic.com/en/docs/claude-code/getting-started",
-    codex: "https://developers.openai.com/codex/cli/",
-    cursor: "https://cursor.com/docs/cli/installation",
-    grok: "https://docs.x.ai/build/overview",
-  };
 
-  async function openReadinessIssue(kind: AgentKind, issue: ReadinessIssue) {
-    if (issue === "binary") {
-      await openPath(AGENT_INSTALL_DOCS[kind]);
-      return;
-    }
-
-    const target = `${issue}-${kind}`;
-    activeTab.value = issue === "lifecycle" ? "advanced" : "integration";
+  /** 滚动定位 + 短暂高亮当前 tab 内的目标元素（须已切到目标 tab）。跨窗口锚点跳转
+   *（`open_settings` 的 `tab#elementId`，spec gui-agent-task-launch G5）也复用本函数。 */
+  async function gotoSettingsTarget(target: string) {
     await nextTick();
     settingsTargetHighlight.value = target;
     document.getElementById(target)?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -159,6 +198,17 @@ export function useAgentTasks(core: SettingsCore) {
       settingsTargetHighlight.value = "";
       settingsTargetTimer = undefined;
     }, 2200);
+  }
+
+  async function openReadinessIssue(kind: AgentKind, issue: ReadinessIssue) {
+    if (issue === "binary") {
+      await openPath(AGENT_INSTALL_DOCS[kind]);
+      return;
+    }
+    activeTab.value = "integration";
+    await gotoSettingsTarget(
+      issue === "lifecycle" ? `lifecycle-${kind}` : `integration-${kind}`,
+    );
   }
 
   onBeforeUnmount(() => {
@@ -183,6 +233,8 @@ export function useAgentTasks(core: SettingsCore) {
     workspacePanelOpen,
     workspaceMenuPath,
     refreshAgentTaskSettings,
+    ensureAgentTaskSettings,
+    ensurePiReadiness,
     agentTasksConfirmOpen,
     toggleAgentTasks,
     confirmEnableAgentTasks,
@@ -194,6 +246,7 @@ export function useAgentTasks(core: SettingsCore) {
     workspaceAgents,
     workspaceLastUsed,
     settingsTargetHighlight,
+    gotoSettingsTarget,
     openReadinessIssue,
     testAgentTaskTerminal,
   };

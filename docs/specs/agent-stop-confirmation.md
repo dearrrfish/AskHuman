@@ -4,6 +4,11 @@
 >
 > 调研基线（2026-07-12）：Claude Code 2.1.205、Codex CLI 0.144.1、
 > Cursor CLI 2026.06.26-7079533、Grok CLI 0.2.93。
+>
+> **Pi 补充（2026-08-19）**：Pi >=0.82.0 通过受管 Extension 的 `agent_end` + `agent_settled`
+> 识别自然 `stop`，默认开启结束确认；继续时在同一 session 空闲且无排队消息后调用
+> `pi.sendUserMessage`。错误、取消、过期裁决和 session/generation 不匹配均 fail-open。Pi 没有 MCP
+> mode，preference 仅在 CLI mode 激活；完整设计见 `docs/plans/pi-agent-integration.md`。
 
 ## 1. 背景与目标
 
@@ -26,8 +31,9 @@
 | Codex | `Stop`，输入含 `last_assistant_message`、`stop_hook_active` | 返回 `decision: "block"` + `reason`，自动创建 continuation prompt | 无 `StopFailure`；错误/中断在 `Stop` 前返回 | 支持自然完成 |
 | Cursor | `stop`，输入含 `status`、`loop_count`，通用字段含 `transcript_path` | 返回 `followup_message`；`loop_limit: null` 可取消次数上限 | Hook 会收到 `aborted/error`，但 `followup_message` 仅在 `completed` 时消费 | 支持自然完成 |
 | Grok | `Stop` 是被动事件 | stdout 被忽略；只有 `PreToolUse` 可阻塞 | `StopFailure` 同样被动 | 首期明确不支持 |
+| Pi | Extension `agent_end` + `agent_settled` | `pi.sendUserMessage` | 只接受 `stopReason="stop"`；其它原因放行 | 支持自然完成 |
 
-因此首期只在 **Claude Code / Codex / Cursor 的自然完成**时发确认卡。
+当前在 **Claude Code / Codex / Cursor / Pi 的自然完成**时发确认卡。
 错误和用户取消不发卡、不尝试外部 `resume`。三家错误路径继续沿用现有生命周期管理：
 
 - Claude `StopFailure → turn-end`，立即置空闲；
@@ -48,10 +54,19 @@
 
 ### 3.1 开关与支持范围
 
-- Claude Code / Codex / Cursor 各自一个“结束时确认”开关，默认关闭。
-- 开关在产品语义上独立于“生命周期追踪”和“权限审批”。
+- Claude Code / Codex / Cursor 各自一个“结束时确认”开关且默认关闭；Pi 同样有独立开关，默认开启。
+- Stop preference 在产品语义上独立于 lifecycle preference 和权限审批，并跨 integration mode 切换
+  保留；但 active confirmation 只在 CLI/MCP mode 安装，None 下暂停并隐藏，重新集成时按原
+  preference 恢复。Lifecycle 自身是自动集成拥有的可选 capability，不允许脱离 active mode 安装。
 - Grok 显示不支持或不展示开关，不安装 Stop 确认 Hook。
 - 仅自然完成触发；错误、API failure、用户主动取消不发卡。
+- Codex 的内部 thread 不触发结束确认。新版 Hook 输入优先按
+  `thread_source ∈ {"system", "ambient_suggestions"}` 精确识别（拦截集合与 MCP guard 共用，见
+  `mcp.md`；后者为 ChatGPT.app 26.721+ 对 ambient 线程的新标签）；在尚未提供该字段的旧版 Codex 中，
+  `transcript_path` 字段明确为 `null` 表示未创建 rollout 的 ephemeral thread，同样静默放行。
+  字段缺失不按 ephemeral 处理，Claude / Cursor 的行为不受影响。命中后向
+  `~/.askhuman/daemon.log` 写一条结构化审计，`reason` 分别为 `codex_blocked_thread_source`（附
+  `threadSource` 观测原值）或 `codex_transcript_path_null`。
 
 ### 3.2 确认卡
 
@@ -136,17 +151,19 @@
 {}
 ```
 
-stdout 必须只有一个合法 JSON 对象；日志只写 stderr。Hook 始终以 Agent 可接受的成功码退出。
+stdout 必须只有一个合法 JSON 对象；普通诊断日志只写 stderr，system / ephemeral 抑制审计写
+`~/.askhuman/daemon.log`。审计只含 agent、reason 与可用的 session/thread/turn id，不含最后回复或
+transcript 路径。Hook 始终以 Agent 可接受的成功码退出。
 
 ## 5. 架构设计
 
 ### 5.1 单一 AskHuman Stop handler
 
-虽然“结束时确认”和“生命周期追踪”是两个独立开关，但同一家 Agent 的磁盘配置里，
+虽然 active 自动集成里的“结束时确认”和“生命周期追踪”是两个独立偏好，但同一家 Agent 的磁盘配置里，
 AskHuman **只能拥有一个 Stop handler**。原因是三家都会并发启动同一事件的多条匹配 Hook；若一条先上报
 `turn-end`、另一条再等待确认，注册表会提前变空闲并产生竞态。
 
-共享 reconcile 的四种状态：
+active mode 下共享 reconcile 的四种状态：
 
 | 生命周期追踪 | 结束时确认 | AskHuman Stop handler 行为 |
 |---|---|---|
@@ -154,6 +171,11 @@ AskHuman **只能拥有一个 Stop handler**。原因是三家都会并发启动
 | 开 | 关 | 直接上报 `turn-end` |
 | 关 | 开 | 等待确认；不写生命周期注册表 |
 | 开 | 开 | 等待确认；结束/fail-open 后上报 `turn-end`，继续时保持 working |
+
+integration mode 在上述矩阵之外同时门控两个 capability：None 必须删除实际 lifecycle 与 Stop
+handler，但保留 lifecycle/Stop 两项 preference；CLI/MCP 才按两项 preference 重新生成无 handler、
+`track`、`confirm` 或 `track + confirm`。因此现行产品不存在 None + track-only 状态；若检测到旧版
+孤立 lifecycle，则在 Agent 卡显示待清理更新，由用户点击后删除。
 
 启停任一开关都必须在现有 `IntegrationMutationLock` 内重算目标状态：
 
@@ -226,6 +248,8 @@ watch 并集、渠道扰动、取消及现有卡片终态，不新增 Stop 专�
 ### 6.2 安装器与配置保留
 
 - 生命周期 × 结束确认四种组合的 install/uninstall/update 全矩阵及任意切换顺序。
+- None/CLI/MCP × lifecycle × Stop preference 全矩阵：None 删除整个 AskHuman Stop handler 但保留
+  两项 preference；重新集成时恢复 active mode 对应的 `track` / `confirm` 组合。
 - 同一 Agent 任一状态下 AskHuman 自己最多一条 Stop handler。
 - 保留同事件其它用户 handler、注释、JSONC/TOML 格式与无关字段。
 - Claude Nested、Cursor Flat、Codex hooks.json + trust hash 的 status/outdated/reconcile。
