@@ -24,14 +24,13 @@ permissions:
   pull-requests: write
   issues: write
 
-concurrency:
-  group: sync-upstream
-  cancel-in-progress: false
-
 jobs:
   sync:
     name: sync upstream/main
     runs-on: ubuntu-22.04
+    concurrency:
+      group: sync-branches
+      cancel-in-progress: false
     env:
       UPSTREAM_REPO: https://github.com/Naituw/AskHuman.git
       TARGET_BRANCH: main
@@ -374,3 +373,11 @@ jobs:
 
             exit 1
           fi
+
+  sync-my-nixpkgs:
+    name: sync main -> my-nixpkgs
+    needs: sync
+    if: ${{ !cancelled() && needs.sync.result == 'success' }}
+    uses: ./.github/workflows/sync-my-nixpkgs.yml
+    with:
+      dry_run: ${{ inputs.dry_run || false }}
