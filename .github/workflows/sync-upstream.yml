@@ -1,0 +1,376 @@
+name: sync-upstream
+
+# Automatically synchronizes upstream/main (https://github.com/Naituw/AskHuman.git)
+# and v* release tags into origin/main (dearrrfish/AskHuman).
+# - Retains downstream-specific commits via linear git rebase.
+# - Protects against concurrent pushes using --force-with-lease.
+# - Synchronizes Git LFS objects on fast-forward, rebase, and tag sync.
+# - On rebase conflict: aborts rebase, pushes upstream/main to sync/upstream-main,
+#   creates or updates a Pull Request (with fallback Issue), and alerts the maintainer.
+
+on:
+  schedule:
+    # Daily at 04:00 UTC
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Simulate sync without pushing to origin"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: sync upstream/main
+    runs-on: ubuntu-22.04
+    env:
+      UPSTREAM_REPO: https://github.com/Naituw/AskHuman.git
+      TARGET_BRANCH: main
+      CONFLICT_BRANCH: sync/upstream-main
+      DRY_RUN: ${{ inputs.dry_run || false }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          lfs: true
+
+      - name: Configure Git identity and remotes
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config commit.gpgSign false
+          git config tag.gpgSign false
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "$UPSTREAM_REPO"
+          else
+            git remote add upstream "$UPSTREAM_REPO"
+          fi
+
+          echo "Fetching target branch and tags from upstream ($UPSTREAM_REPO)..."
+          git fetch --no-tags upstream "$TARGET_BRANCH:refs/remotes/upstream/$TARGET_BRANCH" "refs/tags/v*:refs/upstream-tags/v*"
+
+      - name: Synchronize upstream tags
+        run: |
+          set -euo pipefail
+
+          NEW_TAGS=()
+          PUSH_TAGS=()
+
+          for ref in $(git for-each-ref --format="%(refname)" refs/upstream-tags/ 2>/dev/null || true); do
+            tag="${ref#refs/upstream-tags/}"
+            if ! git show-ref --verify --quiet "refs/tags/$tag"; then
+              echo "New tag detected: $tag"
+              git update-ref "refs/tags/$tag" "$ref"
+              NEW_TAGS+=("$tag")
+              PUSH_TAGS+=("refs/tags/$tag:refs/tags/$tag")
+            else
+              LOCAL_SHA=$(git rev-parse --verify -q "refs/tags/$tag^{commit}" || true)
+              UPSTREAM_SHA=$(git rev-parse --verify -q "$ref^{commit}" || true)
+              if [ "$LOCAL_SHA" != "$UPSTREAM_SHA" ]; then
+                if git merge-base --is-ancestor "$LOCAL_SHA" "$UPSTREAM_SHA" 2>/dev/null; then
+                  echo "Fast-forwarding existing tag: $tag"
+                  git update-ref "refs/tags/$tag" "$ref"
+                  NEW_TAGS+=("$tag")
+                  PUSH_TAGS+=("+refs/tags/$tag:refs/tags/$tag")
+                else
+                  echo "::warning::Tag $tag diverged between origin and upstream (not fast-forwardable). Skipping."
+                fi
+              fi
+            fi
+          done
+
+          if [ ${#NEW_TAGS[@]} -gt 0 ]; then
+            echo "Found ${#NEW_TAGS[@]} new/updated tags: ${NEW_TAGS[*]}"
+            for tag in "${NEW_TAGS[@]}"; do
+              echo "Fetching LFS objects for tag $tag..."
+              git lfs fetch upstream "$tag" || true
+            done
+
+            if [ "$DRY_RUN" != "true" ]; then
+              echo "Pushing tags to origin..."
+              git push origin "${PUSH_TAGS[@]}"
+            else
+              echo "Dry run: skipping tag push to origin"
+            fi
+
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### 🏷️ Synchronized Upstream Tags"
+                echo "Synced ${#NEW_TAGS[@]} release tag(s) to origin:"
+                for t in "${NEW_TAGS[@]}"; do
+                  echo "- \`$t\`"
+                done
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "All upstream v* tags are already up to date on origin."
+          fi
+
+      - name: Synchronize main branch
+        run: |
+          set -euo pipefail
+
+          ORIG_HEAD=$(git rev-parse HEAD)
+          UPSTREAM_HEAD=$(git rev-parse "upstream/$TARGET_BRANCH")
+
+          echo "Origin HEAD:   $ORIG_HEAD"
+          echo "Upstream HEAD: $UPSTREAM_HEAD"
+
+          # Case 1: upstream/main is already an ancestor of origin/main
+          if git merge-base --is-ancestor "$UPSTREAM_HEAD" "$ORIG_HEAD"; then
+            echo "Upstream HEAD is already an ancestor of origin/main."
+            if [ "$ORIG_HEAD" = "$UPSTREAM_HEAD" ]; then
+              echo "origin/main is identical to upstream/$TARGET_BRANCH."
+              if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                {
+                  echo "### 🟢 Upstream Sync: Already Up to Date"
+                  echo "- **Target Branch**: \`$TARGET_BRANCH\`"
+                  echo "- **Upstream HEAD**: \`$UPSTREAM_HEAD\`"
+                  echo "- **Origin HEAD**: \`$ORIG_HEAD\`"
+                  echo "- **Status**: Branch \`$TARGET_BRANCH\` is identical to upstream. No sync needed."
+                } >> "$GITHUB_STEP_SUMMARY"
+              fi
+            else
+              echo "origin/main has downstream commits on top of upstream/$TARGET_BRANCH."
+              DOWNSTREAM_COMMITS=$(git log --oneline "$UPSTREAM_HEAD..$ORIG_HEAD")
+              if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                {
+                  echo "### 🟢 Upstream Sync: Already Up to Date"
+                  echo "- **Target Branch**: \`$TARGET_BRANCH\`"
+                  echo "- **Upstream HEAD**: \`$UPSTREAM_HEAD\`"
+                  echo "- **Origin HEAD**: \`$ORIG_HEAD\`"
+                  echo "- **Status**: Upstream commits are already integrated into \`$TARGET_BRANCH\`."
+                  echo ""
+                  echo "<details>"
+                  echo "<summary>Downstream commits ahead of upstream</summary>"
+                  echo ""
+                  echo '```'
+                  echo "$DOWNSTREAM_COMMITS"
+                  echo '```'
+                  echo "</details>"
+                } >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+            exit 0
+          fi
+
+          # Case 2: origin/main is an ancestor of upstream/main (clean fast-forward)
+          if git merge-base --is-ancestor "$ORIG_HEAD" "$UPSTREAM_HEAD"; then
+            echo "origin/main can be cleanly fast-forwarded to upstream/$TARGET_BRANCH."
+            git merge --ff-only "$UPSTREAM_HEAD"
+            git lfs fetch upstream "$UPSTREAM_HEAD" || true
+
+            INTEGRATED_COMMITS=$(git log --oneline "$ORIG_HEAD..$UPSTREAM_HEAD")
+
+            if [ "$DRY_RUN" != "true" ]; then
+              echo "Pushing fast-forwarded $TARGET_BRANCH to origin..."
+              git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+              git lfs push origin --all || true
+            else
+              echo "Dry run: skipping push to origin/$TARGET_BRANCH"
+            fi
+
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### 🚀 Upstream Sync: Fast-Forward Successful"
+                echo "- **Target Branch**: \`$TARGET_BRANCH\`"
+                echo "- **Previous HEAD**: \`$ORIG_HEAD\`"
+                echo "- **New HEAD**: \`$UPSTREAM_HEAD\`"
+                echo "- **Mode**: Fast-Forward"
+                echo ""
+                echo "<details open>"
+                echo "<summary>Commits integrated from upstream</summary>"
+                echo ""
+                echo '```'
+                echo "$INTEGRATED_COMMITS"
+                echo '```'
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+
+          # Case 3: Diverged branches (downstream commits exist and upstream has new commits)
+          MERGE_BASE=$(git merge-base "$ORIG_HEAD" "$UPSTREAM_HEAD")
+          UPSTREAM_COMMITS=$(git log --oneline "$MERGE_BASE..$UPSTREAM_HEAD")
+          DOWNSTREAM_COMMITS=$(git log --oneline "$MERGE_BASE..$ORIG_HEAD")
+
+          echo "Branches diverged at $MERGE_BASE."
+          echo "Attempting git rebase onto $UPSTREAM_HEAD..."
+
+          if git rebase "$UPSTREAM_HEAD"; then
+            # Subcase 3a: Rebase succeeded cleanly
+            NEW_HEAD=$(git rev-parse HEAD)
+            echo "Rebase succeeded cleanly! New HEAD: $NEW_HEAD"
+            git lfs fetch upstream "$UPSTREAM_HEAD" || true
+            REBASED_COMMITS=$(git log --oneline "$UPSTREAM_HEAD..$NEW_HEAD")
+
+            if [ "$DRY_RUN" != "true" ]; then
+              echo "Pushing rebased $TARGET_BRANCH with --force-with-lease..."
+              git push --force-with-lease="refs/heads/$TARGET_BRANCH:$ORIG_HEAD" origin "HEAD:refs/heads/$TARGET_BRANCH"
+              git lfs push origin --all || true
+            else
+              echo "Dry run: skipping push to origin/$TARGET_BRANCH"
+            fi
+
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### 🔄 Upstream Sync: Rebase Successful"
+                echo "- **Target Branch**: \`$TARGET_BRANCH\`"
+                echo "- **Merge Base**: \`$MERGE_BASE\`"
+                echo "- **Upstream HEAD**: \`$UPSTREAM_HEAD\`"
+                echo "- **Previous Origin HEAD**: \`$ORIG_HEAD\`"
+                echo "- **New Origin HEAD**: \`$NEW_HEAD\`"
+                echo "- **Mode**: Rebase (--force-with-lease)"
+                echo ""
+                echo "<details open>"
+                echo "<summary>Upstream commits integrated</summary>"
+                echo ""
+                echo '```'
+                echo "$UPSTREAM_COMMITS"
+                echo '```'
+                echo "</details>"
+                echo ""
+                echo "<details open>"
+                echo "<summary>Downstream commits rebased</summary>"
+                echo ""
+                echo '```'
+                echo "$REBASED_COMMITS"
+                echo '```'
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          else
+            # Subcase 3b: Rebase conflict
+            echo "::error::Rebase failed with conflicts."
+            CONFLICTED_FILES=$(git diff --name-only --diff-filter=U || true)
+            if [ -z "$CONFLICTED_FILES" ]; then
+              CONFLICTED_FILES=$(git status --porcelain | awk '/^[UDA]{2}/ {print $2}' || true)
+            fi
+
+            echo "Aborting rebase and resetting to origin HEAD..."
+            git rebase --abort || true
+            git reset --hard "$ORIG_HEAD"
+
+            BODY_FILE=$(mktemp)
+            {
+              echo "An automated rebase of downstream commits onto upstream/\`$TARGET_BRANCH\` encountered merge conflicts."
+              echo ""
+              echo "### Conflict Details"
+              echo "- **Target Branch**: \`$TARGET_BRANCH\`"
+              echo "- **Upstream HEAD**: \`$UPSTREAM_HEAD\`"
+              echo "- **Origin HEAD**: \`$ORIG_HEAD\`"
+              echo "- **Conflict Branch**: \`$CONFLICT_BRANCH\`"
+              echo ""
+              echo "### Conflicted Files"
+              echo '```'
+              echo "$CONFLICTED_FILES"
+              echo '```'
+              echo ""
+              echo "### Downstream Commits to Rebase"
+              echo '```'
+              echo "$DOWNSTREAM_COMMITS"
+              echo '```'
+              echo ""
+              echo "### Upstream Commits"
+              echo '```'
+              echo "$UPSTREAM_COMMITS"
+              echo '```'
+              echo ""
+              echo "### Manual Resolution Instructions"
+              echo "To resolve this locally:"
+              echo '```bash'
+              echo "git fetch origin"
+              echo "git fetch upstream"
+              echo "git checkout -B $TARGET_BRANCH origin/$TARGET_BRANCH"
+              echo "git rebase upstream/$TARGET_BRANCH"
+              echo "# Resolve conflicts in your editor, then:"
+              echo "git add <conflicted-files>"
+              echo "git rebase --continue"
+              echo "# Push rebased main to origin:"
+              echo "git push --force-with-lease origin $TARGET_BRANCH"
+              echo "# Clean up conflict branch if desired:"
+              echo "git push origin --delete $CONFLICT_BRANCH"
+              echo '```'
+            } > "$BODY_FILE"
+
+            if [ "$DRY_RUN" != "true" ]; then
+              echo "Pushing upstream HEAD to origin/$CONFLICT_BRANCH..."
+              git push origin "+$UPSTREAM_HEAD:refs/heads/$CONFLICT_BRANCH"
+
+              echo "Checking for existing PR from $CONFLICT_BRANCH to $TARGET_BRANCH..."
+              PR_NUM=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$CONFLICT_BRANCH" --base "$TARGET_BRANCH" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+
+              PR_ACTION_DONE=false
+              if [ -n "$PR_NUM" ]; then
+                echo "Updating existing PR #$PR_NUM..."
+                if gh pr edit "$PR_NUM" --repo "$GITHUB_REPOSITORY" --title "chore(sync): resolve conflict with upstream/$TARGET_BRANCH" --body-file "$BODY_FILE"; then
+                  PR_ACTION_DONE=true
+                fi
+              else
+                echo "Creating new PR for conflict resolution..."
+                if gh pr create --repo "$GITHUB_REPOSITORY" --head "$CONFLICT_BRANCH" --base "$TARGET_BRANCH" --title "chore(sync): resolve conflict with upstream/$TARGET_BRANCH" --body-file "$BODY_FILE"; then
+                  PR_ACTION_DONE=true
+                fi
+              fi
+
+              if [ "$PR_ACTION_DONE" != "true" ]; then
+                echo "PR action could not be completed. Falling back to GitHub Issue..."
+                ISSUE_NUM=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"[Upstream Sync]\"" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+                if [ -n "$ISSUE_NUM" ]; then
+                  echo "Commenting on existing issue #$ISSUE_NUM..."
+                  gh issue comment "$ISSUE_NUM" --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE" || true
+                else
+                  echo "Creating new issue for conflict notification..."
+                  gh issue create --repo "$GITHUB_REPOSITORY" --title "[Upstream Sync] Rebase conflict with upstream/$TARGET_BRANCH" --body-file "$BODY_FILE" || true
+                fi
+              fi
+            else
+              echo "Dry run: skipping push to origin/$CONFLICT_BRANCH and PR/Issue creation."
+            fi
+            rm -f "$BODY_FILE"
+
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### ❌ Upstream Sync: Rebase Conflict"
+                echo "An automated rebase of downstream commits onto \`upstream/$TARGET_BRANCH\` failed due to merge conflicts."
+                echo ""
+                echo "- **Upstream HEAD**: \`$UPSTREAM_HEAD\`"
+                echo "- **Origin HEAD**: \`$ORIG_HEAD\`"
+                echo "- **Conflict Branch**: \`$CONFLICT_BRANCH\`"
+                echo ""
+                echo "#### Conflicted Files"
+                echo '```'
+                echo "$CONFLICTED_FILES"
+                echo '```'
+                echo ""
+                echo "#### Downstream Commits"
+                echo '```'
+                echo "$DOWNSTREAM_COMMITS"
+                echo '```'
+                echo ""
+                echo "#### Manual Resolution Instructions"
+                echo '```bash'
+                echo "git fetch upstream && git checkout $TARGET_BRANCH && git rebase upstream/$TARGET_BRANCH"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            exit 1
+          fi
