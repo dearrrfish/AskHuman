@@ -33,6 +33,23 @@ demo/tray-menu-close/swift/test_fix
 # 杂项
 .DS_Store
 
+# Downstream-only (kept away from the upstream-maintained tail so upstream appends never conflict)
+.*/skills/team-*/
+.*/agents/coordinator*
+.*/agents/explorer*
+.*/agents/design-agent*
+.*/agents/implementer*
+.*/agents/ops*
+.*/agents/reviewer*
+.worktrees/
+.agent-team/runs/
+.agent-team/backups/
+.agent-team/install-state.json
+/.agent-team/templates/prompts/plan.md
+/.agent-team/templates/prompts/coordinate.md
+/.agent-team/templates/prompts/review.md
+/.agent-team/templates/prompts/discovery.md
+
 # Dev Instance（每 worktree 本地隔离：bin / home / 标记，见 docs/specs/dev-instance-parallel.md）
 .askhuman-dev/
 
