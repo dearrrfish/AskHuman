@@ -12,8 +12,6 @@ use crate::integrations::{
     cursor_hook, mcp_config,
 };
 
-const AGENTS: [&str; 5] = ["cursor", "claude", "codex", "grok", "pi"];
-
 fn daemon_login_ready() -> bool {
     crate::integrations::login_item::daemon_is_installed()
         && !crate::integrations::login_item::daemon_needs_update()
@@ -42,10 +40,17 @@ pub fn dispatch(args: &[String], lang: Lang) {
     let status = cfgio::daemon_status();
     let install = install_check::collect(status.as_ref());
 
-    if json {
-        super::print_line(&render_json(&cfg, &status, &install, lang));
+    let output = if json {
+        render_json(&cfg, &status, &install, lang)
     } else {
-        super::print_line(&render_text(&cfg, &status, &install, lang));
+        render_text(&cfg, &status, &install, lang)
+    };
+    match output {
+        Ok(output) => super::print_line(&output),
+        Err(error) => {
+            eprintln!("Integration status unavailable: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -54,7 +59,7 @@ fn render_text(
     status: &Option<crate::ipc::StatusInfo>,
     install: &install_check::Report,
     lang: Lang,
-) -> String {
+) -> Result<String, String> {
     let yes = cfgio::t(lang, "yes", "是");
     let no = cfgio::t(lang, "no", "否");
     let yn = |b: bool| if b { yes.clone() } else { no.clone() };
@@ -129,14 +134,21 @@ fn render_text(
 
     // Integrations
     out.push_str(&cfgio::t(lang, "\nIntegrations\n", "\n集成\n"));
-    for &name in &AGENTS {
+    for name in super::agents_cmd::aggregate_agents() {
         let target = AgentTarget::parse(name).unwrap();
         let kind = crate::agents::AgentKind::parse(name).unwrap();
-        let rules = state_label(
-            agent_rules::is_installed(target),
-            agent_rules::needs_update(target),
-            lang,
-        );
+        let (mode, rule_outdated, rule_installed) = if target == AgentTarget::Antigravity {
+            let (mode, updates, installed) =
+                agent_mode::antigravity_status().map_err(|e| e.to_string())?;
+            (mode, updates.rule, installed)
+        } else {
+            (
+                agent_mode::current(target),
+                agent_rules::needs_update(target),
+                agent_rules::is_installed(target),
+            )
+        };
+        let rules = state_label(rule_installed, rule_outdated, lang);
         let hook = match target {
             AgentTarget::Cursor => state_label(
                 cursor_hook::is_installed(),
@@ -148,7 +160,9 @@ fn render_text(
                 claude_hook::needs_update(),
                 lang,
             ),
-            AgentTarget::Codex | AgentTarget::Grok => cfgio::t(lang, "n/a", "—"),
+            AgentTarget::Codex | AgentTarget::Grok | AgentTarget::Antigravity => {
+                cfgio::t(lang, "n/a", "—")
+            }
             AgentTarget::Pi => state_label(
                 agent_mode::timeout_hook_is_installed(target),
                 agent_mode::timeout_hook_needs_update(target),
@@ -205,7 +219,7 @@ fn render_text(
             "  {:<8} {}={} {}={} {}={} {}={} {}={} {}={} {}={}\n",
             name,
             cfgio::t(lang, "mode", "模式"),
-            mode_label(agent_mode::current(target), lang),
+            mode_label(mode, lang),
             cfgio::t(lang, "rules", "规则"),
             rules,
             cfgio::t(lang, "hook", "hook"),
@@ -255,7 +269,7 @@ fn render_text(
     if let Some(error) = cursor.error {
         out.push_str(&format!("  {error}\n"));
     }
-    out.trim_end().to_string()
+    Ok(out.trim_end().to_string())
 }
 
 fn state_label(installed: bool, needs_update: bool, lang: Lang) -> String {
@@ -281,7 +295,7 @@ fn render_json(
     status: &Option<crate::ipc::StatusInfo>,
     install: &install_check::Report,
     lang: Lang,
-) -> String {
+) -> Result<String, String> {
     let conns = status
         .as_ref()
         .map(|s| s.im_connections.clone())
@@ -303,15 +317,19 @@ fn render_json(
             })
         })
         .collect();
-    let integrations: Vec<serde_json::Value> = AGENTS
+    let integrations: Vec<serde_json::Value> = super::agents_cmd::aggregate_agents()
         .iter()
-        .map(|&name| {
+        .map(|&name| -> Result<serde_json::Value, String> {
             let target = AgentTarget::parse(name).unwrap();
             let kind = crate::agents::AgentKind::parse(name).unwrap();
+            let (mode, rule_outdated, rule_installed) = if target == AgentTarget::Antigravity {
+                let (mode, updates, installed) = agent_mode::antigravity_status().map_err(|e| e.to_string())?;
+                (mode, updates.rule, installed)
+            } else { (agent_mode::current(target), agent_rules::needs_update(target), agent_rules::is_installed(target)) };
             let hook = match target {
                 AgentTarget::Cursor => Some((cursor_hook::is_installed(), cursor_hook::needs_update())),
                 AgentTarget::ClaudeCode => Some((claude_hook::is_installed(), claude_hook::needs_update())),
-                AgentTarget::Codex | AgentTarget::Grok => None,
+                AgentTarget::Codex | AgentTarget::Grok | AgentTarget::Antigravity => None,
                 AgentTarget::Pi => Some((
                     agent_mode::timeout_hook_is_installed(target),
                     agent_mode::timeout_hook_needs_update(target),
@@ -320,10 +338,10 @@ fn render_json(
             let lc = agent_lifecycle::status(kind);
             let permission = agent_permission::status(target);
             let guard = agent_subagent_guard::status(target);
-            serde_json::json!({
+            Ok(serde_json::json!({
                 "name": name,
-                "mode": agent_mode::current(target).as_str(),
-                "rules": { "installed": agent_rules::is_installed(target), "needsUpdate": agent_rules::needs_update(target) },
+                "mode": mode.as_str(),
+                "rules": { "installed": rule_installed, "needsUpdate": rule_outdated },
                 "hook": hook.map(|(i, u)| serde_json::json!({ "installed": i, "needsUpdate": u })),
                 "subagentGuard": if agent_subagent_guard::supported(target) {
                     Some(serde_json::json!({
@@ -343,9 +361,9 @@ fn render_json(
                     "cleanupRequired": lc.cleanup_required,
                     "supported": lc.supported
                 },
-            })
+            }))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let daemon = match status {
         Some(s) => serde_json::json!({
             "running": true,
@@ -378,5 +396,5 @@ fn render_json(
             "agents": task_readiness,
         },
     }))
-    .unwrap_or_default()
+    .map_err(|e| e.to_string())
 }

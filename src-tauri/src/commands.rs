@@ -575,12 +575,59 @@ pub fn popup_show_window(app: AppHandle, request_id: Option<String>) {
 /// `ts` 为前端 `Date.now()`（epoch ms），使时间反映页面而非 IPC 往返；省略则用当前时间。
 /// 埋点关闭（无关联 id）时为 no-op。
 #[tauri::command]
-pub fn perf_mark(stage: String, ts: Option<f64>) {
+pub fn perf_mark(
+    app: AppHandle,
+    stage: String,
+    ts: Option<f64>,
+    request_id: Option<String>,
+) -> bool {
+    if let Some(request_id) = request_id {
+        let Some(ts) = ts.filter(|value| value.is_finite() && *value >= 0.0) else {
+            return false;
+        };
+        if stage != "fe.painted" || !canonical_non_nil_uuid(&request_id) {
+            return false;
+        }
+        let Some(inbox) = app.try_state::<crate::app::popup_inbox::Inbox>() else {
+            return false;
+        };
+        // `Inbox::active_perf_id` gates this to the active, pending presentation. The native
+        // window check closes the interval before its actual raise finishes.
+        if !app
+            .get_webview_window("popup")
+            .is_some_and(|window| window.is_visible().unwrap_or(false))
+        {
+            return false;
+        }
+        let Some(perf_id) = inbox.active_perf_id(&request_id) else {
+            return false;
+        };
+        if !valid_perf_id(&perf_id) {
+            return false;
+        }
+        // Preserve the existing performance-harness milestone while adding the request-bound
+        // receipt used by the transport collector. Only the suffixed marker is evidence here.
+        crate::perf::mark_at(&perf_id, "fe.painted", ts as u128);
+        crate::perf::mark_at(&perf_id, &format!("fe.painted:{request_id}"), ts as u128);
+        return true;
+    }
     let id = crate::perf::effective_id();
     match ts {
         Some(t) => crate::perf::mark_at(&id, &stage, t as u128),
         None => crate::perf::mark(&id, &stage),
     }
+    true
+}
+
+fn canonical_non_nil_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value)
+        .is_ok_and(|parsed| !parsed.is_nil() && parsed.hyphenated().to_string() == value)
+}
+
+fn valid_perf_id(value: &str) -> bool {
+    // Legacy `<pid>-<ms>` ids and harness-supplied Antigravity keys share one bounded grammar
+    // so popup paint marks are not dropped for the newer form.
+    crate::perf::valid_correlation_id(value)
 }
 
 /// 解析某 agent pid 所在终端类型（`apple-terminal`/`iterm2`/…）。**刻意独立于 `popup_init` + 异步**：
@@ -3108,8 +3155,20 @@ pub fn collaboration_style_apply_integrations() -> Result<(), String> {
         AgentTarget::Codex,
         AgentTarget::Grok,
         AgentTarget::Pi,
+        AgentTarget::Antigravity,
     ] {
-        let mode = agent_mode::current(target);
+        // An unavailable platform adapter must not break updates to existing integrations.
+        // Dedicated Antigravity status/mutations still return the explicit unsupported error.
+        if target == AgentTarget::Antigravity && !cfg!(unix) {
+            continue;
+        }
+        let mode = if target == AgentTarget::Antigravity {
+            agent_mode::antigravity_status()
+                .map_err(|e| e.to_string())?
+                .0
+        } else {
+            agent_mode::current(target)
+        };
         if mode == Mode::None {
             continue;
         }
@@ -3420,6 +3479,16 @@ fn parse_agent(agent: &str) -> Result<AgentTarget, String> {
 #[tauri::command]
 pub fn agent_rule_status(agent: String) -> Result<RuleStatus, String> {
     let a = parse_agent(&agent)?;
+    if a == agent_rules::AgentTarget::Antigravity {
+        let (_, updates, installed) =
+            agent_mode::antigravity_status().map_err(|e| e.to_string())?;
+        return Ok(RuleStatus {
+            installed,
+            outdated: updates.rule,
+            path: agent_rules::display_path(a),
+            supported: true,
+        });
+    }
     Ok(RuleStatus {
         installed: agent_rules::is_installed(a),
         outdated: agent_rules::needs_update(a),
@@ -3518,8 +3587,15 @@ pub async fn agent_mode_status(agent: String) -> Result<AgentModeStatus, String>
 fn agent_mode_status_sync(agent: &str) -> Result<AgentModeStatus, String> {
     let a = parse_agent(agent)?;
     let stop_kind = parse_agent_kind(agent)?;
-    let updates = agent_mode::artifact_updates(a);
-    let mode = agent_mode::current(a);
+    let (mode, updates, rule_installed) = if a == agent_rules::AgentTarget::Antigravity {
+        agent_mode::antigravity_status().map_err(|e| e.to_string())?
+    } else {
+        (
+            agent_mode::current(a),
+            agent_mode::artifact_updates(a),
+            agent_rules::is_installed(a),
+        )
+    };
     let lifecycle = agent_lifecycle::status_for_mode(stop_kind, mode);
     let permission = agent_permission::status(a);
     let recovery = agent_context_recovery::status(a, mode);
@@ -3532,7 +3608,7 @@ fn agent_mode_status_sync(agent: &str) -> Result<AgentModeStatus, String> {
         hook_needs_update: updates.hook,
         mcp_needs_update: updates.mcp,
         rule_path: agent_rules::display_path(a),
-        rule_installed: agent_rules::is_installed(a),
+        rule_installed,
         timeout_hook_supported: agent_mode::timeout_hook_supported(a),
         timeout_hook_installed: agent_mode::timeout_hook_is_installed(a),
         timeout_hook_needs_update: agent_mode::timeout_hook_supported(a)
@@ -4798,6 +4874,23 @@ pub fn restart_settings(app: AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_paint_perf_ids_match_the_cli_pid_epoch_format() {
+        assert!(valid_perf_id("123-123456"));
+        assert!(!valid_perf_id(""));
+        assert!(!valid_perf_id("123-"));
+        assert!(!valid_perf_id("0-123456"));
+        assert!(!valid_perf_id("123-12\n3456"));
+        assert!(!valid_perf_id("123-123456-7"));
+        // Harness-supplied Antigravity keys must reach the paint marks.
+        assert!(valid_perf_id("agy-case-1"));
+        assert!(valid_perf_id("Agy.case:run_1"));
+        assert!(!valid_perf_id("1agy-case"));
+        assert!(!valid_perf_id("-agy"));
+        assert!(!valid_perf_id(" agy"));
+        assert!(!valid_perf_id(&format!("agy-{}", "x".repeat(61))));
+    }
 
     #[test]
     fn fork_source_rejects_desktop_origin_at_selection_and_submission() {

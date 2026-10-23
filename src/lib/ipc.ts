@@ -70,6 +70,10 @@ export const enrichPermissionDiff = (requestId: string) =>
 export const perfMark = (stage: string, ts: number) =>
   invoke<void>("perf_mark", { stage, ts });
 
+/** Record a paint only when this exact shared-popup request is active and visibly presented. */
+export const perfMarkScopedPaint = (requestId: string, ts: number) =>
+  invoke<boolean>("perf_mark", { stage: "fe.painted", ts, requestId });
+
 /** 异步解析指定 agent pid 所在终端类型（独立于 popup_init，避免进程链 ps 拖慢弹窗首屏）。 */
 export const popupAgentTerminal = (pid: number) =>
   invoke<string | null>("popup_agent_terminal", { pid });

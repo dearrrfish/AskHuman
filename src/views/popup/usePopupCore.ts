@@ -25,6 +25,7 @@ import {
   focusAgentTerminal,
   popupAgentTerminal,
   popupAgentResolved,
+  perfMarkScopedPaint,
   popupShowWindow,
   popupImTipVisible,
   popupImTipDismiss,
@@ -173,6 +174,52 @@ export function usePopupCore(scope?: PopupScope) {
   const acceptsInput = () => popupActive.value && !scope?.blocked.value;
   const submissionError = ref<string | null>(null);
   let disposed = false;
+  let scopedPaintEnabled = false;
+  let scopedPaintReported = false;
+  let scopedPaintScheduled = false;
+  let scopedPaintInFlight = false;
+  let scopedPaintRetryQueued = false;
+  let scopedPaintAutodismiss = false;
+  const reportScopedPaint = (queueRetry = false) => {
+    if (!scope || !scopedPaintEnabled || scopedPaintReported || disposed || !scope.active.value) {
+      return;
+    }
+    if (scopedPaintScheduled || scopedPaintInFlight) {
+      if (queueRetry) {
+        scopedPaintRetryQueued = true;
+      }
+      return;
+    }
+    scopedPaintScheduled = true;
+    // Presentation can arrive after this form was prepared while hidden. Keep the callback
+    // request-scoped and retry only when activation/presentation schedules another frame.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        scopedPaintScheduled = false;
+        if (!scope || !scopedPaintEnabled || scopedPaintReported || scopedPaintInFlight || disposed || !scope.active.value) {
+          return;
+        }
+        scopedPaintInFlight = true;
+        void perfMarkScopedPaint(scope.requestId, Date.now()).then(marked => {
+          if (!marked) {
+            return;
+          }
+          scopedPaintReported = true;
+          if (scopedPaintAutodismiss && !isConfirm.value) {
+            cancelPopup(scope.requestId).catch(() => {});
+          }
+        }).catch(() => {}).finally(() => {
+          scopedPaintInFlight = false;
+          if (scopedPaintRetryQueued && !scopedPaintReported) {
+            scopedPaintRetryQueued = false;
+            reportScopedPaint();
+          } else {
+            scopedPaintRetryQueued = false;
+          }
+        });
+      });
+    });
+  };
   async function listen<T = unknown>(event: string, handler: (event: TauriEvent<T>) => void): Promise<UnlistenFn> {
     const off = await listenEvent<T>(event, handler);
     if (disposed) { off(); return () => {}; }
@@ -1134,6 +1181,7 @@ export function usePopupCore(scope?: PopupScope) {
   let unlistenTodos: UnlistenFn | null = null;
   // 方案6 预热弹窗：daemon 领用时 emit 的唤醒事件，前端据此 pull 请求并渲染。
   let unlistenShow: UnlistenFn | null = null;
+  let unlistenPresented: UnlistenFn | null = null;
   let unlistenNativePreview: UnlistenFn | null = null;
 
   function triggerFlash() {
@@ -2261,6 +2309,8 @@ export function usePopupCore(scope?: PopupScope) {
     const interaction = init.interaction;
     if (disposed || !interaction || interactionRendered) return;
     interactionRendered = true;
+    scopedPaintEnabled = !!scope && init.perf === true;
+    scopedPaintAutodismiss = scopedPaintEnabled && init.perfAutodismiss === true;
     appearance = { theme: init.theme, language: init.language };
     if (popupActive.value) applyTheme(init.theme);
     // 精确语言来自 popup_init（零钥匙串）；main.ts 只做 auto 兜底，故此处校正。
@@ -2358,12 +2408,13 @@ export function usePopupCore(scope?: PopupScope) {
       // 此刻打点更贴近用户真正看到内容的时刻（比单 rAF 晚约 1 帧）。
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          perfMarkFe("fe.painted");
+          if (scope) reportScopedPaint();
+          else perfMarkFe("fe.painted");
           if (isConfirm.value) confirmPopupReady(scope?.requestId).catch(() => {});
           startPermissionDiffEnrichment();
           // harness 模式：内容已上屏即自动取消，免人工点按。
-          if (init.perfAutodismiss && !isConfirm.value) {
-            cancelPopup(scope?.requestId).catch(() => {});
+          if (!scope && init.perfAutodismiss && !isConfirm.value) {
+            cancelPopup().catch(() => {});
           }
         });
       });
@@ -2381,6 +2432,14 @@ export function usePopupCore(scope?: PopupScope) {
     void initAfterPaint(init);
   }
 
+  if (scope) {
+    watch(scope.active, active => {
+      if (active) {
+        reportScopedPaint(true);
+      }
+    });
+  }
+
   // 预热弹窗领用：重新 pull popup_init，若已带 request 则渲染（一次性）。
   async function adopt() {
     if (request.value || confirmRequest.value || adopting) return;
@@ -2390,7 +2449,7 @@ export function usePopupCore(scope?: PopupScope) {
       if (init.interaction) {
         // 热路径领用：丢弃预热阶段缓存的标记（fe.bootstrap/fe.mounted/待命 popup_init 不属本次请求），
         // 只上报领用后的标记（如 fe.painted），避免污染时间线（负的 page boot）。
-        if (init.perf) perfEnableFe(true);
+        if (init.perf && !scope) perfEnableFe(true);
         renderInit(init);
       }
     } catch (err) {
@@ -2420,13 +2479,19 @@ export function usePopupCore(scope?: PopupScope) {
       if (interactionRendered) agentSessionTitle.value = payload.title;
     });
     if (!scope) unlistenShow = await listen("popup-show", () => { void adopt(); });
+    if (scope) {
+      unlistenPresented = await listen("popup-inbox-presented", () => {
+        reportScopedPaint(true);
+      });
+      if (disposed) unlistenPresented();
+    }
     // 关键路径：第一步即取请求内容并渲染，尽快上屏；其余初始化全部移到渲染之后（见 initAfterPaint）。
     try {
       const init = await popupInit(scope?.requestId);
       if (disposed) return;
       // 后端在 helper 进程收到 ASKHUMAN_PERF_ID 时置 perf=true：开启前端埋点并冲刷此前缓存的标记。
-      if (init.perf) perfEnableFe();
-      perfMarkFe("fe.popup_init_done");
+      if (init.perf && !scope) perfEnableFe();
+      if (!scope) perfMarkFe("fe.popup_init_done");
       if (init.interaction) {
         // 冷路径 / 已领用：直接渲染。
         renderInit(init);
@@ -2644,6 +2709,7 @@ export function usePopupCore(scope?: PopupScope) {
     unlistenSessionTitle?.();
     unlistenTodos?.();
     unlistenShow?.();
+    unlistenPresented?.();
     unlistenNativePreview?.();
     if (timeTicker) window.clearInterval(timeTicker);
     if (flashTimer) window.clearTimeout(flashTimer);

@@ -80,6 +80,8 @@ AskHuman --history    # 打开回复历史（加 --all 看全部项目）
 - **手动集成**：复制参考提示词，自行加入你的 Agent 全局提示词（如 Cursor Rules / `AGENTS.md` / `CLAUDE.md`）。
 - **自动集成**：一键为 Cursor / Claude Code / Codex 安装全局 Rules；还可安装超时 Hook（检测到调用 `AskHuman` 时，自动把工具调用超时延长到 24 小时，避免等待你回应时被强制取消）。
 
+Antigravity 提供实验性的 **None/CLI** 家族共享规则集成，MCP 与高级能力保持关闭。配置方法和验收范围见 [Antigravity 集成](docs/wiki/antigravity-setup.md)；其命令工具等待方式与上述超时 Hook 不同。
+
 ### 三、配置沟通渠道
 
 默认即有本地弹窗。你也可以开启钉钉、飞书、Telegram、Slack 等渠道——这样无论是否在电脑前，都能收到提问并回复（多个渠道可同时开启并行「抢答」）。在设置的 **通信渠道** Tab 配置，每个渠道的接入步骤见：

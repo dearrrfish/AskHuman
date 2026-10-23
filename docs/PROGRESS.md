@@ -190,3 +190,15 @@ Grok 默认会扫描 Cursor Skills，候选 frontmatter 已设计为对 Cursor �
   `\\?\` 前缀）与 `--version` 探测没在 Windows 实机验过。
 - 扫描各 Agent 的 hooks / MCP 配置里写死的 AskHuman 路径，与 Daemon 实际运行的二进制对比。
   现有补救是装完用 `AskHuman agents update` 重写。
+
+## 状态记录：Antigravity 支持收敛（G0 / v1 已关闭）
+
+2026-10-23 经人类明确确认，**彻底关闭 G0 沙盒与 v1 来源认证过度工程路线**（独立审阅与批判剖析见 `docs/investigations/agent-team-workflow-critique.md`）。
+废弃所有 `scripts/antigravity-probe/`（C 夹具、SCM_RIGHTS 描述符传递、pidfd 监控、内存合成 oracle 等伪命题安全机制），回归单机同 UID 实用主义路线。
+
+已保留并提取的核心有效资产：
+- **Antigravity 家族支持与 CLI 提示词协议**：`src-tauri/src/prompts.rs`、`src-tauri/src/integrations/agent_rules.rs`、`src-tauri/src/integrations/antigravity_rule.rs`，对应托管文件 `~/.gemini/config/rules/askhuman-antigravity.md`，支持 `--caller-agent antigravity` hint、单会话问答与交接规范。
+- **Linux WebKitGTK DPI 兜底修复**：`src-tauri/src/app/linux_dpi.rs`，针对 Linux / Wayland 下 `screen.resolution() == -1.0` 导致 WebKit 页面缩放为负的真实界面缺陷提供稳健兜底。
+- **真实问答链路**：Popup 问答、CLI 等待、超时与取消链路已验证可用。
+
+后续路线：按需增加可信 MCP 工具支持，不引入重型沙盒，采用轻量化迭代。

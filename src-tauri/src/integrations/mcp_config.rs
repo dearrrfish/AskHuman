@@ -105,7 +105,7 @@ fn format_of(target: AgentTarget) -> Format {
     match target {
         AgentTarget::Codex | AgentTarget::Grok => Format::Toml,
         AgentTarget::Cursor | AgentTarget::ClaudeCode => Format::Json,
-        AgentTarget::Pi => Format::Json,
+        AgentTarget::Pi | AgentTarget::Antigravity => Format::Json,
     }
 }
 
@@ -117,12 +117,13 @@ fn config_path(target: AgentTarget) -> PathBuf {
         AgentTarget::Codex => paths::codex_config_toml(),
         AgentTarget::Grok => paths::grok_config_toml(),
         AgentTarget::Pi => paths::config_dir().join("unsupported-pi-mcp.json"),
+        AgentTarget::Antigravity => paths::config_dir().join("unsupported-antigravity-mcp.json"),
     }
 }
 
 /// 当前平台是否支持（三家配置读写均跨平台）。
 pub fn supported(target: AgentTarget) -> bool {
-    target != AgentTarget::Pi
+    !matches!(target, AgentTarget::Pi | AgentTarget::Antigravity)
 }
 
 /// 配置展示路径（home 前缀折叠为 `~`）。

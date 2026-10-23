@@ -338,6 +338,11 @@ pub fn pi_sessions_dir() -> PathBuf {
     pi_agent_dir().join("sessions")
 }
 
+/// Shared rules for local Antigravity clients; agy availability is a separate host diagnostic.
+pub fn antigravity_rule_file() -> PathBuf {
+    home().join(".gemini/config/rules/askhuman-antigravity.md")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

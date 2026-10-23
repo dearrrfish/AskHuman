@@ -151,6 +151,15 @@ impl Inbox {
         let state = self.inner.lock().unwrap();
         state.presented && state.active.as_deref() == Some(id) && state.requests.contains_key(id)
     }
+    /// Return the per-request performance id only for the exact request that is both pending and
+    /// currently presented. Callers must still validate the id before recording a marker.
+    pub fn active_perf_id(&self, id: &str) -> Option<String> {
+        let state = self.inner.lock().unwrap();
+        if !state.presented || state.active.as_deref() != Some(id) {
+            return None;
+        }
+        state.requests.get(id).map(|show| show.perf_id.clone())
+    }
     pub fn presented(&self) -> bool {
         self.inner.lock().unwrap().presented
     }
@@ -499,6 +508,42 @@ mod tests {
         assert!(!inbox.inner.lock().unwrap().insert(show("a")));
         assert!(inbox.activate("a").is_err());
         assert!(inbox.snapshot().requests.is_empty());
+    }
+    #[test]
+    fn active_perf_id_requires_the_presented_active_pending_request() {
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let inbox = Inbox::new(tx, 1, false);
+        let mut first = show("first");
+        first.perf_id = "123-123456".into();
+        let mut second = show("second");
+        second.perf_id = "456-123457".into();
+        {
+            let mut state = inbox.inner.lock().unwrap();
+            state.insert(first);
+            state.insert(second);
+            state.active = Some("first".into());
+        }
+        assert_eq!(
+            inbox.active_perf_id("first"),
+            None,
+            "hidden is not paintable"
+        );
+        {
+            let mut state = inbox.inner.lock().unwrap();
+            state.presented = true;
+        }
+        assert_eq!(inbox.active_perf_id("first").as_deref(), Some("123-123456"));
+        assert_eq!(
+            inbox.active_perf_id("second"),
+            None,
+            "inactive request cannot inherit an id"
+        );
+        inbox.inner.lock().unwrap().finish("first", "popup");
+        assert_eq!(
+            inbox.active_perf_id("first"),
+            None,
+            "terminal request cannot be marked"
+        );
     }
     #[test]
     fn completion_feedback_requires_a_local_committed_answer() {

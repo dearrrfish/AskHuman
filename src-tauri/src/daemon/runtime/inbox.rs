@@ -2,6 +2,63 @@
 use super::*;
 use crate::daemon::popup_inbox::{Lease, Recovery};
 
+/// Upper bound on captured popup host stderr that may reach the daemon log.
+const POPUP_HOST_STDERR_LIMIT: usize = 8192;
+
+async fn capture_popup_stderr(
+    mut stream: impl tokio::io::AsyncRead + Unpin,
+    captured: &mut Vec<u8>,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut buffer = [0u8; 1024];
+    loop {
+        match stream.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                let room = POPUP_HOST_STDERR_LIMIT.saturating_sub(captured.len());
+                captured.extend_from_slice(&buffer[..read.min(room)]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+async fn reap_popup_host(mut child: tokio::process::Child, report: impl FnOnce(String)) {
+    let pid = child.id();
+    let stderr = child.stderr.take();
+    let mut captured = Vec::new();
+    let status = {
+        let drain = async {
+            if let Some(stderr) = stderr {
+                capture_popup_stderr(stderr, &mut captured).await;
+            }
+        };
+        tokio::pin!(drain);
+        tokio::select! {
+            biased;
+            status = child.wait() => {
+                // A terminal/opener descendant may retain stderr after the host exits.
+                // Reap the direct child immediately and bound final draining, then close the pipe.
+                let _ = tokio::time::timeout(Duration::from_millis(100), &mut drain).await;
+                status
+            }
+            _ = &mut drain => child.wait().await,
+        }
+    };
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            let text = String::from_utf8_lossy(&captured);
+            report(format!(
+                "popup host pid={pid:?} exited with {status}: {:?}",
+                text.trim_end()
+            ));
+        }
+        Err(error) => report(format!("popup host pid={pid:?} wait failed: {error}")),
+    }
+}
+
 fn terminal(entry: &InteractionEntry) -> bool {
     match entry {
         InteractionEntry::Ask(entry) => entry.coordinator.is_finalizing(),
@@ -153,6 +210,9 @@ fn fail_surface(entry: &InteractionEntry) {
 
 fn spawn_inbox_process(exe: &std::path::Path, token: &str) -> std::io::Result<u32> {
     use std::process::{Command, Stdio};
+    // Capture the host's stderr so a failed startup is visible in daemon.log, while routine
+    // GTK warnings from successful hosts never reach the log.
+    let runtime = tokio::runtime::Handle::try_current().map_err(std::io::Error::other)?;
     let mut command = Command::new(exe);
     command
         .arg("--popup-host")
@@ -160,9 +220,14 @@ fn spawn_inbox_process(exe: &std::path::Path, token: &str) -> std::io::Result<u3
         .arg(token)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     crate::daemon::spawn::configure_background(&mut command);
-    crate::daemon::spawn::spawn_and_reap(&mut command)
+    let child = tokio::process::Command::from(command).spawn()?;
+    let pid = child
+        .id()
+        .ok_or_else(|| std::io::Error::other("spawned popup host has no pid"))?;
+    runtime.spawn(reap_popup_host(child, |message| log(&message)));
+    Ok(pid)
 }
 
 fn spawn_inbox_host(lease: Lease, state: &Arc<ServerState>) -> bool {
