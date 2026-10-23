@@ -190,8 +190,10 @@ if [ -n "$SOURCE_HASH" ] && [ -f "$INSTALLED_BIN" ] && [ -f "$INSTALL_STATE" ]; 
 fi
 
 if [ "$SKIP_COPY" -eq 0 ]; then
-  cp "$BIN_PATH" "$INSTALLED_BIN"
-  chmod 0755 "$INSTALLED_BIN"
+  TMP_BIN="${INSTALLED_BIN}.tmp.$$"
+  cp "$BIN_PATH" "$TMP_BIN"
+  chmod 0755 "$TMP_BIN"
+  mv -f "$TMP_BIN" "$INSTALLED_BIN"
 
   if [ "$(uname)" = "Darwin" ]; then
     # 清除 quarantine，降低拷贝后被 Gatekeeper 拦截的概率
