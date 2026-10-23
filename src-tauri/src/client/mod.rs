@@ -772,7 +772,9 @@ async fn run_ask_final_async(task: crate::ipc::TaskRequest, verbose: bool) -> As
             // 流式取回：Warn → stderr；Final → stdout + 退出码；中途断连 → 退出码 3（P4）。
             loop {
                 match ipc::read_msg::<_, ServerMsg>(&mut reader).await {
-                    Ok(Some(ServerMsg::Accepted { .. })) => {}
+                    Ok(Some(ServerMsg::Accepted { request_id })) => {
+                        crate::perf::mark_cli_accepted(&task.perf_id, &request_id);
+                    }
                     // 排空闸门拒绝（只出现在 Accepted 之前）：等旧 Daemon 下线后重来。
                     Ok(Some(ServerMsg::Draining { .. })) => {
                         wait_for_drain().await;

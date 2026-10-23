@@ -14,8 +14,9 @@ vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ setAlwaysO
 vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: () => ({ onDragDropEvent: mocks.drag }) }));
 vi.mock("@crabnebula/tauri-plugin-drag", () => ({ startDrag: vi.fn() }));
 import { usePopupCore, type DropAim, type DropReceiver, type PopupScope } from "./usePopupCore";
-function init(id: string): PopupInit {
+function init(id: string, perf = false): PopupInit {
   return { theme: "light", alwaysOnTop: false, sourceName: "Codex", project: "/project", projectName: "project", language: "en", warm: true,
+    perf,
     interaction: { type: "ask", request: { id, isMarkdown: true, selectOnly: false, single: false, outputFormat: "text",
       message: { text: "", files: [] }, questions: [{ message: "Choose", predefinedOptions: [{ text: "Yes", recommended: true }] }] } } };
 }
@@ -103,6 +104,103 @@ describe("mounted inbox forms", () => {
     await flushPromises();
     expect(ctx.agentSessionId.value).toBe("native-a");
     expect(ctx.agentSessionTitle.value).toBe("New name");
+  });
+});
+
+describe("request-scoped paint marks", () => {
+  const wrappers: VueWrapper[] = [];
+  const id = "4ed587dc-03e9-4b9d-aa01-65c5a2529efe";
+  beforeEach(() => {
+    vi.clearAllMocks(); mocks.handlers.clear();
+    vi.stubGlobal("requestAnimationFrame", (f: FrameRequestCallback) => { queueMicrotask(() => f(0)); return 1; });
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    mocks.invoke.mockImplementation(async (command: string, args: { requestId?: string }) => {
+      if (command === "popup_init") return init(args.requestId!, true);
+      if (command === "perf_mark") return true;
+      if (command === "popup_agent_resolved") return {};
+      if (command === "todos_list") return [];
+      if (command === "popup_update_state") return { available: false, pending: false };
+      return false;
+    });
+  });
+  afterEach(() => { wrappers.forEach(wrapper => wrapper.unmount()); wrappers.length = 0; vi.unstubAllGlobals(); });
+  async function mountScoped(active: Ref<boolean>, perf = true, requestId = id) {
+    mocks.invoke.mockImplementation(async (command: string, args: { requestId?: string }) => {
+      if (command === "popup_init") return init(args.requestId!, perf);
+      if (command === "perf_mark") return true;
+      if (command === "popup_agent_resolved") return {};
+      if (command === "todos_list") return [];
+      if (command === "popup_update_state") return { available: false, pending: false };
+      return false;
+    });
+    const scope: PopupScope = { requestId, active, blocked: computed(() => false), ready: vi.fn(), close: vi.fn(), draft: vi.fn(),
+      preview: async () => ({ revision: 1, side: "closed", mainWidth: 560, mainHeight: 620 }) };
+    const wrapper = mount(defineComponent({ setup() { usePopupCore(scope); return () => h("div"); } }), {
+      global: { plugins: [createI18n({ legacy: false, locale: "en", messages: { en } })] },
+    });
+    wrappers.push(wrapper); await flushPromises(); return wrapper;
+  }
+  const scopedMarks = () => mocks.invoke.mock.calls.filter(([command]) => command === "perf_mark");
+
+  it("waits for a prepared hidden request to activate, then uses only its scoped mark", async () => {
+    const active = ref(false);
+    await mountScoped(active);
+    expect(scopedMarks()).toHaveLength(0);
+    active.value = true;
+    await flushPromises();
+    expect(scopedMarks()).toHaveLength(1);
+    expect(scopedMarks()[0]).toEqual(["perf_mark", expect.objectContaining({
+      stage: "fe.painted", requestId: id, ts: expect.any(Number),
+    })]);
+  });
+
+  it("does not create a scoped IPC call when per-request perf is disabled or disposed", async () => {
+    const disabled = ref(true);
+    await mountScoped(disabled, false);
+    expect(scopedMarks()).toHaveLength(0);
+    const activeLater = ref(false);
+    const disposed = await mountScoped(activeLater);
+    disposed.unmount();
+    activeLater.value = true;
+    await flushPromises();
+    expect(scopedMarks()).toHaveLength(0);
+  });
+
+  it("retries once when presentation arrives during a failed hidden paint attempt", async () => {
+    const active = ref(false);
+    await mountScoped(active);
+    let resolveFirst!: (marked: boolean) => void;
+    let paintCalls = 0;
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "perf_mark") {
+        paintCalls += 1;
+        if (paintCalls === 1) {
+          return new Promise<boolean>(resolve => { resolveFirst = resolve; });
+        }
+        return true;
+      }
+      return false;
+    });
+    active.value = true;
+    await flushPromises();
+    expect(paintCalls).toBe(1);
+    for (const handler of mocks.handlers.get("popup-inbox-presented")!) {
+      handler({ payload: undefined });
+    }
+    resolveFirst(false);
+    await flushPromises();
+    expect(paintCalls).toBe(2);
+  });
+
+  it("keeps two request ids scoped and leaves disabled perf out of the global path", async () => {
+    const secondId = "4a08c9d0-47ac-4d53-aa01-65c5a2529efe";
+    const disabledId = "7b08c9d0-47ac-4d53-aa01-65c5a2529efe";
+    await mountScoped(ref(true), true, id);
+    await mountScoped(ref(true), true, secondId);
+    await mountScoped(ref(true), false, disabledId);
+    expect(scopedMarks()).toHaveLength(2);
+    expect(scopedMarks().map(([, args]) => args.requestId)).toEqual([id, secondId]);
+    expect(scopedMarks().every(([, args]) => args.stage === "fe.painted" && args.requestId)).toBe(true);
   });
 });
 

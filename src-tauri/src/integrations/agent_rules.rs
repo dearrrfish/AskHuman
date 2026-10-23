@@ -7,6 +7,8 @@
 //! - Codex：`~/.codex/AGENTS.md` 内的托管区块。
 //! - Pi：`~/.pi/agent/AGENTS.md` 内的托管区块。
 //!
+//! Antigravity delegates to an exclusive shared module with strict ownership and transactions.
+//!
 //! 「更新」用于内置提示词随版本变化后，把已安装的旧正文覆盖为最新（仅替换区块内部）。
 //! Cursor 卸载时若区块外只剩 frontmatter / 空白则删除整个文件，否则保留用户内容。
 //! 旧版 Cursor 独占文件（含 `MANAGED_FILE_MARK` 头标记、无区块）仍识别为已安装，并在
@@ -49,7 +51,7 @@ impl Variant {
 /// 注意 `Grok` 的「指令载体」不是 rules 文件，而是 `~/.grok/skills/interaction-protocol/SKILL.md`
 /// （见 [`crate::integrations::grok_skill`]）：Grok 默认模型 Composer 不读全局 `~/.grok/AGENTS.md`，
 /// 故本模块对 `Grok` 的所有指令查询 / 安装 / 卸载 / 打开一律**委托** `grok_skill`，让 `agent_mode`、
-/// 命令层、CLI 可用同一套 `AgentTarget` 统一处理五家（Grok 的 `Variant` 无意义，恒按 MCP 语义）。
+/// The unified target type also covers the Grok skill delegation and Antigravity module.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgentTarget {
     Cursor,
@@ -57,6 +59,7 @@ pub enum AgentTarget {
     Codex,
     Grok,
     Pi,
+    Antigravity,
 }
 
 impl AgentTarget {
@@ -68,6 +71,7 @@ impl AgentTarget {
             "codex" => Some(AgentTarget::Codex),
             "grok" => Some(AgentTarget::Grok),
             "pi" => Some(AgentTarget::Pi),
+            "antigravity" => Some(AgentTarget::Antigravity),
             _ => None,
         }
     }
@@ -85,6 +89,7 @@ impl AgentTarget {
             AgentTarget::Codex => paths::codex_agents_md(),
             AgentTarget::Grok => paths::grok_skill_md(),
             AgentTarget::Pi => paths::pi_agents_md(),
+            AgentTarget::Antigravity => paths::antigravity_rule_file(),
         }
     }
 
@@ -100,6 +105,7 @@ impl AgentTarget {
             AgentTarget::Codex => crate::agents::AgentKind::Codex,
             AgentTarget::Grok => crate::agents::AgentKind::Grok,
             AgentTarget::Pi => crate::agents::AgentKind::Pi,
+            AgentTarget::Antigravity => crate::agents::AgentKind::Antigravity,
         }
     }
 }
@@ -221,6 +227,15 @@ pub fn is_managed_cursor_file(text: &str) -> bool {
 
 /// 该 Agent 的规则是否已安装（新格式托管区块，或 Cursor 旧格式头标记）。
 pub fn is_installed(agent: AgentTarget) -> bool {
+    if agent == AgentTarget::Antigravity {
+        return super::antigravity_rule::probe(&antigravity_context()).is_ok_and(|s| {
+            matches!(
+                s.state,
+                super::antigravity_rule::RuleState::OwnedCurrent
+                    | super::antigravity_rule::RuleState::OwnedOutdated
+            )
+        });
+    }
     if agent.is_grok_skill() {
         return crate::integrations::grok_skill::is_installed();
     }
@@ -246,6 +261,10 @@ pub fn needs_update(agent: AgentTarget) -> bool {
 /// 与指定变体的最新内置正文比对，判断是否需更新。
 /// Cursor 旧格式（头标记、无区块）一律视为需更新。Grok 委托 skill 比对（忽略 variant）。
 pub fn needs_update_variant(agent: AgentTarget, variant: Variant) -> bool {
+    if agent == AgentTarget::Antigravity {
+        return super::antigravity_rule::probe(&antigravity_context())
+            .is_ok_and(|s| s.state == super::antigravity_rule::RuleState::OwnedOutdated);
+    }
     if agent.is_grok_skill() {
         return crate::integrations::grok_skill::needs_update();
     }
@@ -263,6 +282,20 @@ pub fn needs_update_variant(agent: AgentTarget, variant: Variant) -> bool {
 /// 已安装规则的变体：区块正文精确匹配目标 Agent 的 MCP / CLI reference 即判定对应变体；
 /// 漂移（旧版本提示词）时用结构性信号兜底（见 [`classify_body`]）。未安装返回 None。
 pub fn installed_variant(agent: AgentTarget) -> Option<Variant> {
+    if agent == AgentTarget::Antigravity {
+        return super::antigravity_rule::probe(&antigravity_context())
+            .ok()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    super::antigravity_rule::RuleState::OwnedCurrent
+                        | super::antigravity_rule::RuleState::OwnedOutdated
+                )
+            })
+            .and_then(|s| s.ownership)
+            .filter(|r| r.variant == "cli")
+            .map(|_| Variant::Cli);
+    }
     if agent.is_grok_skill() {
         // Grok 只有 MCP 语义：装了 skill 即视为 Mcp 变体，未装为 None。
         return crate::integrations::grok_skill::is_installed().then_some(Variant::Mcp);
@@ -296,9 +329,9 @@ pub fn classify_body(body: &str, agent: AgentTarget) -> Variant {
     }
 }
 
-/// 当前平台是否支持（五家指令文件读写均跨平台）。
-pub fn supported(_agent: AgentTarget) -> bool {
-    true
+/// Antigravity requires the strict Unix adapter; existing rule targets remain portable.
+pub fn supported(agent: AgentTarget) -> bool {
+    agent != AgentTarget::Antigravity || cfg!(unix)
 }
 
 /// 目标文件的展示路径（把 home 前缀折叠为 `~`）。
@@ -332,6 +365,14 @@ pub fn update(agent: AgentTarget) -> Result<String> {
 
 /// 安装指定变体的提示词（托管区块 upsert，保留区块外用户内容）。Grok 委托 skill（忽略 variant）。
 pub fn install_variant(agent: AgentTarget, variant: Variant) -> Result<String> {
+    if agent == AgentTarget::Antigravity {
+        if variant != Variant::Cli {
+            anyhow::bail!("Antigravity P0 supports None | Cli only");
+        }
+        let _lock = super::mutation_lock::IntegrationMutationLock::acquire()?;
+        super::antigravity_rule::install_unlocked(&antigravity_context())?;
+        return Ok(display_path(agent));
+    }
     if agent.is_grok_skill() {
         return crate::integrations::grok_skill::install();
     }
@@ -368,6 +409,11 @@ fn write_rule(agent: AgentTarget, body: &str) -> Result<()> {
 
 /// 卸载：移除托管区块、保留区块外用户内容；Cursor 文件若区块外只剩 frontmatter / 空白则整文件删除。
 pub fn uninstall(agent: AgentTarget) -> Result<String> {
+    if agent == AgentTarget::Antigravity {
+        let _lock = super::mutation_lock::IntegrationMutationLock::acquire()?;
+        super::antigravity_rule::uninstall_unlocked(&antigravity_context())?;
+        return Ok(display_path(agent));
+    }
     if agent.is_grok_skill() {
         return crate::integrations::grok_skill::uninstall();
     }
@@ -447,6 +493,43 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Frozen context for the exclusive Antigravity writer. Production never accepts arbitrary paths.
+pub(crate) fn antigravity_context() -> super::antigravity_rule::RuleContext {
+    let body = Variant::Cli.body(AgentTarget::Antigravity);
+    super::antigravity_rule::RuleContext {
+        target_path: paths::antigravity_rule_file(),
+        integration_state_file: paths::integration_state_file(),
+        generation_version: "1".into(),
+        variant: "cli".into(),
+        rendered_bytes: format!("---\ntrigger: always_on\ndescription: AskHuman interaction protocol for local Antigravity clients\n---\n{}\n{}\n{}\n{}\n", super::antigravity_rule::MANAGED_FILE_MARK, BLOCK_BEGIN, body, BLOCK_END).into_bytes(),
+    }
+}
+
+/// Validate before exposing public state; boolean compatibility helpers are not error channels.
+pub(crate) fn antigravity_snapshot() -> Result<super::antigravity_rule::RuleSnapshot> {
+    let snapshot = super::antigravity_rule::probe(&antigravity_context())?;
+    if matches!(
+        snapshot.state,
+        super::antigravity_rule::RuleState::Conflict
+            | super::antigravity_rule::RuleState::NeedsRepair
+    ) {
+        anyhow::bail!(
+            "{}",
+            snapshot
+                .reason
+                .unwrap_or_else(|| "Antigravity rule needs repair".into())
+        );
+    }
+    Ok(snapshot)
+}
+
+pub(crate) fn validate_status(agent: AgentTarget) -> Result<()> {
+    if agent == AgentTarget::Antigravity {
+        antigravity_snapshot()?;
+    }
     Ok(())
 }
 

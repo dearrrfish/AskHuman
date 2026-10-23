@@ -185,6 +185,7 @@ AskHuman/
         agent_lifecycle.rs   五家 Agent 生命周期管理（原生 Hook + Pi Extension）
         agent_launch.rs      Agent readiness、一次性启动记录与 Terminal.app / Windows Terminal helper
         agent_rules.rs       Agent 全局 Rules 管理
+        antigravity_rule.rs  Antigravity 独占共享规则、所有权与持久事务（基础 CLI；高级能力未开放）
         agent_subagent_guard.rs  Claude/Codex SubagentStart 提示 Hook
         agent_context_recovery.rs  集成 mode 托管的压缩恢复/会话绑定 Hook
         grok_skill.rs        Grok interaction-protocol skill 管理

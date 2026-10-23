@@ -81,6 +81,8 @@ To make your agent call `AskHuman` on its own when finishing or needing confirma
 - **Manual integration** — copy the reference prompt and add it to your agent's global instructions yourself (e.g. Cursor Rules / `AGENTS.md` / `CLAUDE.md`).
 - **Automatic integration** — one click installs global Rules for Cursor / Claude Code / Codex; you can also install the timeout Hook (when it detects a call to `AskHuman`, it extends the tool-call timeout to 24 hours so it isn't force-canceled while waiting for your reply).
 
+Antigravity has experimental **None/CLI** integration through a shared family rule; MCP and advanced adapters remain disabled. See [Antigravity setup and verification limits](docs/wiki/antigravity-setup.en.md). Its command tool waiting guidance differs from the timeout Hooks above.
+
 ### 3. Set up communication channels
 
 The local popup works out of the box. You can also enable DingTalk, Feishu, Telegram, or Slack — so you get questions and can reply whether or not you're at your desk (multiple channels can run in parallel and race for the answer). Configure them in the **Channels** tab; for each channel's onboarding steps, see:

@@ -657,6 +657,7 @@ fn detect_integration_updates() -> Vec<String> {
         ("codex", AgentTarget::Codex),
         ("grok", AgentTarget::Grok),
         ("pi", AgentTarget::Pi),
+        ("antigravity", AgentTarget::Antigravity),
     ]
     .into_iter()
     .filter(|&(_, target)| crate::integrations::agent_mode::needs_update(target))

@@ -52,7 +52,7 @@ pub fn timeout_hook_supported(target: AgentTarget) -> bool {
     match target {
         AgentTarget::Cursor => cursor_hook::supported(),
         AgentTarget::ClaudeCode => claude_hook::supported(),
-        AgentTarget::Codex | AgentTarget::Grok => false,
+        AgentTarget::Codex | AgentTarget::Grok | AgentTarget::Antigravity => false,
         AgentTarget::Pi => true,
     }
 }
@@ -62,7 +62,7 @@ pub fn timeout_hook_is_installed(target: AgentTarget) -> bool {
     match target {
         AgentTarget::Cursor => cursor_hook::is_installed(),
         AgentTarget::ClaudeCode => claude_hook::is_installed(),
-        AgentTarget::Codex | AgentTarget::Grok => false,
+        AgentTarget::Codex | AgentTarget::Grok | AgentTarget::Antigravity => false,
         AgentTarget::Pi => super::pi_extension::status().cli,
     }
 }
@@ -72,7 +72,7 @@ pub fn timeout_hook_needs_update(target: AgentTarget) -> bool {
     match target {
         AgentTarget::Cursor => cursor_hook::needs_update(),
         AgentTarget::ClaudeCode => claude_hook::needs_update(),
-        AgentTarget::Codex | AgentTarget::Grok => false,
+        AgentTarget::Codex | AgentTarget::Grok | AgentTarget::Antigravity => false,
         AgentTarget::Pi => {
             let status = super::pi_extension::status();
             status.cli && status.outdated
@@ -84,7 +84,7 @@ fn timeout_hook_install(target: AgentTarget) -> Result<()> {
     match target {
         AgentTarget::Cursor => cursor_hook::install().map(|_| ()),
         AgentTarget::ClaudeCode => claude_hook::install().map(|_| ()),
-        AgentTarget::Codex | AgentTarget::Grok => Ok(()),
+        AgentTarget::Codex | AgentTarget::Grok | AgentTarget::Antigravity => Ok(()),
         AgentTarget::Pi => super::pi_extension::set_cli_enabled(true),
     }
 }
@@ -93,7 +93,7 @@ fn timeout_hook_uninstall(target: AgentTarget) -> Result<()> {
     match target {
         AgentTarget::Cursor => cursor_hook::uninstall().map(|_| ()),
         AgentTarget::ClaudeCode => claude_hook::uninstall().map(|_| ()),
-        AgentTarget::Codex | AgentTarget::Grok => Ok(()),
+        AgentTarget::Codex | AgentTarget::Grok | AgentTarget::Antigravity => Ok(()),
         AgentTarget::Pi => super::pi_extension::set_cli_enabled(false),
     }
 }
@@ -103,7 +103,7 @@ pub fn timeout_hook_reveal(target: AgentTarget) {
     match target {
         AgentTarget::Cursor => cursor_hook::reveal(),
         AgentTarget::ClaudeCode => claude_hook::reveal(),
-        AgentTarget::Codex | AgentTarget::Grok => {}
+        AgentTarget::Codex | AgentTarget::Grok | AgentTarget::Antigravity => {}
         AgentTarget::Pi => super::pi_extension::reveal(),
     }
 }
@@ -113,7 +113,7 @@ pub fn timeout_hook_open(target: AgentTarget) {
     match target {
         AgentTarget::Cursor => cursor_hook::open(),
         AgentTarget::ClaudeCode => claude_hook::open(),
-        AgentTarget::Codex | AgentTarget::Grok => {}
+        AgentTarget::Codex | AgentTarget::Grok | AgentTarget::Antigravity => {}
         AgentTarget::Pi => super::pi_extension::open(),
     }
 }
@@ -305,6 +305,20 @@ fn set_unlocked_with_env(
     mode: Mode,
     env: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
+    if target == AgentTarget::Antigravity {
+        return match mode {
+            Mode::Cli => {
+                super::antigravity_rule::install_unlocked(&agent_rules::antigravity_context())
+                    .map(|_| ())
+            }
+            Mode::None => {
+                super::antigravity_rule::uninstall_unlocked(&agent_rules::antigravity_context())
+            }
+            Mode::Mcp => Err(anyhow::anyhow!(
+                "Antigravity P0 supports None | Cli only; MCP validation is pending"
+            )),
+        };
+    }
     match mode {
         Mode::None => uninstall_all_unlocked(target),
         Mode::Cli => {
@@ -342,6 +356,7 @@ fn set_unlocked_with_env(
 
 /// 更新当前模式的全部产物到最新（不切换模式）。None 有残留时清理，clean None 幂等 no-op。
 pub fn update(target: AgentTarget) -> Result<()> {
+    agent_rules::validate_status(target)?;
     set(target, current(target))
 }
 
@@ -349,7 +364,14 @@ pub fn update(target: AgentTarget) -> Result<()> {
 /// 故「重装即更新」；与当前模式不相干的产物（如 None、或在 Cli 模式更新 Mcp）为 no-op。
 pub fn update_artifact(target: AgentTarget, artifact: Artifact) -> Result<()> {
     let _lock = mutation_lock::IntegrationMutationLock::acquire()?;
+    agent_rules::validate_status(target)?;
     let mode = current(target);
+    if target == AgentTarget::Antigravity {
+        if !matches!(artifact, Artifact::Rule) {
+            anyhow::bail!("Antigravity runtime/MCP artifacts are unsupported");
+        }
+        return set_unlocked_with_env(target, mode, &std::collections::BTreeMap::new());
+    }
     match (mode, artifact) {
         (Mode::Cli, Artifact::Rule) => {
             agent_rules::install_variant(target, Variant::Cli)?;
@@ -403,7 +425,27 @@ pub(crate) fn kind_for_target(target: AgentTarget) -> crate::agents::AgentKind {
         AgentTarget::Codex => crate::agents::AgentKind::Codex,
         AgentTarget::Grok => crate::agents::AgentKind::Grok,
         AgentTarget::Pi => crate::agents::AgentKind::Pi,
+        AgentTarget::Antigravity => crate::agents::AgentKind::Antigravity,
     }
+}
+
+/// One strict snapshot for public mode/state views; do not re-read through lossy bool helpers.
+pub(crate) fn antigravity_status() -> Result<(Mode, ArtifactUpdates, bool)> {
+    let snapshot = agent_rules::antigravity_snapshot()?;
+    let installed = matches!(
+        snapshot.state,
+        super::antigravity_rule::RuleState::OwnedCurrent
+            | super::antigravity_rule::RuleState::OwnedOutdated
+    );
+    Ok((
+        if installed { Mode::Cli } else { Mode::None },
+        ArtifactUpdates {
+            rule: snapshot.state == super::antigravity_rule::RuleState::OwnedOutdated,
+            hook: false,
+            mcp: false,
+        },
+        installed,
+    ))
 }
 
 #[cfg(test)]
@@ -626,6 +668,8 @@ mod env_mode_tests {
             (AgentTarget::Cursor, Mode::Mcp),
             (AgentTarget::Grok, Mode::Mcp),
             (AgentTarget::Pi, Mode::Mcp),
+            (AgentTarget::Antigravity, Mode::Cli),
+            (AgentTarget::Antigravity, Mode::Mcp),
             (AgentTarget::Codex, Mode::Cli),
             (AgentTarget::Codex, Mode::None),
         ] {
@@ -639,5 +683,23 @@ mod env_mode_tests {
             .unwrap_err()
             .to_string()
             .contains("invalid environment"));
+    }
+}
+
+#[cfg(test)]
+mod antigravity_capability_tests {
+    use super::*;
+    #[test]
+    fn advanced_adapters_remain_closed() {
+        let kind = crate::agents::AgentKind::Antigravity;
+        let target = AgentTarget::Antigravity;
+        assert!(!timeout_hook_supported(target));
+        assert!(!mcp_config::supported(target));
+        assert!(!agent_permission::supported(target));
+        assert!(!agent_stop::supported(kind));
+        assert!(!agent_ask_question::supported(kind));
+        let lifecycle = agent_lifecycle::status_for_mode(kind, Mode::Cli);
+        assert!(!lifecycle.supported && !lifecycle.enabled && !lifecycle.needs_update);
+        assert!(!super::super::agent_launch::fork_readiness(kind).ready);
     }
 }

@@ -134,6 +134,7 @@ windows-sys = { version = "0.61", features = [
 # Store channel secrets in the Linux Secret Service (D-Bus; needs gnome-keyring/kwallet).
 # Falls back to plaintext config when unavailable (headless servers).
 [target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
 # Reuse the GIO runtime already required by Tauri for desktop browser associations.
 gio = "0.18"
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
