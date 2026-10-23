@@ -2,3 +2,7 @@
 # Set inherit_user_defaults = false to isolate this project.
 schema_version = 1
 inherit_user_defaults = true
+
+[tiers.assisted]
+# Assisted tier is lightweight: serialized execution without mandatory independent review.
+independent_review = false
