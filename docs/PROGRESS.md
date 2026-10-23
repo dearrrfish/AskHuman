@@ -168,3 +168,33 @@ Grok 默认会扫描 Cursor Skills，候选 frontmatter 已设计为对 Cursor �
 
 下一步先确认保留旧 Popup Host 还是重建新版弹窗并恢复草稿，再设计跨版本兼容、多等待者、IM 卡片
 接管和 Windows exe 文件锁处理；以上均为待评估事项，现有 graceful drain 策略继续有效。
+
+## 状态记录：Antigravity 支持收敛（G0 / v1 已关闭）
+
+2026-10-23 经人类明确确认，**彻底关闭 G0 沙盒与 v1 来源认证过度工程路线**（独立审阅与批判剖析见 `docs/investigations/agent-team-workflow-critique.md`）。
+废弃所有 `scripts/antigravity-probe/`（C 夹具、SCM_RIGHTS 描述符传递、pidfd 监控、内存合成 oracle 等伪命题安全机制），回归单机同 UID 实用主义路线。
+
+已保留并提取的核心有效资产：
+- **Antigravity 家族支持与 CLI 提示词协议**：`src-tauri/src/prompts.rs`、`src-tauri/src/integrations/agent_rules.rs`、`src-tauri/src/integrations/antigravity_rule.rs`，对应托管文件 `~/.gemini/config/rules/askhuman-antigravity.md`，支持 `--caller-agent antigravity` hint、单会话问答与交接规范。
+- **Linux WebKitGTK DPI 兜底修复**：`src-tauri/src/app/linux_dpi.rs`，针对 Linux / Wayland 下 `screen.resolution() == -1.0` 导致 WebKit 页面缩放为负的真实界面缺陷提供稳健兜底。
+- **真实问答链路**：Popup 问答、CLI 等待、超时与取消链路已验证可用。
+
+后续路线：按需增加可信 MCP 工具支持，不引入重型沙盒，采用轻量化迭代。
+
+2026-10-05 人类调整顺位：优先补完整本机 NixOS 能力，macOS/Windows 专用实现与真机验证后移；既有平台待办保留，真机/贡献者就绪可独立介入。当前路线见 `docs/plans/antigravity-nixos-first.md`。当前从N1原生接口probe继续，N0剩余四IM独立延期；随后可信来源/binding/MCP → N2生命周期/Stop → N3控制台/任务 → N4高级原生接口与本机收敛。各能力仍须独立 gate，未知接口保留 blocker，不把计划改动当作开工或支持认证。
+
+官方调查、需求取舍和 team 实施计划见 `docs/investigations/antigravity-cli.md`、
+`docs/specs/antigravity-cli.md`、`docs/plans/antigravity-cli.md`。规划已批准；第一波环境准备与探针已完成，证据见 `docs/investigations/antigravity-cli-probes.md`。
+CLI-first 前置验证见 `docs/investigations/antigravity-cli-preflight.md`：真实未绑定 Popup 回答链路通过（约9秒），CLI-only 全局规则没有加载，相同内容的本地规则对照通过。
+共享 `~/.gemini/config/rules` 临时模块的严格零工具 before/present/after 对照通过，候选方案见 `docs/investigations/antigravity-cli-carrier.md`；CLI-only 精确遗漏原因仍未知。
+人类已批准按 Antigravity 家族共享协议、按客户端分别验收；P0 合同修订已通过两轮独立审查（修复事务恢复材料缺口），正式模块为 `~/.gemini/config/rules/askhuman-antigravity.md`。CLI/MCP 指 AskHuman 调用方式，非仅TUI。P0 本地实现已完成并安装验证；1190 Rust、184 Vitest + 2 Node、fmt/Clippy/build/install 通过。身份冲突仍按已批准的拒绝策略处理。
+CLI 600 秒完成，MCP 600 秒请求约180秒被客户端取消；所有自动 gate 保留 blocked。
+原生会话环境 UUID 与 init/Hook 相同，但同时继承外层 Codex 环境；不得混用其身份。
+MCP 长等待、可信绑定、child 区分、真实 AskHuman 交互与 Stop 各自验收后开放。
+正式共享规则已获临时安装授权：安装/no-op update/None 幂等、12项错误路径和目录保留通过，规则已清理，当前 None。
+原生附件提问/安全恢复失败后重新确认/测试交接已观察；已安装 CLI 同题并发各得 A/B、待办附件及下一任务/结束测试通过。
+追加验收已取得原始TaskId严格诊断、RequestReview准确正/负对照、同任务实际取消及结构化短回答（9360ms）精确输出，人类已接受这些范围；详见 docs/investigations/antigravity-cli-native-acceptance.md。
+自由文本result.response仍聚合背景提示；认证字段为result.structured_output.output。helper无优雅信号回调，取消依据为原生CANCELED/daemon先finalized/进程结束。共享settings须避免其它agy实例并行写入；临时权限已恢复原始完整字节/0600。
+下一步补child/无hint ancestry/IM和P1 MCP/绑定/生命周期/Stop。旧自动gate仍blocked，完整native不放行。
+macOS/Windows 独立任务后移但可提前介入；Windows严格writer ACL/identity仍未完成。IDE/扩展/2.0若本机可运行，纳入独立宿主验收；缺客户端记录blocked，不从agy推导通过。
+实施/证据见 docs/plans/antigravity-cli.md 的 P0 执行记录。本机项完成即删除对应主线记录；外部平台未完成项独立保留，不阻塞本机主线关闭。
