@@ -303,11 +303,11 @@ pub fn persist_check_result(mut info: UpdateInfo, clear_dismissed: bool) -> Upda
     info
 }
 
-/// 规范化版本号：去前缀 `v`、丢弃预发布后缀、仅保留数字与点。
+/// 规范化版本号：去前缀 `v`、丢弃预发布后缀与构建元数据后缀、仅保留数字与点。
 pub fn normalize_version(tag: &str) -> String {
     let core = tag.trim().trim_start_matches('v');
-    // 丢弃 `-rc.1` 等预发布后缀（一期自更新只面向正式版）。
-    let core = core.split('-').next().unwrap_or(core);
+    // 丢弃 `-rc.1` 等预发布后缀与 `+my-abc1234` 等构建元数据后缀。
+    let core = core.split(['-', '+']).next().unwrap_or(core);
     core.chars()
         .filter(|c| c.is_ascii_digit() || *c == '.')
         .collect()
@@ -315,6 +315,7 @@ pub fn normalize_version(tag: &str) -> String {
 
 /// 逐段数字比较：a>b → 1，a<b → -1，相等 → 0。非数字段按 0 处理。
 pub fn compare_versions(a: &str, b: &str) -> i32 {
+    let (a, b) = (normalize_version(a), normalize_version(b));
     let pa: Vec<u64> = a.split('.').map(|s| s.parse().unwrap_or(0)).collect();
     let pb: Vec<u64> = b.split('.').map(|s| s.parse().unwrap_or(0)).collect();
     let n = pa.len().max(pb.len());
@@ -407,6 +408,10 @@ mod tests {
         assert_eq!(compare_versions("0.5", "0.5.0"), 0);
         assert_eq!(compare_versions("0.5.1", "0.5"), 1);
         assert_eq!(compare_versions("0.6.0", "0.5.99"), 1);
+        // 构建元数据后缀（如 +my-<hash>）不改变主版本比较。
+        assert_eq!(compare_versions("0.15.1", "0.15.1+my-0d2dbbf"), 0);
+        assert_eq!(compare_versions("0.15.2", "0.15.1+my-0d2dbbf"), 1);
+        assert_eq!(compare_versions("0.15.0", "0.15.1+my-0d2dbbf"), -1);
     }
 
     #[test]
@@ -414,6 +419,8 @@ mod tests {
         assert_eq!(normalize_version("v0.5.3"), "0.5.3");
         assert_eq!(normalize_version("0.5.3"), "0.5.3");
         assert_eq!(normalize_version("v0.6.0-rc.1"), "0.6.0");
+        assert_eq!(normalize_version("v0.15.1+my-0d2dbbf"), "0.15.1");
+        assert_eq!(normalize_version("0.15.1+my-0d2dbbf"), "0.15.1");
         assert_eq!(normalize_version(" v1.2.3 "), "1.2.3");
     }
 
