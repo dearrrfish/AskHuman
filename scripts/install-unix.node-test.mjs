@@ -308,6 +308,18 @@ test("preserves a relative/absolute symlink chain and replaces its final target"
   assertNoStage(f);
 });
 
+test("installation probes use the installed binary and preserve an explicit isolated home", unixOnly, t => {
+  const f = fixture(t, { os: "Linux" });
+  const probeLog = path.join(f.repo, "probe.log");
+  const probe = `#!/bin/sh\nprintf '%s|%s\\n' "$*" "\${ASKHUMAN_HOME-}" >> "$TEST_PROBE_LOG"\nexit 0\n`;
+  executable(f.target, probe);
+  executable(path.join(f.repo, "src-tauri/target/local-install/AskHuman"), probe);
+  assertSuccess(f.run({ ASKHUMAN_HOME: "/tmp/explicit-install-target", TEST_PROBE_LOG: probeLog }));
+  const calls = readFileSync(probeLog, "utf8");
+  assert.match(calls, /daemon status\|\/tmp\/explicit-install-target/);
+  assert.match(calls, /doctor install --warn-only\|\/tmp\/explicit-install-target/);
+});
+
 for (const failure of ["TEST_FAIL_SIGN", "TEST_FAIL_VERIFY"]) {
   test(`${failure}: retains the installed binary and state, and removes staging`, unixOnly, t => {
     const f = fixture(t);

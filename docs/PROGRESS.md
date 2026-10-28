@@ -3,6 +3,14 @@
 记录需要跨会话保留的未完成 / 延期事项和明确下一步。任务 / 需求完成后删除其 section
 （历史留在 git）。
 
+## 待验收：默认系统与显式 Dev 路由
+
+2026-10-27 在 `feat/dev-instance-explicit-routing`（upstream/main `e0d302d` 基线）实施默认系统、`dev exec -- …`、直接 dev bin 固定 home、显式 home 保留及安装目标自检；规格见 `docs/specs/dev-instance-parallel.md`，使用见 `docs/wiki/dev-instance.md`。Linux Dev 与系统入口已安装；独立进程目标检查、MCP 多次只读工具调用、17 项安装器测试、Clippy、隔离 Rust 全量 1772 passed / 3 ignored 已通过。
+
+用户明确暂缓 Dev Telegram 真实问答，已加入项目 todo #6。后续调查发现 `~/tmp/askhuman_dev_bot.json` 的测试渠道配置已在本树 Dev 落盘，token 与系统不同；经用户授权检查 shell 历史，找到准确调用本树 `apply-dev-telegram.py` 的命令，支持手动配置步骤已执行的解释（无历史时间戳/退出状态）。此前两次自动写入确实被拒绝，但不能据此继续声称配置未写入。下一步补真实通知与回答链路；未取得真实链路证据不得标通过。生产 Telegram 已通过真实投放与用户回答；假 HOME+非空 ASKHUMAN_HOME 中 Hook/MCP 生成保持稳定系统入口。用户具名授权后已执行系统入口 `agents update claude`，11 条受管 Hook 均迁到稳定系统入口，CLI mode 与 permission/Stop/lifecycle 开关保持，系统 daemon 为 0.16.0 / protocol 4；本会话真实 Bash activity 在系统实例更新，Dev 旧会话记录仍 ended。新的 SessionStart、permission/Stop/interject、watch 归属与旧长寿命 MCP 迁移的完整验收仍待收口；macOS/Windows 未实机验收。Linux DPI 已有专门 PR，用户要求本任务只记录，不移植其修复。
+
+后续用户明确“系统”指原 Nix 安装，并授权以 `origin/main` 为基准重建 `my-nixpkgs`，整合 PR19、PR18 和本次路由改动后重建系统包。原 Nix 0.15.1 仍按 cwd 自动进入 Dev，故原安装迁移尚未完成。Dev 已重新安装并启动；按用户授权，经产品配置命令清除测试 Telegram，重启后所有 IM 渠道未启用、未配置、未连接（`im conns none`），主题仍为 `system`，系统为 `dark`。本机备份含测试凭据，位于忽略目录 `.agent-team/runs/dev-instance-explicit-routing/backup/`，不纳入提交。整合采用 PR19 的 `executable::launch_path()` 复用启动路径缓存，移除重复 `process_entry` 模块；整合版本需重新验证，早前分支测试不能替代整合结果。
+
 ## 进行中：iOS 原生渠道（原型已完成，待真实服务与真机验收）
 
 2026-10-24 用户要求整理交接（[移动渠道交接](investigations/native-ios-channel-handoff.md)：杭州 EMQX 传输验证包、

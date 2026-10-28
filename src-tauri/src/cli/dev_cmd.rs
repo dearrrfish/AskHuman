@@ -18,6 +18,8 @@ pub fn dispatch(args: &[String], _lang: Lang) {
         "enable" => cmd_enable(&args[1..]),
         "disable" => cmd_disable(&args[1..]),
         "status" => cmd_status(),
+        "exec" => dev_instance::exec_dev(&args[1..]),
+        "target" => cmd_target(&args[1..]),
         "preset" => cmd_preset(&args[1..]),
         "help" | "--help" | "-h" => {
             print_usage();
@@ -37,6 +39,8 @@ fn print_usage() {
   AskHuman dev enable [--preset <name>]... [--force]
   AskHuman dev disable [--purge]
   AskHuman dev status
+  AskHuman dev exec -- <AskHuman arguments>
+  AskHuman dev target [--dev]
   AskHuman dev preset save <name> [--from-instance]
   AskHuman dev preset list
   AskHuman dev preset show <name>
@@ -44,6 +48,10 @@ fn print_usage() {
   AskHuman dev preset rm <name> [--force]
 
 Dev Instance isolates daemon/bin/config per git worktree.
+Ordinary AskHuman calls use system; enabled only selects the install destination.
+Use dev exec for a single dev invocation, or invoke this tree's dev binary directly.
+An explicit ASKHUMAN_HOME remains isolated; conflicting dev homes are rejected.
+Target diagnostics are read-only; --dev previews the explicit dev selection.
 See docs/specs/dev-instance-parallel.md and docs/agent-worktree-setup.md."
     );
 }
@@ -73,6 +81,27 @@ fn require_git_root() -> PathBuf {
                 "error: not inside a git worktree (no .git found walking up from {})",
                 cwd.display()
             );
+            exit(1);
+        }
+    }
+}
+
+/// Management selects an instance explicitly, using the same conflict rules as dev exec.
+fn pin_management_home(root: &Path) {
+    let target = (|| {
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        dev_instance::resolve_target(
+            &cwd,
+            &dev_instance::installed_entry()?,
+            std::env::var_os(dev_instance::ASKHUMAN_HOME_ENV).as_deref(),
+            &crate::paths::home().join(".askhuman"),
+            Some(root),
+        )
+    })();
+    match target {
+        Ok(target) => dev_instance::apply_target(&target),
+        Err(error) => {
+            eprintln!("error: {error}");
             exit(1);
         }
     }
@@ -136,6 +165,7 @@ fn parse_enable_args(args: &[String]) -> (Vec<String>, bool) {
 fn cmd_enable(args: &[String]) {
     let (presets, force) = parse_enable_args(args);
     let root = require_git_root();
+    pin_management_home(&root);
     let (bin, home) = match ensure_layout(&root) {
         Ok(v) => v,
         Err(e) => {
@@ -143,10 +173,6 @@ fn cmd_enable(args: &[String]) {
             exit(1);
         }
     };
-
-    // Pin env so subsequent logic in this process uses instance home (also for preset materialise).
-    std::env::set_var(dev_instance::ASKHUMAN_HOME_ENV, &home);
-    std::env::set_var("ASKHUMAN_NO_KEYCHAIN", "1");
 
     if !presets.is_empty() {
         match dev_presets::apply_presets_to_instance(&root, &home, &presets, force) {
@@ -177,7 +203,7 @@ fn cmd_enable(args: &[String]) {
     {
         println!("  next       run ./scripts/install.sh  (installs into this instance bin)");
     } else {
-        println!("  next       AskHuman … / MCP ask  (auto-routed to this instance)");
+        println!("  next       AskHuman dev exec -- …  (single dev invocation)");
     }
     exit(0);
 }
@@ -203,9 +229,7 @@ fn cmd_disable(args: &[String]) {
         exit(1);
     };
 
-    let home = dev_instance::instance_home(&root);
-    std::env::set_var(dev_instance::ASKHUMAN_HOME_ENV, &home);
-    std::env::set_var("ASKHUMAN_NO_KEYCHAIN", "1");
+    pin_management_home(&root);
 
     // Best-effort stop the daemon in this instance partition before removing its marker/data.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -354,6 +378,45 @@ fn terminate_instance_processes(instance_bin: &Path) -> Vec<u32> {
     terminated
 }
 
+fn cmd_target(args: &[String]) {
+    let dev = match args {
+        [] => false,
+        [flag] if flag == "--dev" => true,
+        _ => {
+            eprintln!("error: usage: AskHuman dev target [--dev]");
+            exit(1);
+        }
+    };
+    let target = match dev_instance::current_target(dev) {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("error: {error}");
+            exit(1);
+        }
+    };
+    // Endpoint derivation uses the same paths API as runtime. No config or IPC is opened.
+    dev_instance::apply_target(&target);
+    println!("target: {}", target.kind);
+    println!("  bin        {}", target.bin.display());
+    println!("  home       {}", target.home.display());
+    println!(
+        "  endpoint   {}",
+        crate::ipc::transport::socket_path().display()
+    );
+    println!("  reason     {}", target.reason);
+    if target.kind == "dev" {
+        match dev_instance::validate_dev_binary(&target.bin) {
+            Ok(()) => println!("  binary     executable"),
+            Err(error) => {
+                println!("  binary     unavailable");
+                eprintln!("error: {error}");
+                exit(1);
+            }
+        }
+    }
+    exit(0);
+}
+
 fn cmd_status() {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = dev_instance::find_dev_root(&cwd);
@@ -366,8 +429,7 @@ fn cmd_status() {
         Some(root) => {
             let home = dev_instance::instance_home(&root);
             let bin = dev_instance::instance_bin(&root);
-            std::env::set_var(dev_instance::ASKHUMAN_HOME_ENV, &home);
-            std::env::set_var("ASKHUMAN_NO_KEYCHAIN", "1");
+            pin_management_home(&root);
 
             println!("dev instance: enabled");
             println!("  worktree   {}", root.display());
@@ -507,7 +569,7 @@ fn preset_save(args: &[String]) {
         eprintln!(
             "error: only --from-instance is supported for now (configure channels in this worktree first)"
         );
-        eprintln!("  AskHuman dev enable && AskHuman --settings && AskHuman dev preset save {name} --from-instance");
+        eprintln!("  AskHuman dev enable && AskHuman dev exec -- --settings && AskHuman dev preset save {name} --from-instance");
         exit(1);
     }
 
@@ -516,9 +578,7 @@ fn preset_save(args: &[String]) {
         eprintln!("error: cwd is not a Dev Instance (run `dev enable` first)");
         exit(1);
     };
-    let home = dev_instance::instance_home(&root);
-    std::env::set_var(dev_instance::ASKHUMAN_HOME_ENV, &home);
-    std::env::set_var("ASKHUMAN_NO_KEYCHAIN", "1");
+    pin_management_home(&root);
 
     let cfg = AppConfig::load();
     let channels = match dev_presets::extract_configured_channels(&cfg) {

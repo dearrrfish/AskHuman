@@ -197,8 +197,11 @@ Multiple agents can develop in separate git worktrees without sharing one daemon
 cd /path/to/worktree
 AskHuman dev enable                    # or: dev enable --preset <name>
 ./scripts/install.sh                   # → .askhuman-dev/bin
-AskHuman "…"                           # auto re-exec into this instance
+AskHuman "日常讨论"                     # system instance
+AskHuman dev exec -- "功能验证"          # this worktree instance
 ```
+
+enabled 标记只选择安装目录；普通 CLI/MCP/Hook 默认系统。首次迁移须更新系统入口（`./scripts/install.sh --global` / Windows `-Global`），仅更新 dev bin 无法改变旧 dispatcher。显式非空 `ASKHUMAN_HOME` 保持隔离，直接 dev bin 固定自己的 home；缺少 dev bin 时 dev exec 失败。独立测试 MCP 使用 `dev exec -- mcp`，不改生产注册。
 
 Default instance config is popup-only and never reads the main keychain. Optional machine-level channel presets live in `~/.askhuman/dev-presets/` with exclusive leases.
 

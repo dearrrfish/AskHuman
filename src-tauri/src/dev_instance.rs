@@ -1,8 +1,8 @@
 //! Dev Instance discovery and CLI entry redirection.
 //!
-//! When the process cwd sits under a worktree that has been `dev enable`d
-//! (marker: `<root>/.askhuman-dev/enabled`), the CLI routes data and (when
-//! present) re-execs into that tree's isolated binary + `ASKHUMAN_HOME`.
+//! Normal calls use the system instance regardless of cwd markers. `dev exec`
+//! explicitly selects a worktree binary and home; invoking that binary directly
+//! also binds its home. An explicit `ASKHUMAN_HOME` remains isolated.
 //! See `docs/specs/dev-instance-parallel.md`.
 
 use std::ffi::OsStr;
@@ -88,16 +88,16 @@ pub fn instance_bin(root: &Path) -> PathBuf {
 /// Command class for dispatcher policy (spec D18 / plan §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandClass {
-    /// Spawned child roles: never redirect by cwd.
+    /// Spawned child roles: inherit the resolved home, never redirect by cwd.
     Skip,
-    /// `dev` / help / version: may run without instance bin.
+    /// Help / version: run without loading config or requiring an instance bin.
     Meta,
-    /// Dev Instance management pins the target home but stays in the dispatcher binary. This lets
+    /// Dev Instance management selects its home explicitly and stays in the dispatcher binary. This lets
     /// Windows purge an instance without running from the executable being deleted.
     Dev,
-    /// settings / history / config / channel: may run without instance bin (write instance home).
+    /// Settings / history / config / channel: use the resolved invocation target.
     Config,
-    /// ask / daemon / mcp / …: require instance bin.
+    /// Ask / daemon / mcp / …: use the resolved invocation target.
     Runtime,
 }
 
@@ -125,63 +125,214 @@ pub fn classify_command(argv: &[String]) -> CommandClass {
     }
 }
 
-/// Apply Dev Instance env and optional re-exec. Call at the very start of `cli::dispatch`.
-pub fn maybe_enter_dev_instance() {
-    let argv: Vec<String> = std::env::args().collect();
-    if matches!(classify_command(&argv), CommandClass::Skip) {
-        return;
-    }
-
-    let Ok(cwd) = std::env::current_dir() else {
-        return;
-    };
-    let Some(root) = find_dev_root(&cwd) else {
-        return;
-    };
-
-    let home = instance_home(&root);
-    let bin = instance_bin(&root);
-    let class = classify_command(&argv);
-
-    // Data plane: always pin instance home + no main keychain for this process.
-    // SAFETY: single-threaded at process entry before other threads; std::env::set_var is the
-    // established pattern for CLI bootstrap in this codebase (see spawn env pass-through).
-    std::env::set_var(ASKHUMAN_HOME_ENV, &home);
-    std::env::set_var("ASKHUMAN_NO_KEYCHAIN", "1");
-
-    let bin_exists = bin.is_file();
-    if matches!(class, CommandClass::Runtime) && !bin_exists {
-        eprintln!(
-            "error: Dev Instance enabled at {} but binary is missing:\n  {}\nRun `./scripts/install.sh` in this worktree first.",
-            root.display(),
-            bin.display()
-        );
-        std::process::exit(1);
-    }
-
-    if !bin_exists {
-        // Meta / Config: continue with current exe under instance env.
-        return;
-    }
-
-    if matches!(class, CommandClass::Dev) {
-        return;
-    }
-
-    let Ok(current) = std::env::current_exe() else {
-        return;
-    };
-    if same_executable(&current, &bin) {
-        return;
-    }
-
-    reexec_into(&bin, &home, &argv);
+/// A resolved invocation target. Resolution never reads configuration or contacts a daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub kind: &'static str,
+    pub bin: PathBuf,
+    pub home: PathBuf,
+    pub reason: &'static str,
 }
 
-fn same_executable(a: &Path, b: &Path) -> bool {
-    let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
-    let cb = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
-    ca == cb
+/// Use the installation entry captured at startup, never a replaced running inode.
+pub fn installed_entry() -> Result<PathBuf, String> {
+    crate::executable::launch_path()
+        .map(stable_entry_path)
+        .map_err(|e| format!("cannot resolve executable installation entry: {e}"))
+}
+
+fn stable_entry_path(path: PathBuf) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        if let Some(entry) = path.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+            return std::ffi::OsString::from_vec(entry.to_vec()).into();
+        }
+    }
+    path
+}
+
+fn executable_root(exe: &Path) -> Option<&Path> {
+    let bin = exe.parent()?;
+    let dev = bin.parent()?;
+    if bin.file_name()? == "bin"
+        && dev.file_name()? == DEV_DIR
+        && exe.file_name()? == instance_bin(Path::new("")).file_name()?
+    {
+        dev.parent()
+    } else {
+        None
+    }
+}
+
+fn absolute_from(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    let normalize = |p: &Path| {
+        // Existing homes may be symlinked; missing homes still need lexical normalization.
+        if let Ok(p) = std::fs::canonicalize(p) {
+            return p;
+        }
+        let mut normalized = PathBuf::new();
+        for component in p.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                other => normalized.push(other.as_os_str()),
+            }
+        }
+        normalized
+    };
+    normalize(a) == normalize(b)
+}
+
+/// `dev_root` is supplied only for explicit `dev exec` / `dev target --dev`.
+/// Cwd markers alone never select a runtime instance.
+pub fn resolve_target(
+    cwd: &Path,
+    exe: &Path,
+    home_env: Option<&OsStr>,
+    system_home: &Path,
+    dev_root: Option<&Path>,
+) -> Result<Target, String> {
+    let explicit = home_env
+        .filter(|v| !v.is_empty())
+        .map(|v| absolute_from(cwd, Path::new(v)));
+    let own_root = executable_root(exe);
+    if let (Some(own), Some(requested)) = (own_root, dev_root) {
+        if !same_path(own, requested) {
+            return Err(format!(
+                "Dev Instance binary {} cannot select another worktree {}",
+                exe.display(),
+                requested.display()
+            ));
+        }
+    }
+    if let Some(root) = dev_root.or(own_root) {
+        let home = instance_home(root);
+        if let Some(explicit) = explicit {
+            if !same_path(&explicit, &home) {
+                return Err(format!("ASKHUMAN_HOME={} conflicts with Dev Instance home {}; unset it or use this instance's home", explicit.display(), home.display()));
+            }
+        }
+        return Ok(Target {
+            kind: "dev",
+            bin: instance_bin(root),
+            home,
+            reason: if dev_root.is_some() {
+                "explicit dev selection"
+            } else {
+                "dev binary installation entry"
+            },
+        });
+    }
+    Ok(Target {
+        kind: if explicit.is_some() {
+            "explicit-home"
+        } else {
+            "system"
+        },
+        bin: exe.to_path_buf(),
+        home: explicit
+            .clone()
+            .unwrap_or_else(|| system_home.to_path_buf()),
+        reason: if explicit.is_some() {
+            "explicit ASKHUMAN_HOME"
+        } else {
+            "default system instance (cwd markers affect installation only)"
+        },
+    })
+}
+
+pub fn current_target(dev: bool) -> Result<Target, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot resolve cwd: {e}"))?;
+    let root = if dev {
+        Some(find_dev_root(&cwd).ok_or_else(|| {
+            format!(
+                "no enabled Dev Instance from {}; run `AskHuman dev enable` first",
+                cwd.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    resolve_target(
+        &cwd,
+        &installed_entry()?,
+        std::env::var_os(ASKHUMAN_HOME_ENV).as_deref(),
+        &crate::paths::home().join(".askhuman"),
+        root.as_deref(),
+    )
+}
+
+/// Apply a resolved target before any config, locale or GUI initialization.
+pub fn apply_target(target: &Target) {
+    if target.kind != "system" {
+        std::env::set_var(ASKHUMAN_HOME_ENV, &target.home);
+        std::env::set_var("ASKHUMAN_NO_KEYCHAIN", "1");
+    }
+}
+
+/// Bootstrap all roles, including daemon/popup/workers. Inherited homes remain intact.
+pub fn maybe_enter_dev_instance() {
+    match current_target(false) {
+        Ok(target) => apply_target(&target),
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+pub fn validate_dev_binary(bin: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(bin).map_err(|e| format!("Dev Instance binary is missing or inaccessible: {}: {e}. Run `./scripts/install.sh` in this worktree first", bin.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "Dev Instance binary is not a file: {}",
+            bin.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(format!("Dev Instance binary is not executable: {}. Run `./scripts/install.sh` in this worktree first", bin.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Only AskHuman arguments are accepted; `--` separates the wrapper from its payload.
+pub fn dev_exec_args(args: &[String]) -> Result<&[String], String> {
+    if args.first().map(String::as_str) != Some("--") || args.len() < 2 {
+        return Err("usage: AskHuman dev exec -- <AskHuman arguments>".into());
+    }
+    Ok(&args[1..])
+}
+
+pub fn exec_dev(args: &[String]) -> ! {
+    let prepared = dev_exec_args(args).and_then(|payload| {
+        let target = current_target(true)?;
+        validate_dev_binary(&target.bin)?;
+        let mut argv = vec![target.bin.to_string_lossy().into_owned()];
+        argv.extend_from_slice(payload);
+        Ok((target, argv))
+    });
+    match prepared {
+        Ok((target, argv)) => reexec_into(&target.bin, &target.home, &argv),
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn reexec_into(bin: &Path, home: &Path, argv: &[String]) -> ! {
@@ -225,6 +376,337 @@ mod tests {
     use super::*;
     use std::fs;
 
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "askhuman-routing-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn enabled_marker_never_selects_runtime_target() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join(DEV_DIR)).unwrap();
+        fs::write(tmp.path().join(DEV_DIR).join(ENABLED_MARKER), "").unwrap();
+        let exe = Path::new("/system/bin/AskHuman");
+        let target =
+            resolve_target(tmp.path(), exe, None, Path::new("/system/home"), None).unwrap();
+        assert!(find_dev_root(tmp.path()).is_some());
+        assert_eq!(target.kind, "system");
+        assert_eq!(target.bin, exe);
+        assert_eq!(target.home, Path::new("/system/home"));
+        // Missing dev bin also cannot break ordinary system invocations.
+        assert!(!instance_bin(tmp.path()).exists());
+    }
+
+    #[test]
+    fn explicit_home_is_preserved_and_absolutized() {
+        let target = resolve_target(
+            Path::new("/cwd"),
+            Path::new("/bin/AskHuman"),
+            Some(OsStr::new("qa/home")),
+            Path::new("/system"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(target.kind, "explicit-home");
+        assert_eq!(target.home, Path::new("/cwd/qa/home"));
+        assert_eq!(
+            resolve_target(
+                Path::new("/cwd"),
+                Path::new("/bin/AskHuman"),
+                Some(OsStr::new("")),
+                Path::new("/system"),
+                None
+            )
+            .unwrap()
+            .kind,
+            "system"
+        );
+    }
+
+    #[test]
+    fn dev_selection_and_direct_binary_bind_own_home() {
+        let root = Path::new("/work/tree");
+        let bin = instance_bin(root);
+        for selection in [None, Some(root)] {
+            let target = resolve_target(
+                Path::new("/elsewhere"),
+                &bin,
+                None,
+                Path::new("/system"),
+                selection,
+            )
+            .unwrap();
+            assert_eq!(target.kind, "dev");
+            assert_eq!(target.home, instance_home(root));
+            assert_eq!(target.bin, bin);
+        }
+        // The marker is intentionally absent: installed executable identity alone is enough.
+        let target = resolve_target(
+            Path::new("/work/tree"),
+            Path::new("/bin/AskHuman"),
+            None,
+            Path::new("/system"),
+            Some(root),
+        )
+        .unwrap();
+        assert_eq!(target.home, instance_home(root));
+    }
+
+    #[test]
+    fn explicit_conflicts_fail_without_switching_instances() {
+        let root = Path::new("/work/tree");
+        for exe in [instance_bin(root), PathBuf::from("/bin/AskHuman")] {
+            assert!(resolve_target(
+                Path::new("/"),
+                &exe,
+                Some(OsStr::new("/other/home")),
+                Path::new("/system"),
+                Some(root)
+            )
+            .unwrap_err()
+            .contains("conflicts"));
+        }
+        assert!(resolve_target(
+            Path::new("/"),
+            &instance_bin(root),
+            None,
+            Path::new("/system"),
+            Some(Path::new("/other/tree"))
+        )
+        .is_err());
+        assert!(resolve_target(
+            root,
+            &instance_bin(root),
+            Some(OsStr::new(".askhuman-dev/./home")),
+            Path::new("/system"),
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn dev_exec_payload_preserves_arguments_verbatim() {
+        let args: Vec<String> = [
+            "--",
+            "-q",
+            "spaces and $literal",
+            "-f",
+            "./relative file.md",
+            "--output",
+            "json",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(dev_exec_args(&args).unwrap(), &args[1..]);
+        assert!(dev_exec_args(&[]).is_err());
+        assert!(dev_exec_args(&["--".into()]).is_err());
+        assert!(dev_exec_args(&["--help".into()]).is_err());
+    }
+
+    #[test]
+    fn missing_and_non_executable_dev_binary_fail_closed() {
+        let tmp = TestDir::new();
+        let bin = instance_bin(tmp.path());
+        assert!(validate_dev_binary(&bin).unwrap_err().contains("missing"));
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, "not executable").unwrap();
+        #[cfg(unix)]
+        assert!(validate_dev_binary(&bin)
+            .unwrap_err()
+            .contains("not executable"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deleted_linux_image_keeps_installation_identity() {
+        let entry = stable_entry_path(PathBuf::from(
+            "/work/tree/.askhuman-dev/bin/AskHuman (deleted)",
+        ));
+        assert_eq!(executable_root(&entry), Some(Path::new("/work/tree")));
+        assert_eq!(entry, instance_bin(Path::new("/work/tree")));
+    }
+
+    // Child-only probe exercises the real bootstrap without accessing configuration or IPC.
+    #[test]
+    fn routing_process_probe() {
+        let Some(mode) = std::env::var_os("ASKHUMAN_ROUTING_TEST_CHILD") else {
+            return;
+        };
+        maybe_enter_dev_instance();
+        if mode == "exec" {
+            exec_dev(&[
+                "--".into(),
+                "-q".into(),
+                "spaces and $literal".into(),
+                "-f".into(),
+                "./attachment.md".into(),
+            ]);
+        }
+        println!(
+            "resolved-home={}",
+            std::env::var(ASKHUMAN_HOME_ENV).unwrap_or_default()
+        );
+        println!(
+            "keychain={}",
+            std::env::var("ASKHUMAN_NO_KEYCHAIN").unwrap_or_default()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_dev_exec_preserves_cwd_metadata_arguments_and_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TestDir::new();
+        let bin = instance_bin(tmp.path());
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(tmp.path().join(DEV_DIR).join(ENABLED_MARKER), "").unwrap();
+        fs::write(
+            &bin,
+            r#"#!/bin/sh
+printf '%s\n' "$ASKHUMAN_HOME" "$PWD" "$ASKHUMAN_MCP_AGENT_SESSION_ID" "$ASKHUMAN_NO_KEYCHAIN" "$@"
+exit 23
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["routing_process_probe", "--nocapture"])
+            .current_dir(tmp.path())
+            .env("ASKHUMAN_ROUTING_TEST_CHILD", "exec")
+            .env("ASKHUMAN_MCP_AGENT_SESSION_ID", "session-keep")
+            .env_remove(ASKHUMAN_HOME_ENV)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(23),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for value in [
+            instance_home(tmp.path()).to_string_lossy().as_ref(),
+            tmp.path().to_string_lossy().as_ref(),
+            "session-keep",
+            "spaces and $literal",
+            "./attachment.md",
+        ] {
+            assert!(stdout.contains(value), "missing {value}: {stdout}");
+        }
+    }
+
+    #[test]
+    fn process_default_and_internal_roles_preserve_home_selection() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join(DEV_DIR)).unwrap();
+        fs::write(tmp.path().join(DEV_DIR).join(ENABLED_MARKER), "").unwrap();
+        for role in [
+            "daemon",
+            "--popup",
+            "--popup-host",
+            "--gui-host",
+            "__permission-shell-worker",
+            "__update-worker",
+        ] {
+            for home in [None, Some("relative-isolated-home")] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["routing_process_probe", "--nocapture"])
+                    .current_dir(tmp.path())
+                    .env("ASKHUMAN_ROUTING_TEST_CHILD", role)
+                    .env_remove(ASKHUMAN_HOME_ENV)
+                    .env_remove("ASKHUMAN_NO_KEYCHAIN");
+                if let Some(home) = home {
+                    child.env(ASKHUMAN_HOME_ENV, home);
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{role}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let expected = home
+                    .map(|v| tmp.path().join(v).display().to_string())
+                    .unwrap_or_default();
+                assert!(
+                    stdout.contains(&format!("resolved-home={expected}\n")),
+                    "{role}: {stdout}"
+                );
+                if home.is_some() {
+                    assert!(stdout.contains("keychain=1"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn process_dev_exec_missing_binary_has_no_stdout_or_fallback() {
+        let tmp = TestDir::new();
+        fs::create_dir_all(tmp.path().join(DEV_DIR)).unwrap();
+        fs::write(tmp.path().join(DEV_DIR).join(ENABLED_MARKER), "").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["routing_process_probe", "--nocapture", "--quiet"])
+            .current_dir(tmp.path())
+            .env("ASKHUMAN_ROUTING_TEST_CHILD", "exec")
+            .env_remove(ASKHUMAN_HOME_ENV)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("binary is missing"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("resolved-home="));
+    }
+
+    #[test]
+    fn process_direct_dev_binary_binds_home_without_marker() {
+        let tmp = TestDir::new();
+        let bin = instance_bin(tmp.path());
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::copy(std::env::current_exe().unwrap(), &bin).unwrap();
+        let output = std::process::Command::new(&bin)
+            .args(["routing_process_probe", "--nocapture"])
+            .current_dir(std::env::temp_dir())
+            .env("ASKHUMAN_ROUTING_TEST_CHILD", "direct")
+            .env_remove(ASKHUMAN_HOME_ENV)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!(
+                "resolved-home={}",
+                instance_home(tmp.path()).display()
+            )),
+            "{stdout}"
+        );
+        assert!(stdout.contains("keychain=1"), "{stdout}");
+    }
+
     #[test]
     fn instance_context_follows_home_env_or_exe_path() {
         let ordinary = Path::new("/usr/local/bin/AskHuman");
@@ -260,7 +742,7 @@ mod tests {
 
     #[test]
     fn find_dev_root_nearest_marker() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = TestDir::new();
         let root = tmp.path().join("wt");
         let nested = root.join("src").join("deep");
         fs::create_dir_all(&nested).unwrap();

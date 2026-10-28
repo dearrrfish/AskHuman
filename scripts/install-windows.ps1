@@ -53,15 +53,31 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
   Write-Error "需要 Rust 工具链（https://rustup.rs）"; exit 1
 }
 
+# Scope probes to the installation target even when the calling shell inherited a dev home.
+function Invoke-InstallTarget {
+  param([string[]]$TargetArgs)
+  $SavedHome = $env:ASKHUMAN_HOME
+  try {
+    if ($IsDevInstall) {
+      $env:ASKHUMAN_HOME = $InstanceHome
+    } elseif ($Global) {
+      Remove-Item Env:ASKHUMAN_HOME -ErrorAction SilentlyContinue
+    }
+    & $InstalledBin @TargetArgs
+  } finally {
+    $env:ASKHUMAN_HOME = $SavedHome
+  }
+}
+
 # Show the same in-flight request warning as install.sh before replacing the binary.
 if (Test-Path -LiteralPath $InstalledBin) {
-  $StatusOut = & $InstalledBin daemon status 2>$null
+  $StatusOut = Invoke-InstallTarget -TargetArgs @("daemon", "status") 2>$null
   $StatusExitCode = $LASTEXITCODE
   $StatusMatch = [regex]::Match(($StatusOut | Out-String), 'requests\s+(\d+) active')
   if ($StatusExitCode -eq 0 -and $StatusMatch.Success -and [int]$StatusMatch.Groups[1].Value -gt 0) {
     $ActiveRequests = $StatusMatch.Groups[1].Value
     Write-Host "提示: daemon 当前有 $ActiveRequests 个在途请求；安装后将在它们完结后自动换新（期间新提问会等待）。"
-    Write-Host "      立即换新: AskHuman daemon restart --force（会打断在途请求）"
+    Write-Host "      如需立即换新，请显式选择安装目标再运行 daemon restart --force（会打断在途请求）"
   }
 }
 
@@ -195,7 +211,7 @@ if ($UsesDefaultInstallDir) {
 }
 Write-Host "==> 完成：$InstallDir\AskHuman.exe"
 if ($IsDevInstall) {
-  Write-Host "==> Dev Instance 已安装；在本 worktree 内运行 AskHuman 会自动改道到此二进制。"
+  Write-Host "==> Dev Instance 已安装；使用 AskHuman dev exec -- <参数> 验证，普通 AskHuman 继续使用系统实例。"
 } else {
   Write-Host "==> AskHuman 命令已就绪；可直接运行 AskHuman --version。"
 }

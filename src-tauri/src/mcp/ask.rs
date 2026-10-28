@@ -399,6 +399,8 @@ pub struct AskServer {
     // Resolve once before updates unlink the running image. On Linux, current_exe()
     // would then return a nonexistent " (deleted)" path instead of the new CLI.
     executable: Result<PathBuf, String>,
+    // A long-lived server keeps its startup target for every spawned CLI invocation.
+    instance_home: Option<std::ffi::OsString>,
 }
 
 /// Hop budget for the ancestor probe that decides [`AskServer::hidden`]: AskHuman → codex, with a
@@ -452,6 +454,8 @@ impl AskServer {
                 .map(|cwd| crate::project::detect_from(&cwd))
                 .unwrap_or_default(),
             executable: crate::executable::launch_path().map_err(|error| error.to_string()),
+            instance_home: std::env::var_os(crate::dev_instance::ASKHUMAN_HOME_ENV)
+                .filter(|home| !home.is_empty()),
         }
     }
 
@@ -958,6 +962,13 @@ required.",
         command: &mut tokio::process::Command,
         binding: Option<&crate::context_binding::AgentBinding>,
     ) {
+        if let Some(home) = &self.instance_home {
+            command
+                .env(crate::dev_instance::ASKHUMAN_HOME_ENV, home)
+                .env("ASKHUMAN_NO_KEYCHAIN", "1");
+        } else {
+            command.env_remove(crate::dev_instance::ASKHUMAN_HOME_ENV);
+        }
         // Native session env inherited when this long-lived MCP process started may belong to an
         // older conversation. Only explicit per-call binding is authoritative.
         for kind in [
@@ -2287,6 +2298,22 @@ mod tests {
         let unbound = configured_env(&server, None).await;
         assert!(!unbound.contains(&format!("{}=", crate::cli::MCP_AGENT_KIND_ENV)));
         assert!(!unbound.contains(&format!("{}=", crate::cli::MCP_AGENT_SESSION_ID_ENV)));
+
+        let mut isolated = server.clone();
+        isolated.instance_home = Some("/tmp/askhuman-mcp-target".into());
+        let isolated_env = configured_env(&isolated, None).await;
+        assert!(isolated_env.contains("ASKHUMAN_HOME=/tmp/askhuman-mcp-target\n"));
+        assert!(isolated_env.contains("ASKHUMAN_NO_KEYCHAIN=1\n"));
+
+        let mut system = server;
+        system.instance_home = None;
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "env"])
+            .env("ASKHUMAN_HOME", "/tmp/stale-target");
+        system.configure_child(&mut command, None);
+        let system_env = String::from_utf8(command.output().await.unwrap().stdout).unwrap();
+        assert!(!system_env.contains("ASKHUMAN_HOME="));
     }
 
     #[test]

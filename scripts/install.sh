@@ -192,13 +192,24 @@ if [ -n "${RUSTC_BOOTSTRAP+x}" ]; then
 fi
 _log_toolchain_if_changed
 
-# 在途请求提示：daemon 正服务中的提问不会被安装打断——换新会在它们完结后自动发生（graceful drain），
-# 期间新提问会等待。此处只提示，不强杀。
-if command -v AskHuman >/dev/null 2>&1; then
-  ACTIVE="$(AskHuman daemon status 2>/dev/null | sed -n 's/.*requests[[:space:]]*\([0-9][0-9]*\) active.*/\1/p' | head -n1 || true)"
+# Probe the installation target explicitly; cwd no longer selects the runtime instance.
+# Explicit homes are confined to these read-only probes and do not affect the build shell.
+INSTALL_TARGET_HOME=""
+if [ "$(basename "$INSTALL_DIR")" = "bin" ] && [ "$(basename "$(dirname "$INSTALL_DIR")")" = ".askhuman-dev" ]; then
+  INSTALL_TARGET_HOME="$(dirname "$INSTALL_DIR")/home"
+elif [ -n "${ASKHUMAN_HOME:-}" ] && [ "$FORCE_GLOBAL" -ne 1 ]; then
+  INSTALL_TARGET_HOME="$ASKHUMAN_HOME"
+fi
+run_install_target() {
+  ASKHUMAN_HOME="$INSTALL_TARGET_HOME" "$INSTALL_DIR/AskHuman" "$@"
+}
+
+# Existing requests finish through graceful drain; status never starts or stops a daemon.
+if [ -x "$INSTALL_DIR/AskHuman" ]; then
+  ACTIVE="$(run_install_target daemon status 2>/dev/null | sed -n 's/.*requests[[:space:]]*\([0-9][0-9]*\) active.*/\1/p' | head -n1 || true)"
   if [ -n "${ACTIVE:-}" ] && [ "$ACTIVE" -gt 0 ] 2>/dev/null; then
     echo "提示: daemon 当前有 $ACTIVE 个在途请求；安装后将在它们完结后自动换新（期间新提问会等待）。"
-    echo "      立即换新: AskHuman daemon restart --force（会打断在途请求）"
+    echo "      如需立即换新，请显式选择安装目标再运行 daemon restart --force（会打断在途请求）"
   fi
 fi
 
@@ -468,4 +479,4 @@ fi
 # 多份安装 / PATH 遮蔽检查：内容不同的 AskHuman 并存时会轮流把对方的 daemon 顶掉
 # （docs/specs/daemon-graceful-drain.md §6）。只在发现冲突时输出；检查失败不影响安装结果。
 # Dev Instance 安装有独立 daemon，检查会自行跳过。
-"$INSTALLED_BIN" doctor install --warn-only || true
+run_install_target doctor install --warn-only || true

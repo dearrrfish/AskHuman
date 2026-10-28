@@ -17,7 +17,7 @@
 
 - **主环境不变**：未进入 Dev Instance 时，行为与今天完全一致（单 Daemon、生产 config/钥匙串、生产 bot）。
 - **每个 Git WorkTree（含主工作树，若 enable）可有一套独立 Dev Instance**：独立二进制、独立 Daemon、独立 config/home；彼此与主环境互不 drain、互不覆盖 bin。
-- **Agent 提示词零分支**：配置好某 WorkTree 后，仍只跑 `./scripts/install.sh` 与 `AskHuman …` / MCP `ask`，自动走该树的实例。
+- **安装与调用分离**：`./scripts/install.sh` 保持工作树安装隔离；普通 `AskHuman …` 与生产 MCP/Hook 默认系统，功能验证使用 `AskHuman dev exec -- …`。
 - **渠道安全默认**：Dev Instance **默认 popup-only**，绝不读主 `~/.askhuman/config.json`、绝不读主钥匙串生产密钥；需要测 IM 时在**该实例自己的** config 里配置**专用测试 bot**。
 
 ## 3. 已确认决策
@@ -28,10 +28,10 @@
 | D2 | 默认渠道 | **popup-only**；不读主配置/主钥匙串 |
 | D3 | 测试 IM | 支持在**每个** WorkTree 实例 home 内单独配置测试 bot（多实例 = 多份 config，非共享一份「dev 渠道配置」） |
 | D4 | 开启方式 | **必须显式** `dev enable`（最可预测）；不做「一进 worktree 就自动 enable」 |
-| D5 | 入口改道 | 任意 `AskHuman` 从 **cwd 向上**找本树标记；命中则 **re-exec** 到该树 `.askhuman-dev/bin/AskHuman`，并带上该树 `ASKHUMAN_HOME` |
+| D5 | 入口改道 | 普通调用默认系统；仅 `dev exec -- …` 按 cwd 标记选择本树 bin/home；直接实例 bin 始终绑定自身 home |
 | D6 | `.askhuman-dev` 与 git | **整目录本机私有、gitignore**；不提交 bin/home/标记 |
 | D7 | 多 WorkTree 模型 | **主工作树 + N 个子 WorkTree，每个可独立 enable**；每套实例数据与 bin 都落在**该工作树根**下，互不共享、互不继承 |
-| D8 | Agent 流程 | enable 之后，既有「install → AskHuman 提问」提示词**不改** |
+| D8 | Agent 流程 | 日常讨论继续普通 AskHuman；安装后功能验证显式使用 dev exec |
 | D9 | 安装逃生口 | 已 enable 树内更新生产 bin：Unix `./scripts/install.sh --global`；Windows `.\scripts\install-windows.cmd -Global` |
 | D10 | `dev disable` | 默认只去掉 `enabled`，并停止本实例 daemon/GUI Host；**保留** `bin/`+`home/`。`--purge` 还会在有界优雅退出后按精确实例 EXE 路径收口残留 GUI 子进程，再删除整个 `.askhuman-dev` |
 | D11 | 渠道预设存放 | 机器级 `~/.askhuman/dev-presets/`（主 daemon **不**加载）；每预设一文件 + `index.json` 租约 |
@@ -41,7 +41,7 @@
 | D15 | 建立预设 | 主路径：`dev preset save <name> --from-instance`（从当前 dev 实例已配渠道快照）；亦支持参数/交互写入；**不提供** `--from-main` |
 | D16 | 多 preset | 可重复 `--preset`；合并物化；同一 channel 出现在多个所选 preset 中 → enable 失败 |
 | D17 | Agent 文档 | 新增 `docs/agent-worktree-setup.md`（准备 worktree 的步骤；用 AskHuman 问人是否挂 channel 预设）；`Agents.md` 引用：建/用 worktree 前先读该文档 |
-| D18 | Dispatcher 分级 | 见计划 §2：spawn 子角色跳过改道；`dev`/help 与 `--settings` 在 bin 缺失时仍可跑（settings 写实例 home）；提问/`daemon`/`mcp` 无 bin 则失败 |
+| D18 | Dispatcher 分级 | 内部角色继承目标；普通 help/settings/runtime 不依赖 dev bin；dev exec 要求已安装且可执行的实例 bin，缺失明确失败 |
 
 ## 4. 多 WorkTree 模型（核心）
 
@@ -96,27 +96,26 @@
 ### 5.2 工作树根
 
 - `dev enable`：以**当前 cwd** 向上查找 Git 根（首个含 `.git` 文件或目录的祖先）作为 `<worktree-root>`；找不到 Git 根则对 cwd 报错退出（dev 仅面向本仓库工作树场景）。
-- **运行时发现**（AskHuman / install.sh）：从 **进程 cwd** 向上查找名为 `.askhuman-dev/enabled` 的路径；**最近的一处命中**生效（不跨过别的工作树去「继承」父树的 enable——每个工作树根自己有自己的 `.askhuman-dev`，子 worktree 是并列目录而非嵌套在主工作树 path 下，故通常不会嵌套命中）。
+- **显式开发目标发现**（dev exec / install.sh）：从工作目录向上查找 `.askhuman-dev/enabled`，最近标记生效。普通调用不按 cwd 改目标。
 
 ### 5.3 `ASKHUMAN_HOME`
 
 - 规范环境变量：`ASKHUMAN_HOME` 指向实例 `home/` 目录（即今日 `~/.askhuman` 的角色）。
 - 所有经 `paths::config_dir()`（及等价）的落盘均相对此根。
-- 未设置且未命中标记时：`config_dir()` = `~/.askhuman`（现状）。
-- re-exec / install 命中标记时：强制 `ASKHUMAN_HOME=<root>/.askhuman-dev/home`。
+- 普通系统入口未设置时：`config_dir()` = `~/.askhuman`，即使 cwd 在 enabled 树内。
+- 显式非空 home 保持隔离；与显式 dev 目标冲突时报错。dev exec 与直接实例 bin 固定自身 home，禁用生产钥匙串。
 
 ## 6. 入口行为
 
 ### 6.1 `AskHuman`（任意已安装副本，含主 bin）
 
-在真正执行业务前（含提问、daemon 子命令、被 MCP spawn 的路径）：
+普通系统入口不因 cwd 改道；ask、show-last、whats-next、todo、daemon、MCP 与 Hook 使用相同默认目标。enabled 仅表示安装隔离与 dev 可用。
 
-1. 若环境已显式设置 `ASKHUMAN_HOME` 且指向某 dev home，可跳过「找标记」中的 home 推导，但仍应按标记/同树 bin 做 re-exec 判定（避免 home 与 bin 不一致）。一期简化：**以 cwd 标记为准**；显式 `ASKHUMAN_HOME` 仅在无标记时覆盖 `config_dir`（高级用法，文档注明）。
-2. cwd 向上找到 `.askhuman-dev/enabled`：
-   - 若 `<root>/.askhuman-dev/bin/AskHuman` **不存在** → stderr 提示先在该树执行 `./scripts/install.sh`，退出码 1（禁止静默用主二进制冒充本树代码）。
-   - 若存在且与 `current_exe()` 为不同路径（或内容指纹不同）→ `exec` 该 bin，argv 不变，env 设置 `ASKHUMAN_HOME=<root>/.askhuman-dev/home`，并设置 `ASKHUMAN_NO_KEYCHAIN=1`（或实例模式等价开关）。
-   - 若已是该 bin → 只保证 `ASKHUMAN_HOME` 正确后继续。
-3. 未找到标记 → 主环境路径，行为与今天一致。
+`AskHuman dev exec -- <AskHuman 参数…>` 选择最近 enabled 树的 bin/home，保留 cwd、附件与会话元数据，不执行任意 shell。bin 缺失或不可执行明确退出，不回退系统。直接 `.askhuman-dev/bin/AskHuman` 无论 cwd 都固定自己的实例 home；显式 home 与该身份冲突报错。内部角色继承已选环境，不再按 cwd 改道。
+
+生产 MCP 的每次子 CLI 固定 server 的启动目标；独立 dev MCP 使用 `dev exec -- mcp`。dev 单次请求不修改系统 Hook、watch 或 interject 归属。不自动迁移在途请求。
+
+迁移须升级系统安装入口：旧系统 dispatcher 会在业务入口前按 cwd re-exec，单独安装新 dev bin 不够。统一切换，不保留 legacy auto 模式。确认无须中断在途请求后，Unix 用 `./scripts/install.sh --global`，Windows 用 `-Global` 更新系统入口。
 
 ### 6.2 安装脚本
 
@@ -140,6 +139,8 @@ PowerShell 5.1 兼容脚本）。两者共享以下语义：
 | `AskHuman dev enable … --force` | 抢占已被其它树占用的 preset 租约（警告；不自动动对方进程/home） |
 | `AskHuman dev disable` | 停止本实例 daemon 与 GUI Host（若在跑）；移除 `enabled`；**释放**本树持有的 preset 租约；默认保留 `bin/`+`home/` |
 | `AskHuman dev disable --purge` | 在 disable 基础上删除整个 `.askhuman-dev/`；Windows 会在优雅退出超时后仅终止可执行路径精确等于本实例 bin 的残留 GUI 子进程，并等待文件锁释放 |
+| `AskHuman dev exec -- <args>` | 单次显式验证，选择本树 bin/home；缺失或冲突失败 |
+| `AskHuman dev target [--dev]` | 无配置读取的 target/bin/home/endpoint/reason 诊断 |
 | `AskHuman dev status` | 是否 enable、root、home、bin、daemon、渠道摘要、本树占用的 preset 名 |
 | `AskHuman dev preset save/list/show/rm/release` | 见 §7.2 |
 
@@ -153,8 +154,8 @@ PowerShell 5.1 兼容脚本）。两者共享以下语义：
   - **禁止**回退读取 `~/.askhuman/config.json` / legacy；
   - **禁止**读写主钥匙串生产 secret（实例强制 no-keychain；密钥仅来自实例 config，0600）。
 - **在本树改渠道**（写入当前实例 home，不影响其它树）：
-  - **设置 GUI**：在本 worktree cwd 下打开 `AskHuman --settings`（经 dispatcher 进实例后，设置读写的就是本树 `home/config.json`）；
-  - 或 `AskHuman channel …` / 手改 config。
+  - **设置 GUI**：在本 worktree cwd 下打开 `AskHuman dev exec -- --settings`（显式进入实例，设置读写本树 `home/config.json`）；
+  - 或 `AskHuman dev exec -- channel …` / 手改 config。
 - Daemon **只读本树物化后的 config**，运行时不打开 `dev-presets/`。
 - **禁止触碰用户级全局登录项**（2026-07-25 补，用户实证）：`~/Library/LaunchAgents` /
   autostart 的 label 全用户唯一，实例进程写入会把**生产**的开机自启劫持到 worktree 二进制
@@ -199,8 +200,9 @@ PowerShell 5.1 兼容脚本）。两者共享以下语义：
    ```bash
    cd some-worktree
    AskHuman dev enable                 # 先空实例
-   AskHuman --settings                 # 在 GUI 里配好测试飞书/钉钉/…（写入本树 home）
-   # 或：AskHuman channel set …
+   ./scripts/install.sh                # 安装实例 bin
+   AskHuman dev exec -- --settings                 # 在 GUI 里配好测试飞书/钉钉/…（写入本树 home）
+   # 或：AskHuman dev exec -- channel set …
    AskHuman dev preset save feishu-test --from-instance
    # 把「当前实例 home 里已配置/已启用的渠道片段」快照为机器级预设
    ```
@@ -240,7 +242,7 @@ AskHuman dev enable --preset feishu-test
 | macOS launchd | 每实例按 `ASKHUMAN_HOME` 派生独立 daemon label（配置目录不是账户自己的 `~/.askhuman` 的进程同理）；与主实例、其它工作树互不 bootout；登出时随当前 GUI domain 退出 |
 | Windows process spawn | detached daemon 禁止继承调用者 handles；PowerShell/CI 捕获 `daemon start` 输出可正常收到 EOF |
 | GUI host | 每实例独立 socket/named-pipe 与 lock（避免与主 tray 抢）；disable 同时关闭本实例 host |
-| Agent lifecycle hooks | 用户级全局 hook 仍可能触发；事件打到**实际 exec 到的**那个 daemon（cwd 正确则进实例）。不在一期改 hook 安装布局。实例 daemon 启动时**不**自动迁移（改写）这些全局 hook，见 §7.1 |
+| Agent lifecycle hooks | 用户级全局 hook 仍可能触发；事件打到**实际 exec 到的**那个 daemon（生产入口默认系统；dev 测试须显式选择）。不在一期改 hook 安装布局。实例 daemon 启动时**不**自动迁移（改写）这些全局 hook，见 §7.1 |
 | 自更新 | 仅主环境产品路径关心；dev bin 不走应用内 self-update 到生产目录 |
 
 ## 9. 非目标（一期）
@@ -249,21 +251,21 @@ AskHuman dev enable --preset feishu-test
 - 不提供跨实例请求迁移。
 - 不默认「附加 worktree 自动 enable」。
 - 不一键复制主配置生产 bot 到实例。
-- 不解决「MCP 在错误 cwd 下 spawn」的全部 harness 差异（文档说明；cwd 为 workspace root 时为一期主路径）。
+- 不覆写生产 MCP 注册来测试 dev；使用独立测试客户端。
 
 ## 10. 验收标准
 
 1. 主工作树未 enable：行为与改前一致。
-2. 子 WorkTree A `dev enable` 后：在 A 内 `install.sh` 只更新 A 的 bin；在 A 内 `AskHuman` 提问走 A 的 daemon；主环境在途提问不被 drain。
+2. 子 WorkTree A `dev enable` 后：在 A 内 `install.sh` 只更新 A 的 bin；在 A 内 `AskHuman dev exec -- …` 提问走 A 的 daemon；主环境在途提问不被 drain。
 3. 子 WorkTree B 同时 enable + install + 提问：与 A 并行，互不等待、互不覆盖 bin。
 4. A 的 config 打开测试飞书、B 保持 popup-only：互不影响；A/B 均不读取主钥匙串生产密钥。
-5. 在 A 内不设任何特殊 env，仅 `AskHuman "hi"`（PATH 仍指向旧主 bin）→ 自动 re-exec 到 A 的 bin 并弹出。
-6. enable 后尚未 install：`AskHuman` 明确报错，不静默走主 bin。
+5. 在 A 内普通 `AskHuman "hi"` 仍走系统；`dev exec -- "hi"` 走 A；两者可并行，互不跨实例 drain。
+6. enable 后尚未 install：普通系统调用可用；显式 dev exec 明确报错，不回退系统。
 7. Unix `install.sh --global` / Windows `install-windows.cmd -Global` 可从 enable 树内更新生产 bin；默认
    Dev 安装不改变生产 binary/config/PATH/launcher。
 8. `.askhuman-dev/` 被 gitignore，不进入版本库。
 9. `dev preset save x --from-instance` 后，新树 `dev enable --preset x` 物化渠道且无需重填密钥；第二棵树再 `--preset x` 失败；`--force` 可抢；disable 释放后第二棵可占用；僵死 lease 自动回收。
-10. 已 enable、**尚未** `install.sh` 时打开 `--settings`（或改实例渠道）：只读写 `<wt>/.askhuman-dev/home/config.json`；`~/.askhuman/config.json` 与主钥匙串内容不变。
+10. 实例安装后 `dev exec -- --settings` 仅写实例 home；普通 settings 使用系统。验证显式 home、cwd 外直调实例 bin、内部 spawn、生产 MCP 多次调用和真实 Hook 归属。Linux 安装态及生产 Telegram 问答为必要验收，macOS/Windows 未实机验收时明确标记。
 
 ## 11. 引导配置（人） vs Agent（不变）
 
@@ -272,7 +274,8 @@ AskHuman dev enable --preset feishu-test
 ```bash
 cd /path/to/any-worktree
 AskHuman dev enable
-AskHuman --settings          # GUI 配测试 bot → 写入本树 home
+./scripts/install.sh
+AskHuman dev exec -- --settings          # GUI 配测试 bot → 写入本树 home
 AskHuman dev preset save my-feishu --from-instance
 ```
 
@@ -283,11 +286,12 @@ cd /path/to/new-worktree
 AskHuman dev enable --preset my-feishu   # 或不要 --preset = popup-only
 ```
 
-**Agent（提示词保持）**
+**Agent（日常与验证分离）**
 
 ```bash
 ./scripts/install.sh
-AskHuman "…"
+AskHuman "日常讨论"
+AskHuman dev exec -- "功能验证"
 ```
 
 ---
@@ -295,9 +299,9 @@ AskHuman "…"
 ## 反馈意见
 
 1. **多 WorkTree**：主 + 多个子树各自独立 `.askhuman-dev`，不是全局一份 dev 配置（已写入 D7 / §4）。
-2. **提示词零分支**：靠目录标记 + re-exec / install 识别，agent 仍只跑 install + AskHuman（D5/D8）。
+2. **2026-10-27 路由修订**：默认系统、显式 dev；取代原提示词零分支及 cwd 自动路由（D5/D8）。
 3. **Bot 配置嫌每次手填**：要机器级预设，enable 时点名；同一预设被另一 WorkTree 占用时报错，除非 `--force`（已写入 D11–D16 / §7.2）。
-4. **`--from-instance` 含义确认**：先在本 WorkTree `dev enable`，再 `AskHuman --settings`（或 channel CLI）配好测试渠道，然后 `dev preset save <name> --from-instance` 快照；不是从主生产环境抽。
+4. **`--from-instance` 含义确认**：先在本 WorkTree `dev enable`，再 `AskHuman dev exec -- --settings`（或 channel CLI）配好测试渠道，然后 `dev preset save <name> --from-instance` 快照；不是从主生产环境抽。
 5. **租约**：占用失败 / `--force` 抢租约+警告；僵死自动回收；预设目录 `~/.askhuman/dev-presets/`。
 6. **Agent WorkTree 文档**：需 `docs/agent-worktree-setup.md`，并在 `Agents.md` 引用；准备新 worktree 时 agent 用 AskHuman 询问是否配置 channel 预设。
-7. **Dispatcher**：A/B/C 分级 + spawn 跳过已定稿；未 install 的 settings 只写实例 home（验收 #10）。
+7. **Dispatcher**：目标选择与安装隔离分离，内部角色继承；dev 验证要求已安装实例 bin（D18）。

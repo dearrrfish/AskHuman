@@ -16,14 +16,15 @@
 
 ## 目标体验
 
-准备完成后，agent **提示词仍只需**：
+准备完成后，日常协作与功能验证分别调用：
 
 ```bash
 ./scripts/install.sh
-AskHuman "…"   # 或 MCP ask
+AskHuman "日常讨论"                     # 系统实例
+AskHuman dev exec -- "验证本次改动"      # 本树实例
 ```
 
-不必在提示词里分支 env / PATH；cwd 在已 enable 的树内会自动改道到该树的 bin + daemon。
+enabled 标记仅控制安装隔离。普通 CLI/MCP/Hook 默认系统；dev exec 显式选择本树 bin/home，保持 cwd 与附件解析。dev bin 缺失时明确失败，普通系统调用仍可用。首次迁移须先升级系统入口，只有 dev 安装不足以覆盖旧 dispatcher。
 
 Windows 对应安装命令是 `.\scripts\install-windows.cmd`；其余 `AskHuman dev …` 命令相同。
 
@@ -62,8 +63,9 @@ AskHuman dev enable --preset <name>
 
 ```bash
 AskHuman dev enable
-AskHuman --settings          # 在 GUI 里只配【测试】bot，勿用生产凭据
-# 或：AskHuman channel set …
+./scripts/install.sh         # dev exec 需要已安装的实例 bin
+AskHuman dev exec -- --settings          # 在 GUI 里只配【测试】bot，勿用生产凭据
+# 或：AskHuman dev exec -- channel set …
 AskHuman dev preset save <name> --from-instance
 ```
 
@@ -145,14 +147,15 @@ macOS 沿用原有复制和签名流程，本条 Linux 替换保证不适用于 
 
 ```bash
 AskHuman dev status
-AskHuman daemon status    # endpoint 应按本树 .askhuman-dev/home/ 独立派生
+AskHuman daemon status                 # 系统实例
+AskHuman dev exec -- daemon status      # 本树 endpoint
 ```
 
 ## 禁止事项
 
 - **不要**把生产 bot 凭据写进 dev 实例，也不要指望从主配置一键导入（产品不提供）。  
 - **不要**在两棵树上同时 `enable --preset` 同一预设（平台长连接互斥）；需要并行真 IM 时准备**两套**测试 bot / 两个预设。  
-- **不要**为了「走 dev」去改 agent 全局提示词分支；靠目录标记自动改道。
+- **不要**为了测试改生产 MCP/Hook 注册；使用 `dev exec -- …`，MCP 则开独立 `dev exec -- mcp` 客户端。
 - **不要**在实例里运行会改 Agent 集成的显式命令（`AskHuman agents …`、设置页的 Agent 集成开关）来「试一试」：
   `ASKHUMAN_HOME` 不隔离 `~/.cursor/hooks.json`、`~/.codex/…`、`~/.claude/settings.json` 等，这些写入会落到**真实**用户配置。
   实例 daemon 启动时的自动迁移已被跳过，但显式命令不受限（见 spec §7.1）。
@@ -177,6 +180,6 @@ AskHuman dev disable --purge   # 连 .askhuman-dev 目录一起删
 | 现象 | 处理 |
 |---|---|
 | `binary is missing` | 在本树跑 `./scripts/install.sh`；Windows 跑 `.\scripts\install-windows.cmd` |
-| 提问仍进主 daemon | 确认 cwd 在 enable 的树内；PATH 上的 `AskHuman` 是否已含 dispatcher（至少全局装过一版本功能） |
+| 提问仍进主 daemon | 普通调用走系统是预期；验证须用 `dev exec -- …`，并升级系统安装入口 |
 | preset 占用冲突 | 对方 `dev disable` 或本树 `--force` |
-| 设置改到了生产 config | 未 enable；先 `dev enable` 再 `--settings` |
+| 设置改到了生产 config | 使用 `dev exec -- --settings`；普通 `--settings` 面向系统 |

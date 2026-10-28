@@ -61,7 +61,7 @@ fn print_line(text: &str) {
 
 /// 入口分发：在创建任何窗口前按 argv 分流。
 pub fn dispatch() {
-    // Dev Instance: pin ASKHUMAN_HOME / re-exec worktree bin before any config or GUI load.
+    // Resolve explicit homes / dev installation entries before any config or GUI load.
     crate::dev_instance::maybe_enter_dev_instance();
 
     let raw_argv: Vec<String> = std::env::args().collect();
@@ -87,7 +87,15 @@ pub fn dispatch() {
         }
         let _ = CALLER_AGENT_HINT.set(hint);
     }
-    let lang = Lang::current();
+    // Management and pure information commands must not load production config just for locale.
+    let lang = if matches!(
+        crate::dev_instance::classify_command(&argv),
+        crate::dev_instance::CommandClass::Meta | crate::dev_instance::CommandClass::Dev
+    ) {
+        Lang::from_system()
+    } else {
+        Lang::current()
+    };
 
     // 完全无参数：报错 + 通用 Help（让用户直接 `AskHuman` 即可看到全部用法，而非仅提问说明）。
     // 注意：有参数但解析失败 / 未知选项的情况，仍展示提问导向的 agent-help（见下方分支）。
