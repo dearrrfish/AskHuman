@@ -32,6 +32,8 @@ demo/tray-menu-close/swift/test_fix
 
 # 杂项
 .DS_Store
+/result
+/result-*
 
 # Downstream-only (kept away from the upstream-maintained tail so upstream appends never conflict)
 .*/skills/team-*/
