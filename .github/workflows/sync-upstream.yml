@@ -12,6 +12,11 @@ on:
   schedule:
     # Daily at 04:00 UTC
     - cron: "0 4 * * *"
+  # Single entry point for main updates: direct pushes also sync upstream and,
+  # through the chained job below, my-nixpkgs. Pushes made with GITHUB_TOKEN by
+  # this workflow do not retrigger it.
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       dry_run:
