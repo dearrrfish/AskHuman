@@ -9,8 +9,9 @@ name: sync-my-nixpkgs
 #   creates or updates a Pull Request (with fallback Issue), and alerts the maintainer.
 
 on:
-  push:
-    branches: [main]
+  # Triggered by sync-upstream (on schedule, dispatch, and pushes to main) so
+  # every main update flows through one entry point. workflow_dispatch remains
+  # for manual recovery.
   workflow_dispatch:
     inputs:
       dry_run:
