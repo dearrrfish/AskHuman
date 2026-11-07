@@ -7,6 +7,7 @@ name: sync-my-nixpkgs
 # - Synchronizes Git LFS objects.
 # - On rebase conflict: aborts rebase, pushes origin/main to sync/main-to-my-nixpkgs,
 #   creates or updates a Pull Request (with fallback Issue), and alerts the maintainer.
+# Git pushes use SYNC_GITHUB_TOKEN. GITHUB_TOKEN cannot update workflow files.
 
 on:
   # Triggered by sync-upstream (on schedule, dispatch, and pushes to main) so
@@ -25,6 +26,10 @@ on:
         type: boolean
         default: false
         required: false
+    secrets:
+      SYNC_GITHUB_TOKEN:
+        description: "Fine-grained PAT with Contents, Workflows, Pull requests, and Issues write"
+        required: true
 
 permissions:
   contents: write
@@ -43,14 +48,25 @@ jobs:
       TARGET_BRANCH: my-nixpkgs
       CONFLICT_BRANCH: sync/main-to-my-nixpkgs
       DRY_RUN: ${{ inputs.dry_run || false }}
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
     steps:
+      - name: Require SYNC_GITHUB_TOKEN
+        env:
+          SYNC_GITHUB_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SYNC_GITHUB_TOKEN}" ]; then
+            echo "::error::Missing repository secret SYNC_GITHUB_TOKEN. Create a fine-grained PAT for dearrrfish/AskHuman with Contents, Workflows, Pull requests, and Issues set to Read and write, then run: gh secret set SYNC_GITHUB_TOKEN --repo dearrrfish/AskHuman"
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 0
           lfs: true
+          token: ${{ secrets.SYNC_GITHUB_TOKEN }}
 
       - name: Configure Git & Fetch Branches
         id: fetch
