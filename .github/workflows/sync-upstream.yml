@@ -7,6 +7,9 @@ name: sync-upstream
 # - Synchronizes Git LFS objects on fast-forward, rebase, and tag sync.
 # - On rebase conflict: aborts rebase, pushes upstream/main to sync/upstream-main,
 #   creates or updates a Pull Request (with fallback Issue), and alerts the maintainer.
+# Git pushes use SYNC_GITHUB_TOKEN (a fine-grained PAT). GITHUB_TOKEN is an
+# Actions GitHub App token and cannot create or update .github/workflows files,
+# so tag and branch sync that includes workflow changes is rejected.
 
 on:
   schedule:
@@ -41,14 +44,26 @@ jobs:
       TARGET_BRANCH: main
       CONFLICT_BRANCH: sync/upstream-main
       DRY_RUN: ${{ inputs.dry_run || false }}
-      GH_TOKEN: ${{ github.token }}
+      # gh uses this for conflict PRs/issues. Git push uses the checkout token below.
+      GH_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
     steps:
+      - name: Require SYNC_GITHUB_TOKEN
+        env:
+          SYNC_GITHUB_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SYNC_GITHUB_TOKEN}" ]; then
+            echo "::error::Missing repository secret SYNC_GITHUB_TOKEN. Create a fine-grained PAT for dearrrfish/AskHuman with Contents, Workflows, Pull requests, and Issues set to Read and write, then run: gh secret set SYNC_GITHUB_TOKEN --repo dearrrfish/AskHuman"
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 0
           lfs: true
+          token: ${{ secrets.SYNC_GITHUB_TOKEN }}
 
       - name: Configure Git identity and remotes
         run: |
@@ -386,3 +401,5 @@ jobs:
     uses: ./.github/workflows/sync-my-nixpkgs.yml
     with:
       dry_run: ${{ inputs.dry_run || false }}
+    secrets:
+      SYNC_GITHUB_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
