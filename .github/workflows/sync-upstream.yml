@@ -15,9 +15,7 @@ on:
   schedule:
     # Daily at 04:00 UTC
     - cron: "0 4 * * *"
-  # Single entry point for main updates: direct pushes also sync upstream and,
-  # through the chained job below, my-nixpkgs. Pushes made with GITHUB_TOKEN by
-  # this workflow do not retrigger it.
+  # Direct pushes to main also check for upstream updates.
   push:
     branches: [main]
   workflow_dispatch:
@@ -393,13 +391,3 @@ jobs:
 
             exit 1
           fi
-
-  sync-my-nixpkgs:
-    name: sync main -> my-nixpkgs
-    needs: sync
-    if: ${{ !cancelled() && needs.sync.result == 'success' }}
-    uses: ./.github/workflows/sync-my-nixpkgs.yml
-    with:
-      dry_run: ${{ inputs.dry_run || false }}
-    secrets:
-      SYNC_GITHUB_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}

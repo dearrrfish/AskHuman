@@ -25,6 +25,27 @@ pnpm build && cargo build --release \
 cargo test --manifest-path src-tauri/Cargo.toml            # Rust unit tests
 ```
 
+### Nix builds (Linux)
+
+The fork's `main` branch provides an `x86_64-linux` flake. Fetch Git LFS assets when
+building from Git:
+
+```bash
+nix build 'git+https://github.com/dearrrfish/AskHuman.git?ref=main&lfs=1'
+nix develop '.?lfs=1'
+nix flake check '.?lfs=1'
+```
+
+`packages.default`, `packages.askhuman`, and `packages.askhuman-my` refer to the same
+package; `overlays.default` also provides `askhuman-my`. Nix builds stamp
+`<baseVersion>+my-<shortRev>` into the manifests and binary while keeping the
+repository's release version unchanged. Build metadata is ignored by update
+version comparisons. The flake owns dependency hashes and Linux build/test
+integration; consumers should not need to duplicate these in overlays. When
+updating dependency lockfiles, refresh the corresponding PNPM/Cargo hash and run
+the flake checks. There is no separate packaging branch or downstream package
+update workflow.
+
 ### UI prototyping (browser-only, no Tauri)
 
 `src/prototype/` hosts standalone HTML entries that run in a plain browser with mock data and

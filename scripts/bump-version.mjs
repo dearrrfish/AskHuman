@@ -15,9 +15,12 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const version = process.argv[2];
-if (!version || !/^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/.test(version)) {
+if (
+  !version ||
+  !/^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?(\+[0-9A-Za-z.-]+)?$/.test(version)
+) {
   console.error(
-    "用法: node scripts/bump-version.mjs <version>   (如 0.2.0 或 0.2.0-rc.1)"
+    "用法: node scripts/bump-version.mjs <version>   (如 0.2.0、0.2.0-rc.1 或 0.2.0+my-abc1234)"
   );
   process.exit(1);
 }
