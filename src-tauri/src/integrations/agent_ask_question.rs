@@ -134,7 +134,7 @@ fn inspect(text: &str, expected: &str) -> (usize, usize) {
             }
             marker_count += 1;
             let timeout_ok = handler.get("timeout").and_then(Value::as_u64) == Some(TIMEOUT_SECS);
-            if matcher_ok && command == expected && timeout_ok {
+            if matcher_ok && hook_edit::same_hook_command(command, expected) && timeout_ok {
                 exact_count += 1;
             }
         }

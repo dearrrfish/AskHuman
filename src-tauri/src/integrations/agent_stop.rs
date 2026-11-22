@@ -544,6 +544,38 @@ fn apply_failure_sources(
     Ok(updated)
 }
 
+fn failure_values_match(expected: &Value, original: &Value) -> bool {
+    match (expected, original) {
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(k, va)| {
+                    b.get(k).is_some_and(|vb| {
+                        if k == "command" {
+                            match (va.as_str(), vb.as_str()) {
+                                (Some(sa), Some(sb))
+                                    if sa.contains(FAILURE_MARKER)
+                                        || sb.contains(FAILURE_MARKER) =>
+                                {
+                                    hook_edit::same_hook_command(sb, sa)
+                                }
+                                _ => va == vb,
+                            }
+                        } else {
+                            failure_values_match(va, vb)
+                        }
+                    })
+                })
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(va, vb)| failure_values_match(va, vb))
+        }
+        _ => expected == original,
+    }
+}
+
 fn failure_sources_match(kind: AgentKind, original: &str, track: bool, confirm: bool) -> bool {
     let executable = crate::development::routing::program_path().ok();
     let expected = apply_failure_sources(
@@ -559,9 +591,11 @@ fn failure_sources_match(kind: AgentKind, original: &str, track: bool, confirm: 
         jsonc_parser::parse_to_serde_value::<Value>(text, &jsonc_parser::ParseOptions::default())
             .ok()
     };
-    expected
-        .ok()
-        .is_some_and(|expected| parse(&expected) == parse(original))
+    match (expected.ok().and_then(|text| parse(&text)), parse(original)) {
+        (Some(exp), Some(orig)) => failure_values_match(&exp, &orig),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn hook_path(kind: AgentKind) -> std::path::PathBuf {

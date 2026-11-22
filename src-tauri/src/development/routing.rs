@@ -105,8 +105,14 @@ fn contextualize(mut target: Target) -> Result<Target, String> {
 /// image is reached through a symlink or retained by the Linux publisher.
 pub fn program_path() -> std::io::Result<PathBuf> {
     match inherited().map_err(std::io::Error::other)? {
-        Some(target) => Ok(target.binary),
-        None => crate::executable::launch_path(),
+        Some(target) => {
+            if target.kind == TargetKind::System && crate::executable::is_nix_entry() {
+                crate::executable::public_program_path()
+            } else {
+                Ok(target.binary)
+            }
+        }
+        None => crate::executable::public_program_path(),
     }
 }
 

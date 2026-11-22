@@ -2,6 +2,16 @@
 use std::time::{Duration, Instant};
 
 pub fn dispatch(args: &[String]) -> i32 {
+    dispatch_for_kind(args, crate::update::detect_install_kind())
+}
+
+fn dispatch_for_kind(args: &[String], kind: crate::update::InstallKind) -> i32 {
+    if kind == crate::update::InstallKind::Nix {
+        eprintln!(
+            "AskHuman is managed by Nix; update through your declarative configuration or Nix profile"
+        );
+        return 1;
+    }
     match args.first().map(String::as_str) {
         Some("prepare") if args.len() == 1 => prepare(),
         _ => {
@@ -143,6 +153,7 @@ fn prepare() -> i32 {
             crate::update::InstallKind::Npm => {
                 println!("next: {}", crate::update::npm::NpmUpdater::manual_command());
             }
+            crate::update::InstallKind::Nix => unreachable!("Nix is rejected before preparation"),
             crate::update::InstallKind::Direct => {
                 println!(
                     "release: https://github.com/{}/{}/releases/latest",
@@ -169,6 +180,14 @@ fn prepare() -> i32 {
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn nix_prepare_is_rejected_before_runtime_or_daemon_access() {
+        assert_eq!(
+            super::dispatch_for_kind(&["prepare".to_string()], crate::update::InstallKind::Nix),
+            1
+        );
+    }
 
     #[test]
     fn unknown_subcommand_is_rejected() {

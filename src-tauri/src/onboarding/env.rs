@@ -279,6 +279,25 @@ fn installs_message(report: &install_check::Report, lang: Lang) -> Option<String
     Some(message)
 }
 
+fn resolve_program_exe_with(
+    routing: impl FnOnce() -> std::io::Result<PathBuf>,
+    public: impl FnOnce() -> std::io::Result<PathBuf>,
+    launch: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Option<PathBuf> {
+    routing()
+        .or_else(|_| public())
+        .or_else(|_| launch())
+        .ok()
+}
+
+fn resolve_program_exe() -> Option<PathBuf> {
+    resolve_program_exe_with(
+        crate::development::routing::program_path,
+        crate::executable::public_program_path,
+        crate::executable::launch_path,
+    )
+}
+
 /// Run the real check. A Dev Instance reports nothing: its binary is not meant to win the PATH and
 /// its daemon is isolated.
 pub fn check(lang: Lang) -> EnvReport {
@@ -294,7 +313,7 @@ pub fn check(lang: Lang) -> EnvReport {
     let status = cfgio::daemon_status_result();
     let report =
         install_check::collect_with_path(status.as_ref().ok().and_then(Option::as_ref), scan_dirs);
-    let exe = std::env::current_exe().ok();
+    let exe = resolve_program_exe();
     let home = crate::paths::home();
     let temp_dir = std::env::temp_dir();
     build_report(Inputs {
@@ -582,5 +601,83 @@ mod tests {
         })
         .unwrap();
         assert_eq!(fix["needsPathEdit"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_program_exe_prefers_public_wrapper_over_current_exe() {
+        const PROBE: &str = "ASKHUMAN_ONBOARDING_ENV_EXE_TEST_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "onboarding::env::tests::resolve_program_exe_prefers_public_wrapper_over_current_exe",
+                    "--nocapture",
+                ])
+                .env(PROBE, "1")
+                .env_remove(crate::development::routing::TARGET_ENV)
+                .env_remove(crate::executable::PUBLIC_EXECUTABLE_ENV)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = p(HOME);
+        let temp = p("/tmp");
+        let wrapper = p("/etc/profiles/per-user/tester/bin/AskHuman");
+
+        let target = crate::development::routing::Target {
+            version: 1,
+            kind: crate::development::routing::TargetKind::Isolated,
+            binary: wrapper.clone(),
+            home: dir.path().join("dev-home"),
+            worktree: None,
+            reason: "test".into(),
+            no_keychain: true,
+            fixture: None,
+        };
+        unsafe {
+            std::env::set_var(
+                crate::development::routing::TARGET_ENV,
+                serde_json::to_string(&target).unwrap(),
+            );
+        }
+
+        let exe = resolve_program_exe().expect("should resolve routed wrapper path");
+        assert_eq!(exe, wrapper);
+        assert_ne!(exe, std::env::current_exe().unwrap());
+
+        let writable = |_: &Path| false;
+        let report = build_report(inputs(EnvLookup::Missing, Some(&exe), &home, &temp, &writable, None));
+        let fix = report.path_fix.expect("path fix expected");
+        assert!(fix.command.contains(&*wrapper.to_string_lossy()));
+        assert!(!fix.command.contains(".AskHuman-wrapped"));
+
+        // Verify fallback chain when routing/public lookups fail.
+        let fallback_public = dir.path().join("profile/bin/AskHuman");
+        let fallback_launch = dir.path().join("launch/bin/AskHuman");
+        assert_eq!(
+            resolve_program_exe_with(
+                || Err(std::io::Error::other("no route")),
+                || Ok(fallback_public.clone()),
+                || Ok(fallback_launch.clone()),
+            ),
+            Some(fallback_public)
+        );
+        assert_eq!(
+            resolve_program_exe_with(
+                || Err(std::io::Error::other("no route")),
+                || Err(std::io::Error::other("no public")),
+                || Ok(fallback_launch.clone()),
+            ),
+            Some(fallback_launch)
+        );
     }
 }

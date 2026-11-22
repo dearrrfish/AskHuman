@@ -4195,7 +4195,7 @@ pub fn mcp_config_open(agent: String) -> Result<(), String> {
 #[tauri::command]
 pub fn mcp_command_path() -> Result<String, String> {
     let lang = crate::i18n::Lang::current();
-    std::env::current_exe()
+    crate::development::routing::program_path()
         .map(|p| p.to_string_lossy().to_string())
         .map_err(|e| crate::i18n::tr(lang, "cmd.locateExeFailed").replace("{e}", &e.to_string()))
 }
@@ -6154,6 +6154,61 @@ mod tests {
         // Restore before asserting so the temporary folder can be removed even when the assertion fails.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(answer, vec![true]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_command_path_uses_routed_public_wrapper_instead_of_current_exe() {
+        const PROBE: &str = "ASKHUMAN_MCP_COMMAND_PATH_TEST_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::tests::mcp_command_path_uses_routed_public_wrapper_instead_of_current_exe",
+                    "--nocapture",
+                ])
+                .env(PROBE, "1")
+                .env_remove(crate::development::routing::TARGET_ENV)
+                .env_remove(crate::executable::PUBLIC_EXECUTABLE_ENV)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        // Dev Instance or wrapper routing overrides `std::env::current_exe()` so callers such as
+        // Nix / Home Manager wrappers never expose `.AskHuman-wrapped` in manual MCP snippets.
+        let wrapper = dir.path().join("bin").join("AskHuman");
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+        let target = crate::development::routing::Target {
+            version: 1,
+            kind: crate::development::routing::TargetKind::Isolated,
+            binary: wrapper.clone(),
+            home: dir.path().join("dev-home"),
+            worktree: None,
+            reason: "test".into(),
+            no_keychain: true,
+            fixture: None,
+        };
+        unsafe {
+            std::env::set_var(
+                crate::development::routing::TARGET_ENV,
+                serde_json::to_string(&target).unwrap(),
+            );
+        }
+        let resolved = mcp_command_path().unwrap();
+        assert_eq!(resolved, wrapper.to_string_lossy());
+        assert_ne!(
+            resolved,
+            std::env::current_exe().unwrap().to_string_lossy()
+        );
     }
 }
 

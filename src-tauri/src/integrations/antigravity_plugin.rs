@@ -522,6 +522,47 @@ fn json_bytes(value: &Value) -> Vec<u8> {
     bytes
 }
 
+fn disk_nix_equivalent_executable(layout: &Layout, expected: &str) -> Option<String> {
+    if let Ok(text) = std::fs::read_to_string(layout.dir.join(MCP)) {
+        if let Ok(val) = serde_json::from_str::<Value>(&text) {
+            if let Some(cmd) = val
+                .get("mcpServers")
+                .and_then(|m| m.get("mcp"))
+                .and_then(|m| m.get("command"))
+                .and_then(Value::as_str)
+            {
+                if cmd != expected && crate::executable::same_program_target(cmd, expected) {
+                    return Some(cmd.to_string());
+                }
+            }
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(layout.dir.join(HOOKS)) {
+        if let Ok(val) = serde_json::from_str::<Value>(&text) {
+            if let Some(events) = val.get(PLUGIN_NAME).and_then(Value::as_object) {
+                for groups in events.values() {
+                    if let Some(arr) = groups.as_array() {
+                        for item in arr {
+                            if let Some(cmd) = item.get("command").and_then(Value::as_str) {
+                                if let Some((exe, _)) =
+                                    super::hook_edit::split_command_executable(cmd)
+                                {
+                                    if exe != expected
+                                        && crate::executable::same_program_target(exe, expected)
+                                    {
+                                        return Some(exe.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Hook commands run through `sh -c` inside double quotes.
 fn command_safe(executable: &str) -> Result<()> {
     if executable.is_empty()
@@ -895,7 +936,14 @@ fn snapshot_at(
                 State::NeedsRepair
             } else {
                 let desired = executable.and_then(|executable| {
-                    render(manifest, executable, &rules(manifest.variant.into())).ok()
+                    let rendered = render(manifest, executable, &rules(manifest.variant.into())).ok()?;
+                    if owned.present == digests(&rendered) {
+                        return Some(rendered);
+                    }
+                    // If HM activation wrote a Nix store path and runtime resolves a matching
+                    // profile symlink (or vice versa), treat equivalent Nix targets as current.
+                    let disk_exe = disk_nix_equivalent_executable(layout, executable)?;
+                    render(manifest, &disk_exe, &rules(manifest.variant.into())).ok()
                 });
                 match desired {
                     Some(desired)

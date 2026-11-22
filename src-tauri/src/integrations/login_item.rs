@@ -16,6 +16,8 @@
 //! 入口都先过 `is_dev_instance_context`（与 Agent hook 自动迁移共用，定义见 `dev_instance`）。
 
 use crate::dev_instance::is_dev_instance_context;
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 
@@ -28,12 +30,21 @@ const WINDOWS_GUI_VALUE: &str = "AskHuman GUI Host";
 #[cfg(windows)]
 const WINDOWS_DAEMON_VALUE: &str = "AskHuman Daemon";
 
-/// 当前可执行文件路径（解析失败回退到字面名，仅用于内容生成）。
+/// Current executable path for the Windows launcher template.
+#[cfg(windows)]
 fn current_exe() -> String {
     std::env::current_exe()
         .ok()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "AskHuman".to_string())
+}
+
+/// Resolve before any login file is written; a Nix generation alone is not stable startup.
+#[cfg(unix)]
+fn persistent_exe() -> std::io::Result<String> {
+    Ok(crate::executable::persistent_launch_path()?
+        .display()
+        .to_string())
 }
 
 // ===== Windows: per-user Run registry values =====
@@ -335,7 +346,7 @@ pub fn install() -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, plist_contents(&current_exe()))?;
+    std::fs::write(&path, plist_contents(&persistent_exe()?))?;
     // 先 bootout 旧实例（忽略错误），再 bootstrap 新的；失败回退 load -w。best-effort。
     let domain = format!("gui/{}", unsafe { libc::getuid() });
     let _ = run(
@@ -371,7 +382,143 @@ pub fn uninstall() -> std::io::Result<()> {
     Ok(())
 }
 
-// ===== Linux：autostart .desktop =====
+// ===== Linux：autostart .desktop & systemd user units =====
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const SYSTEMD_GUIHOST_UNIT: &str = "askhuman-guihost.service";
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const SYSTEMD_DAEMON_UNIT: &str = "askhuman-daemon.service";
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const MANAGED_AUTOSTART_ENV: &str = "ASKHUMAN_MANAGED_AUTOSTART";
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn systemd_unit_managed_in(
+    unit_name: &str,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    integration_home: &Path,
+    system_systemd_dir: &Path,
+) -> bool {
+    if xdg_config_home
+        .filter(|v| !v.is_empty())
+        .is_some_and(|dir| Path::new(dir).join("systemd").join("user").join(unit_name).exists())
+    {
+        return true;
+    }
+    if integration_home
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join(unit_name)
+        .exists()
+    {
+        return true;
+    }
+    system_systemd_dir.join(unit_name).exists()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn is_managed_autostart() -> bool {
+    !is_dev_instance_context()
+        && std::env::var_os(MANAGED_AUTOSTART_ENV).is_some_and(|v| v == "1")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn autostart_managed_externally() -> bool {
+    is_managed_autostart()
+}
+
+#[cfg(target_os = "macos")]
+fn autostart_managed_externally() -> bool {
+    false
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn is_systemd_unit_managed(unit_name: &str) -> bool {
+    if is_dev_instance_context() {
+        return false;
+    }
+    systemd_unit_managed_in(
+        unit_name,
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        &crate::paths::integration_home(),
+        Path::new("/etc/systemd/user"),
+    )
+}
+
+/// Whether the GUI host is managed by a systemd user service (e.g. NixOS / Home Manager).
+/// Always `false` in a Dev Instance context.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn is_systemd_guihost_managed() -> bool {
+    is_systemd_unit_managed(SYSTEMD_GUIHOST_UNIT)
+}
+
+/// Whether the GUI host is managed by a systemd user service. Always `false` off Linux.
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub fn is_systemd_guihost_managed() -> bool {
+    false
+}
+
+/// Whether the daemon is managed by a systemd user service (e.g. NixOS / Home Manager).
+/// Always `false` in a Dev Instance context.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn is_systemd_daemon_managed() -> bool {
+    is_systemd_unit_managed(SYSTEMD_DAEMON_UNIT)
+}
+
+/// Whether the daemon is managed by a systemd user service. Always `false` off Linux.
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub fn is_systemd_daemon_managed() -> bool {
+    false
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn install_desktop_entry(
+    path: &Path,
+    systemd_managed: bool,
+    contents: impl FnOnce() -> String,
+) -> std::io::Result<()> {
+    // When systemd manages the unit, never write a competing XDG autostart entry and remove any
+    // residual .desktop file left by a non-systemd install.
+    if systemd_managed {
+        return remove_file_if_exists(path);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, contents())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[allow(dead_code)]
+fn sync_desktop_autostart(
+    path: &Path,
+    systemd_managed: bool,
+    keep_alive: bool,
+    contents: impl FnOnce() -> String,
+) -> std::io::Result<()> {
+    if systemd_managed || !keep_alive {
+        return remove_file_if_exists(path);
+    }
+    let expected = contents();
+    if std::fs::read_to_string(path).is_ok_and(|installed| installed == expected) {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, expected)
+}
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn item_path() -> PathBuf {
@@ -397,26 +544,22 @@ Terminal=false\n"
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn install() -> std::io::Result<()> {
-    if is_dev_instance_context() {
-        return Ok(()); // dev 实例不触碰全局登录项（见 is_dev_instance_context 注释）。
+    if is_dev_instance_context() || is_managed_autostart() {
+        return Ok(()); // dev 实例或声明式托管环境不触碰全局登录项。
     }
-    let path = item_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    if is_systemd_guihost_managed() {
+        return remove_file_if_exists(&item_path());
     }
-    std::fs::write(&path, desktop_contents(&current_exe()))
+    let exe = persistent_exe()?;
+    install_desktop_entry(&item_path(), false, || desktop_contents(&exe))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn uninstall() -> std::io::Result<()> {
-    if is_dev_instance_context() {
-        return Ok(()); // dev 实例不触碰全局登录项（见 is_dev_instance_context 注释）。
+    if is_dev_instance_context() || is_managed_autostart() {
+        return Ok(()); // dev 实例或声明式托管环境不触碰全局登录项。
     }
-    let path = item_path();
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
-    Ok(())
+    remove_file_if_exists(&item_path())
 }
 
 // ===== Daemon 登录项（保活模式：daemon 本体开机自启）=====
@@ -493,17 +636,23 @@ Terminal=false\n"
 /// daemon 登录项是否已安装。
 #[cfg(unix)]
 pub fn daemon_is_installed() -> bool {
-    daemon_item_path().exists()
+    autostart_managed_externally() || is_systemd_daemon_managed() || daemon_item_path().exists()
 }
 
 /// 已装模板与当前期望不一致（移动安装位置或模板升级后需刷新）。
 #[cfg(unix)]
 pub fn daemon_needs_update() -> bool {
+    if autostart_managed_externally() || is_systemd_daemon_managed() {
+        return false;
+    }
     if !daemon_is_installed() {
         return false;
     }
+    let Ok(exe) = persistent_exe() else {
+        return true;
+    };
     match std::fs::read_to_string(daemon_item_path()) {
-        Ok(text) => daemon_template_needs_update(&text, &current_exe()),
+        Ok(text) => daemon_template_needs_update(&text, &exe),
         Err(_) => true,
     }
 }
@@ -521,11 +670,25 @@ pub fn install_daemon() -> std::io::Result<()> {
     if is_dev_instance_context() {
         return Ok(()); // dev 实例不触碰全局登录项（见 is_dev_instance_context 注释）。
     }
-    let path = daemon_item_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if is_managed_autostart() {
+            return Ok(());
+        }
+        if is_systemd_daemon_managed() {
+            return remove_file_if_exists(&daemon_item_path());
+        }
+        let exe = persistent_exe()?;
+        install_desktop_entry(&daemon_item_path(), false, || daemon_contents(&exe))
     }
-    std::fs::write(&path, daemon_contents(&current_exe()))
+    #[cfg(target_os = "macos")]
+    {
+        let path = daemon_item_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, daemon_contents(&persistent_exe()?))
+    }
 }
 
 /// 删除 daemon 登录项文件（**不** bootout，避免强杀正在运行的 daemon）。幂等。
@@ -533,6 +696,10 @@ pub fn install_daemon() -> std::io::Result<()> {
 pub fn uninstall_daemon() -> std::io::Result<()> {
     if is_dev_instance_context() {
         return Ok(()); // dev 实例不触碰全局登录项（见 is_dev_instance_context 注释）。
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if is_managed_autostart() {
+        return Ok(());
     }
     let path = daemon_item_path();
     if path.exists() {
@@ -578,6 +745,18 @@ pub fn uninstall_daemon() -> std::io::Result<()> {
 /// 让 daemon 登录项与「是否保活」一致：保活→写/刷新文件、否则→删文件。幂等，供 daemon 启动 /
 /// 配置变更 / 宿主换挡复用。
 pub fn sync_daemon(keep_alive: bool) -> std::io::Result<()> {
+    if is_dev_instance_context() {
+        return Ok(());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if is_managed_autostart() {
+            return Ok(());
+        }
+        if is_systemd_daemon_managed() {
+            return remove_file_if_exists(&daemon_item_path());
+        }
+    }
     if keep_alive {
         if daemon_is_installed() && !daemon_needs_update() {
             Ok(())
@@ -594,16 +773,21 @@ pub fn sync_daemon(keep_alive: bool) -> std::io::Result<()> {
 /// 登录项是否已安装。
 #[cfg(unix)]
 pub fn is_installed() -> bool {
-    item_path().exists()
+    autostart_managed_externally() || is_systemd_guihost_managed() || item_path().exists()
 }
 
 /// 已安装但记录的 exe 路径与当前不一致（移动安装位置后需刷新）。
 #[cfg(unix)]
 pub fn needs_update() -> bool {
+    if autostart_managed_externally() || is_systemd_guihost_managed() {
+        return false;
+    }
     if !is_installed() {
         return false;
     }
-    let exe = current_exe();
+    let Ok(exe) = persistent_exe() else {
+        return true;
+    };
     match std::fs::read_to_string(item_path()) {
         Ok(text) => !text.contains(&exe),
         Err(_) => true,
@@ -621,6 +805,15 @@ pub fn instance_has_login_item() -> bool {
 pub fn ensure_installed() -> std::io::Result<()> {
     if is_dev_instance_context() {
         return Ok(()); // dev 实例不触碰全局登录项（见 is_dev_instance_context 注释）。
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if is_managed_autostart() {
+            return Ok(());
+        }
+        if is_systemd_guihost_managed() {
+            return remove_file_if_exists(&item_path());
+        }
     }
     if !is_installed() || needs_update() {
         install()
@@ -757,6 +950,204 @@ mod tests {
         let d = daemon_contents("/home/u/.local/bin/AskHuman");
         assert!(d.contains("Exec=\"/home/u/.local/bin/AskHuman\" daemon start"));
         assert!(d.contains("X-GNOME-Autostart-enabled=true"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn systemd_unit_managed_in_detects_xdg_home_system_and_symlinks_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let xdg_dir = temp.path().join("xdg");
+        let home_dir = temp.path().join("home");
+        let sys_dir = temp.path().join("etc-systemd-user");
+        let store_dir = temp.path().join("nix-store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let store_unit = store_dir.join(SYSTEMD_GUIHOST_UNIT);
+        std::fs::write(&store_unit, "[Unit]\nDescription=AskHuman\n").unwrap();
+
+        // Absent everywhere -> false (even with empty XDG_CONFIG_HOME).
+        assert!(!systemd_unit_managed_in(
+            SYSTEMD_GUIHOST_UNIT,
+            None,
+            &home_dir,
+            &sys_dir
+        ));
+        assert!(!systemd_unit_managed_in(
+            SYSTEMD_GUIHOST_UNIT,
+            Some(std::ffi::OsStr::new("")),
+            &home_dir,
+            &sys_dir
+        ));
+
+        // XDG_CONFIG_HOME direct unit file -> true.
+        let xdg_unit_dir = xdg_dir.join("systemd").join("user");
+        std::fs::create_dir_all(&xdg_unit_dir).unwrap();
+        let xdg_unit = xdg_unit_dir.join(SYSTEMD_GUIHOST_UNIT);
+        std::fs::write(&xdg_unit, "[Unit]\n").unwrap();
+        assert!(systemd_unit_managed_in(
+            SYSTEMD_GUIHOST_UNIT,
+            Some(xdg_dir.as_os_str()),
+            &home_dir,
+            &sys_dir
+        ));
+        std::fs::remove_file(&xdg_unit).unwrap();
+
+        // XDG_CONFIG_HOME symlink to store unit -> true.
+        std::os::unix::fs::symlink(&store_unit, &xdg_unit).unwrap();
+        assert!(systemd_unit_managed_in(
+            SYSTEMD_GUIHOST_UNIT,
+            Some(xdg_dir.as_os_str()),
+            &home_dir,
+            &sys_dir
+        ));
+        std::fs::remove_file(&xdg_unit).unwrap();
+
+        // integration_home/.config/systemd/user symlink -> true.
+        let home_unit_dir = home_dir.join(".config").join("systemd").join("user");
+        std::fs::create_dir_all(&home_unit_dir).unwrap();
+        let home_unit = home_unit_dir.join(SYSTEMD_GUIHOST_UNIT);
+        std::os::unix::fs::symlink(&store_unit, &home_unit).unwrap();
+        assert!(systemd_unit_managed_in(
+            SYSTEMD_GUIHOST_UNIT,
+            None,
+            &home_dir,
+            &sys_dir
+        ));
+        std::fs::remove_file(&home_unit).unwrap();
+
+        // /etc/systemd/user equivalent -> true.
+        std::fs::create_dir_all(&sys_dir).unwrap();
+        std::fs::write(sys_dir.join(SYSTEMD_DAEMON_UNIT), "[Unit]\n").unwrap();
+        assert!(systemd_unit_managed_in(
+            SYSTEMD_DAEMON_UNIT,
+            None,
+            &home_dir,
+            &sys_dir
+        ));
+        assert!(!systemd_unit_managed_in(
+            SYSTEMD_GUIHOST_UNIT,
+            None,
+            &home_dir,
+            &sys_dir
+        ));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn systemd_managed_desktop_cleanup_removes_residual_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let autostart = temp.path().join("autostart");
+        std::fs::create_dir_all(&autostart).unwrap();
+
+        let gui_desktop = autostart.join("askhuman-guihost.desktop");
+        let daemon_desktop = autostart.join("askhuman-daemon.desktop");
+        std::fs::write(&gui_desktop, desktop_contents("/old/AskHuman")).unwrap();
+        std::fs::write(&daemon_desktop, daemon_contents("/old/AskHuman")).unwrap();
+
+        // Systemd-managed guihost install removes residual .desktop without writing a new one.
+        install_desktop_entry(&gui_desktop, true, || {
+            panic!("should not generate .desktop when systemd-managed")
+        })
+        .unwrap();
+        assert!(!gui_desktop.exists());
+
+        // Missing file under systemd-managed stays absent (no directory or file created).
+        let uncreated = temp.path().join("never-created").join("askhuman-guihost.desktop");
+        install_desktop_entry(&uncreated, true, || {
+            panic!("should not generate .desktop when systemd-managed")
+        })
+        .unwrap();
+        assert!(!uncreated.exists());
+        assert!(!uncreated.parent().unwrap().exists());
+
+        // Systemd-managed daemon sync removes residual .desktop even with keep_alive == true.
+        sync_desktop_autostart(&daemon_desktop, true, true, || {
+            panic!("should not generate daemon .desktop when systemd-managed")
+        })
+        .unwrap();
+        assert!(!daemon_desktop.exists());
+
+        // Non-managed paths write .desktop normally.
+        install_desktop_entry(&gui_desktop, false, || {
+            desktop_contents("/etc/profiles/per-user/u/bin/AskHuman")
+        })
+        .unwrap();
+        assert!(std::fs::read_to_string(&gui_desktop)
+            .unwrap()
+            .contains("/etc/profiles/per-user/u/bin/AskHuman"));
+
+        sync_desktop_autostart(&daemon_desktop, false, true, || {
+            daemon_contents("/etc/profiles/per-user/u/bin/AskHuman")
+        })
+        .unwrap();
+        assert!(std::fs::read_to_string(&daemon_desktop)
+            .unwrap()
+            .contains("/etc/profiles/per-user/u/bin/AskHuman"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn managed_autostart_env_reports_installed_and_skips_desktop_writes() {
+        const PROBE: &str = "ASKHUMAN_MANAGED_AUTOSTART_TEST_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let xdg_dir = temp.path().join("xdg");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "integrations::login_item::tests::managed_autostart_env_reports_installed_and_skips_desktop_writes",
+                    "--nocapture",
+                ])
+                .env(PROBE, "1")
+                .env("HOME", temp.path())
+                .env("XDG_CONFIG_HOME", &xdg_dir)
+                .env(MANAGED_AUTOSTART_ENV, "1")
+                .env_remove(crate::development::routing::TARGET_ENV)
+                .env_remove(crate::dev_instance::ASKHUMAN_HOME_ENV)
+                .env_remove(crate::development::session::PROFILE_ENV)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert!(is_managed_autostart());
+        // ASKHUMAN_MANAGED_AUTOSTART=1 suppresses .desktop writes and marks login items
+        // managed, without falsely claiming a systemd unit exists on disk.
+        let home_systemd = crate::paths::integration_home().join(".config/systemd/user");
+        if !home_systemd.join(SYSTEMD_GUIHOST_UNIT).exists()
+            && !Path::new("/etc/systemd/user").join(SYSTEMD_GUIHOST_UNIT).exists()
+        {
+            assert!(!is_systemd_guihost_managed());
+        }
+        if !home_systemd.join(SYSTEMD_DAEMON_UNIT).exists()
+            && !Path::new("/etc/systemd/user").join(SYSTEMD_DAEMON_UNIT).exists()
+        {
+            assert!(!is_systemd_daemon_managed());
+        }
+        let snapshot = |path: &Path| {
+            std::fs::read(path)
+                .ok()
+                .zip(std::fs::metadata(path).ok().and_then(|m| m.modified().ok()))
+        };
+        let gui_before = snapshot(&item_path());
+        let daemon_before = snapshot(&daemon_item_path());
+        assert!(is_installed());
+        assert!(daemon_is_installed());
+        assert!(!needs_update());
+        assert!(!daemon_needs_update());
+        install().unwrap();
+        uninstall().unwrap();
+        ensure_installed().unwrap();
+        install_daemon().unwrap();
+        uninstall_daemon().unwrap();
+        sync_daemon(true).unwrap();
+        sync_daemon(false).unwrap();
+        assert_eq!(snapshot(&item_path()), gui_before);
+        assert_eq!(snapshot(&daemon_item_path()), daemon_before);
     }
 
     #[cfg(windows)]

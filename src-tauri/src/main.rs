@@ -103,7 +103,6 @@ mod watch;
 fn main() {
     // Capture process birth ASAP so the `cli.start` perf milestone is accurate.
     perf::record_start();
-    #[cfg(target_os = "linux")]
     executable::capture_launch_path();
     #[cfg(target_os = "linux")]
     linux_runtime::configure_gsettings();

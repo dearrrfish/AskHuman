@@ -1172,6 +1172,8 @@ export default {
       checkFailed: "检查更新失败",
       updateFailed: "更新失败",
       manualUnavailable: "Windows 自动更新当前不可用，请手动更新。",
+      nixManaged:
+        "此安装由 Nix 管理。请通过你的声明式配置或 Nix profile 更新 AskHuman。",
       prepareManual: "准备手动更新…",
       preparingManual: "正在准备…",
       prepareManualHint:

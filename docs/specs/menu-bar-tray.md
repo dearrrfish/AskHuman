@@ -33,6 +33,8 @@
 > 检查结果合并，不得把刚查到的更新入口覆盖掉。Host 换新使用更新前缓存的稳定可执行路径，避免 Linux
 > 替换运行中 inode 后 `current_exe()` 指向 `(... deleted)`；新 Host 拉起失败时旧 Host 保持运行并显示错误。
 >
+> **Nix 入口与受管自启补充（2026-11）**：Nix 包通过 `share/askhuman/entry-v1.json` 或同包 `.AskHuman-wrapped` → `bin/AskHuman` 还原把运行中 ELF（`image_path`）与外部启动入口（`launch_path` / `public_program_path`）解耦：内部子进程始终经 wrapper 启动，hooks/MCP/plugins 与登录项优先采用 `ASKHUMAN_PUBLIC_EXECUTABLE` 或指向当前包的可信账户 Nix profile 入口，且 symlink 指向同一包 wrapper 的配置在状态检查中视为最新。Linux 下若设置了 `ASKHUMAN_MANAGED_AUTOSTART=1` 或检测到 `askhuman-{guihost,daemon}.service` systemd 用户单元，`login_item` 跳过写入可变 `~/.config/autostart/askhuman-*.desktop` 并回报已就绪；`menuBarIcon=always` 的受管 GUI Host 换新时直接退出交由 systemd `Restart=always` 拉起新版。
+>
 > **D8/D10 补充（检查结果一致性，2026-07）**：设置页与菜单检查共享 `update.json`，写操作持
 > `update.lock`，缓存版本只前进不后退。设置页检查成功须即时刷新 Host 菜单；若 daemon 正在运行，
 > 通过增量 IPC 令其立刻重载并广播给弹窗（不运行则不拉起）。菜单检查成功后保留“已检查到新版本

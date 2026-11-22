@@ -117,7 +117,7 @@ export function useAboutUpdates() {
   }
 
   async function applyUpdate() {
-    if (updateApplying.value) return;
+    if (updateInfo.value?.applyMode !== "automatic" || updateApplying.value) return;
     updateApplying.value = true;
     updateError.value = "";
     updateProgress.value = 0;
@@ -146,7 +146,11 @@ export function useAboutUpdates() {
 
   async function prepareManualUpdate() {
     const info = updateInfo.value;
-    if (!info || info.applyMode === "automatic" || updatePreparing.value) return;
+    if (
+      !info ||
+      !["manualDirect", "manualNpm"].includes(info.applyMode) ||
+      updatePreparing.value
+    ) return;
     if (!window.confirm(t("settings.about.prepareConfirm"))) return;
 
     updatePreparing.value = true;

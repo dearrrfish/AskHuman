@@ -750,7 +750,9 @@ fn elem_matches(
             .and_then(|h| h.as_array())
             .map(|arr| {
                 arr.iter().any(|h| {
-                    h.get("command").and_then(|c| c.as_str()) == Some(want)
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|actual| super::hook_edit::same_hook_command(actual, want))
                         && want_windows.is_none_or(|want_windows| {
                             h.get("commandWindows").and_then(Value::as_str) == Some(want_windows)
                         })
@@ -759,7 +761,9 @@ fn elem_matches(
             })
             .unwrap_or(false),
         Shape::Flat => {
-            elem.get("command").and_then(|c| c.as_str()) == Some(want)
+            elem.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(|actual| super::hook_edit::same_hook_command(actual, want))
                 && timeout_ok(elem)
                 && (!want_unlimited_loop || elem.get("loop_limit").is_some_and(Value::is_null))
         }

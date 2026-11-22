@@ -100,17 +100,40 @@ fn validate_fixture_peer(status: &StatusInfo) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 连一次并握手，返回握手状态（连不上、无应答或应答异常返回 None）。
+fn check_hello_ack_protocol(ack: &crate::ipc::HelloAck) -> std::io::Result<()> {
+    if ack.protocol_version > ipc::PROTOCOL_VERSION {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            ack.reason.clone().unwrap_or_else(|| {
+                format!(
+                    "running daemon (v{}, protocol {}) is newer than this client (protocol {}); restart the client or agent session",
+                    ack.daemon_version, ack.protocol_version, ipc::PROTOCOL_VERSION
+                )
+            }),
+        ));
+    }
+    Ok(())
+}
+
+/// 连一次并握手，返回握手状态（连不上、无应答或应答异常返回 Ok(None)；协议不兼容返回 Err(Unsupported)）。
 ///
 /// Bounded by [`HANDSHAKE_TIMEOUT`]: a daemon that does not answer is the same as no daemon to the
 /// callers, which then walk their start / replace ladder.
-async fn hello_status() -> Option<HelloStatus> {
-    within(HANDSHAKE_TIMEOUT, "Hello", async {
+async fn hello_check() -> std::io::Result<Option<HelloStatus>> {
+    match within(HANDSHAKE_TIMEOUT, "Hello", async {
         let (mut reader, mut writer) = connect_split().await?;
         hello_over(&mut reader, &mut writer).await
     })
     .await
-    .ok()
+    {
+        Ok(status) => Ok(Some(status)),
+        Err(error) if error.kind() == ErrorKind::Unsupported => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+async fn hello_status() -> Option<HelloStatus> {
+    hello_check().await.ok().flatten()
 }
 
 async fn hello_over<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<HelloStatus>
@@ -120,7 +143,10 @@ where
 {
     ipc::write_msg(writer, &ClientMsg::Hello(hello())).await?;
     match ipc::read_msg::<_, ServerMsg>(reader).await? {
-        Some(ServerMsg::HelloAck(ack)) => Ok(ack.status),
+        Some(ServerMsg::HelloAck(ack)) => {
+            check_hello_ack_protocol(&ack)?;
+            Ok(ack.status)
+        }
         _ => Err(Error::new(
             ErrorKind::InvalidData,
             "unexpected daemon Hello response",
@@ -178,7 +204,7 @@ async fn background_peer_ready() -> bool {
 
 async fn ensure_running_inner() -> std::io::Result<()> {
     // 1. 已在运行且 Ok → 直接用。
-    match hello_status().await {
+    match hello_check().await? {
         Some(HelloStatus::Ok) => return Ok(()),
         Some(HelloStatus::Restarting) => {
             // 旧实例将自行退出；等它下线后再拉起新的。
@@ -198,7 +224,7 @@ async fn ensure_running_inner() -> std::io::Result<()> {
     //    `launchctl bootout` the instance a sibling had just started; here the queued starters
     //    re-check after the winner is ready and simply reuse it.
     let _spawn_guard = acquire_spawn_lock().await;
-    match hello_status().await {
+    match hello_check().await? {
         Some(HelloStatus::Ok) => return Ok(()),
         Some(HelloStatus::Draining) => {
             return Err(Error::new(ErrorKind::WouldBlock, "daemon is draining"));
@@ -207,14 +233,14 @@ async fn ensure_running_inner() -> std::io::Result<()> {
         None => {}
     }
     spawn::spawn_detached(spawn::SpawnPolicy::ReuseAlive).await?;
-    if wait_ready(Duration::from_secs(5)).await {
+    if wait_ready(Duration::from_secs(5)).await? {
         return Ok(());
     }
     // A daemon process may be alive yet never answer (wedged, stale socket path). `ReuseAlive`
     // left it untouched; fall back to the replacing spawn so `restart --force` and plain asks can
     // still recover, exactly as before serialization existed.
     spawn::spawn_detached(spawn::SpawnPolicy::Replace).await?;
-    if wait_ready(Duration::from_secs(5)).await {
+    if wait_ready(Duration::from_secs(5)).await? {
         return Ok(());
     }
     Err(Error::new(
@@ -224,15 +250,15 @@ async fn ensure_running_inner() -> std::io::Result<()> {
 }
 
 /// Poll Hello until the daemon answers `Ok` or `max` elapses.
-async fn wait_ready(max: Duration) -> bool {
+async fn wait_ready(max: Duration) -> std::io::Result<bool> {
     let start = Instant::now();
     while start.elapsed() < max {
-        if let Some(HelloStatus::Ok) = hello_status().await {
-            return true;
+        if let Some(HelloStatus::Ok) = hello_check().await? {
+            return Ok(true);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    false
+    Ok(false)
 }
 
 /// Take the cross-process spawn lock, waiting for a sibling starter to finish (it holds the lock
@@ -351,6 +377,7 @@ where
     loop {
         match ipc::read_msg::<_, ServerMsg>(reader).await {
             Ok(Some(ServerMsg::HelloAck(ack))) => {
+                check_hello_ack_protocol(&ack).map_err(|e| e.to_string())?;
                 if ack.status == HelloStatus::Ok {
                     break;
                 }
@@ -386,6 +413,7 @@ pub async fn permission_rules_op(
     loop {
         match ipc::read_msg::<_, ServerMsg>(&mut reader).await {
             Ok(Some(ServerMsg::HelloAck(ack))) => {
+                check_hello_ack_protocol(&ack).map_err(|e| e.to_string())?;
                 if ack.status == HelloStatus::Ok {
                     break;
                 }
@@ -421,6 +449,7 @@ pub async fn away_op(
     loop {
         match ipc::read_msg::<_, ServerMsg>(&mut reader).await {
             Ok(Some(ServerMsg::HelloAck(ack))) => {
+                check_hello_ack_protocol(&ack).map_err(|e| e.to_string())?;
                 if ack.status == HelloStatus::Ok {
                     break;
                 }
@@ -616,7 +645,14 @@ pub async fn request_detect(req: DetectRequest) -> Option<Result<String, String>
         return None;
     }
     match ipc::read_msg::<_, ServerMsg>(&mut reader).await {
-        Ok(Some(ServerMsg::HelloAck(ack))) if ack.status == HelloStatus::Ok => {}
+        Ok(Some(ServerMsg::HelloAck(ack))) => {
+            if let Err(error) = check_hello_ack_protocol(&ack) {
+                return Some(Err(error.to_string()));
+            }
+            if ack.status != HelloStatus::Ok {
+                return None;
+            }
+        }
         // 换新中或握手异常：视作暂不可接通，让调用方回退。
         _ => return None,
     }
@@ -1289,17 +1325,22 @@ async fn run_ask_observed(
                 continue;
             }
             match ipc::read_msg::<_, ServerMsg>(&mut reader).await {
-                Ok(Some(ServerMsg::HelloAck(ack))) => match ack.status {
-                    HelloStatus::Ok => {}
-                    HelloStatus::Restarting => {
-                        wait_until_down(Duration::from_secs(5)).await;
-                        continue;
+                Ok(Some(ServerMsg::HelloAck(ack))) => {
+                    if let Err(error) = check_hello_ack_protocol(&ack) {
+                        return client_error(verbose, &error.to_string());
                     }
-                    HelloStatus::Draining => {
-                        wait_for_drain().await;
-                        continue 'outer;
+                    match ack.status {
+                        HelloStatus::Ok => {}
+                        HelloStatus::Restarting => {
+                            wait_until_down(Duration::from_secs(5)).await;
+                            continue;
+                        }
+                        HelloStatus::Draining => {
+                            wait_for_drain().await;
+                            continue 'outer;
+                        }
                     }
-                },
+                }
                 _ => continue,
             }
             // 提交任务。
@@ -1399,9 +1440,14 @@ async fn desktop_round_trip(
     ipc::write_msg(&mut writer, &ClientMsg::Hello(hello()))
         .await
         .map_err(|e| e.to_string())?;
-    if !matches!(ipc::read_msg::<_,ServerMsg>(&mut reader).await, Ok(Some(ServerMsg::HelloAck(ack))) if ack.status == HelloStatus::Ok)
-    {
-        return Err("Daemon is restarting".into());
+    match ipc::read_msg::<_, ServerMsg>(&mut reader).await {
+        Ok(Some(ServerMsg::HelloAck(ack))) => {
+            check_hello_ack_protocol(&ack).map_err(|e| e.to_string())?;
+            if ack.status != HelloStatus::Ok {
+                return Err("Daemon is restarting".into());
+            }
+        }
+        _ => return Err("Daemon is restarting".into()),
     }
     ipc::write_msg(&mut writer, &request)
         .await
@@ -1942,5 +1988,71 @@ mod tests {
                 attachments: Vec::new(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn hello_over_fails_fast_with_unsupported_when_daemon_protocol_is_newer() {
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (server_read, mut server_write) = tokio::io::split(server);
+        let mut server_read = tokio::io::BufReader::new(server_read);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = tokio::io::BufReader::new(client_read);
+
+        let responder = tokio::spawn(async move {
+            let msg: Option<ClientMsg> = ipc::read_msg(&mut server_read).await.unwrap();
+            assert!(matches!(msg, Some(ClientMsg::Hello(_))));
+            ipc::write_msg(
+                &mut server_write,
+                &ServerMsg::HelloAck(ipc::HelloAck {
+                    agent_lifecycle_version: 1,
+                    protocol_version: ipc::PROTOCOL_VERSION + 1,
+                    daemon_version: "9.9.9".to_string(),
+                    status: HelloStatus::Restarting,
+                    reason: Some("client protocol is older than daemon protocol".to_string()),
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let error = hello_over(&mut client_read, &mut client_write)
+            .await
+            .unwrap_err();
+        responder.await.unwrap();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error
+            .to_string()
+            .contains("client protocol is older than daemon protocol"));
+    }
+
+    #[tokio::test]
+    async fn hello_over_returns_status_when_daemon_protocol_is_compatible() {
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (server_read, mut server_write) = tokio::io::split(server);
+        let mut server_read = tokio::io::BufReader::new(server_read);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = tokio::io::BufReader::new(client_read);
+
+        let responder = tokio::spawn(async move {
+            let _ = ipc::read_msg::<_, ClientMsg>(&mut server_read).await.unwrap();
+            ipc::write_msg(
+                &mut server_write,
+                &ServerMsg::HelloAck(ipc::HelloAck {
+                    agent_lifecycle_version: 1,
+                    protocol_version: ipc::PROTOCOL_VERSION,
+                    daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                    status: HelloStatus::Ok,
+                    reason: None,
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let status = hello_over(&mut client_read, &mut client_write)
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        assert_eq!(status, HelloStatus::Ok);
     }
 }

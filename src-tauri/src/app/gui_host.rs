@@ -1465,10 +1465,10 @@ fn available_update_action(
     lang: Lang,
     version: &str,
 ) -> (&'static str, String) {
-    let (id, key) = if mode == crate::update::UpdateApplyMode::Automatic {
-        ("apply_update", "tray.applyUpdate")
-    } else {
-        ("prepare_update", "tray.prepareManualUpdate")
+    let (id, key) = match mode {
+        crate::update::UpdateApplyMode::Automatic => ("apply_update", "tray.applyUpdate"),
+        crate::update::UpdateApplyMode::ManualNix => ("open_update_settings", "tray.openSettings"),
+        _ => ("prepare_update", "tray.prepareManualUpdate"),
     };
     (id, i18n::tr(lang, key).replace("{v}", version))
 }
@@ -1815,9 +1815,9 @@ pub fn on_menu_event(app: &AppHandle, id: &str) {
                 }
             });
         }
-        // Settings owns the second confirmation and preserves the exact Direct/npm next step
-        // before starting the helper that will close this GUI Host.
-        "prepare_update" => open_window(
+        // Settings shows Nix package-manager instructions or owns the Direct/npm confirmation.
+        // Opening this route never starts a helper or asks for Windows replacement confirmation.
+        "prepare_update" | "open_update_settings" => open_window(
             app,
             WindowKind::Settings,
             false,
@@ -2550,7 +2550,7 @@ fn maybe_refresh_binary(app: &AppHandle) {
 }
 
 fn host_disk_fingerprint(state: &HostState) -> Fingerprint {
-    if state.executable_path.as_os_str().is_empty() {
+    if state.executable_path.as_os_str().is_empty() || crate::executable::is_nix_entry() {
         lifecycle::launch_fingerprint()
     } else {
         lifecycle::fingerprint_at(&state.executable_path)
@@ -2564,6 +2564,14 @@ fn host_disk_fingerprint(state: &HostState) -> Fingerprint {
 #[cfg(any(target_os = "macos", test))]
 fn restart_via_launchd(mode: MenuBarIconMode, has_login_item: bool) -> bool {
     mode == MenuBarIconMode::Always && has_login_item
+}
+
+/// Whether a Linux host replacing itself may just exit and let systemd's `Restart=always`
+/// start the new binary. That holds only when `menuBarIcon = always` and the GUI host is
+/// managed by a systemd user service.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn restart_via_systemd(mode: MenuBarIconMode, systemd_managed: bool) -> bool {
+    mode == MenuBarIconMode::Always && systemd_managed
 }
 
 /// 用盘上（新）二进制重启宿主：释放单实例锁；always 且登录项在则交 launchd KeepAlive 重启，
@@ -2583,6 +2591,16 @@ fn restart_host(app: &AppHandle) {
         if restart_via_launchd(
             mode,
             crate::integrations::login_item::instance_has_login_item(),
+        ) {
+            app.exit(0);
+            return;
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if restart_via_systemd(
+            mode,
+            crate::integrations::login_item::is_systemd_guihost_managed(),
         ) {
             app.exit(0);
             return;
@@ -2639,6 +2657,24 @@ mod tests {
                     restart_via_launchd(mode, has_login_item),
                     expected,
                     "mode {mode:?}, login item {has_login_item}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_restart_delegates_to_systemd_only_when_always_and_managed() {
+        for mode in [
+            MenuBarIconMode::Off,
+            MenuBarIconMode::Active,
+            MenuBarIconMode::Always,
+        ] {
+            for systemd_managed in [false, true] {
+                let expected = mode == MenuBarIconMode::Always && systemd_managed;
+                assert_eq!(
+                    restart_via_systemd(mode, systemd_managed),
+                    expected,
+                    "mode {mode:?}, systemd_managed {systemd_managed}"
                 );
             }
         }
@@ -2933,6 +2969,15 @@ mod tests {
             available_update_action(crate::update::UpdateApplyMode::Automatic, Lang::En, "1.2.0").0,
             "apply_update"
         );
+        for lang in [Lang::En, Lang::Zh] {
+            assert_eq!(
+                available_update_action(crate::update::UpdateApplyMode::ManualNix, lang, "1.2.0"),
+                (
+                    "open_update_settings",
+                    i18n::tr(lang, "tray.openSettings").to_string()
+                )
+            );
+        }
     }
 
     #[test]

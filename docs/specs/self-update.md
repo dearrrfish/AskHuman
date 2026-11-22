@@ -6,7 +6,7 @@
 > 可恢复更新的状态、失败重试及验收见 [即时换新](daemon-live-update.md)。
 
 
-> 状态：已实现；macOS/Linux 支持 Direct/npm 自动 apply，Windows 支持检查、日志与安全的手动更新准备。
+> 状态：已实现；macOS/Linux 的 Direct/npm 安装支持自动 apply，Windows 支持检查、日志与安全的手动更新准备；Nix 管理的安装仅检查版本与日志，通过声明式配置或 Nix profile 升级。
 > 关联计划：`docs/plans/self-update.md`
 > 影响面：新增 `update/` 模块；daemon 生命周期与 IPC 协议（增量，PROTOCOL_VERSION 不变）；前端弹窗 `PopupView` 与设置 `SettingsView`；`commands.rs`；`release.yml` + 新增 `cliff.toml`；发布流程（更新日志生成）。**不改**正常提问流程的 stdout 契约、退出码语义。
 
@@ -24,6 +24,8 @@
 > 代码均已实现并保留，但当前 Windows release 未配置生产 Authenticode。源码 capability 固定关闭所有
 > 联网自动 apply 入口，界面只提供手动路径。`AskHuman update prepare` 会 graceful drain daemon、关闭
 > GUI Host 并释放 `.exe` 锁；Direct installer 仍可复用本地事务 worker 安装显式选定的 build output。
+>
+> **Nix 不可变安装补充（2026-11）**：Nix 构建注入编译期 store 标记（同时识别标准 `/nix/store/<hash>-<name>/...` 路径）为 `InstallKind::Nix`（`UpdateApplyMode::ManualNix`）。Nix 安装保留版本检查、发布说明与忽略版本，界面提示通过 Nix profile、Home Manager 或 NixOS 配置升级；CLI `update prepare` 与 `Updater::apply` 在任何下载、临时文件、pending 状态或 drain 之前拒绝。
 
 ## 1. 背景与动机
 

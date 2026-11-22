@@ -1568,7 +1568,7 @@ export interface UpdateInfo {
   manualCommand: string;
 }
 
-export type UpdateApplyMode = "automatic" | "manualDirect" | "manualNpm";
+export type UpdateApplyMode = "automatic" | "manualDirect" | "manualNpm" | "manualNix";
 
 export interface PushedUpdateState {
   available: boolean;

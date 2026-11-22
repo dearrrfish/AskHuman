@@ -116,8 +116,18 @@ fn build_swift_bridges(manifest_dir: &str) {
     let deploy = "11.0";
     let triple = format!("{arch}-apple-macosx{deploy}");
 
-    let sdk_path = run_capture("xcrun", &["--sdk", "macosx", "--show-sdk-path"]);
-    let swiftc = run_capture("xcrun", &["--sdk", "macosx", "-f", "swiftc"]);
+    // Declarative builders provide store paths; ordinary Xcode builds keep using xcrun.
+    for variable in [
+        "ASKHUMAN_SWIFT_SDK",
+        "ASKHUMAN_SWIFTC",
+        "ASKHUMAN_SWIFT_LIB_DIR",
+    ] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
+    let sdk_path = std::env::var("ASKHUMAN_SWIFT_SDK")
+        .unwrap_or_else(|_| run_capture("xcrun", &["--sdk", "macosx", "--show-sdk-path"]));
+    let swiftc = std::env::var("ASKHUMAN_SWIFTC")
+        .unwrap_or_else(|_| run_capture("xcrun", &["--sdk", "macosx", "-f", "swiftc"]));
 
     // Swift 运行时/标准库静态归档所在目录：<toolchain>/usr/lib/swift/macosx
     // 由 swiftc 路径 .../usr/bin/swiftc 推导出 .../usr/lib/swift/macosx
@@ -126,7 +136,10 @@ fn build_swift_bridges(manifest_dir: &str) {
         .and_then(|p| p.parent()) // usr
         .expect("无法定位 Swift 工具链 usr 目录")
         .to_path_buf();
-    let swift_lib_dir = toolchain_usr.join("lib/swift/macosx");
+    // Nix splits compatibility archives from the compiler into the standard library output.
+    let swift_lib_dir = std::env::var_os("ASKHUMAN_SWIFT_LIB_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| toolchain_usr.join("lib/swift/macosx"));
 
     let lib_path = Path::new(&out_dir).join("libahspeech.a");
     let module_cache = swift_module_cache_dir(Path::new(&out_dir));

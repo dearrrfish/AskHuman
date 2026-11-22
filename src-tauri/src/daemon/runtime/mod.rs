@@ -417,11 +417,20 @@ impl ServerState {
 /// A server state for tests: draining (so nothing is spawned), no popup prewarm, everything empty.
 #[cfg(test)]
 fn test_state(directory: &std::path::Path) -> Arc<ServerState> {
+    test_state_with_hello_config(directory, lifecycle::Fingerprint { size: 0, hash: 0 }, true)
+}
+
+#[cfg(test)]
+fn test_state_with_hello_config(
+    directory: &std::path::Path,
+    startup_fp: lifecycle::Fingerprint,
+    draining: bool,
+) -> Arc<ServerState> {
     let mut config = AppConfig::default();
     config.general.popup_prewarm = false;
     Arc::new(ServerState {
         failure_confirmations: failure_confirmation::Cards::default(),
-        startup_fp: lifecycle::Fingerprint { size: 0, hash: 0 },
+        startup_fp,
         exe_path: String::new(),
         restart_hold: Default::default(),
         started_at: 0,
@@ -430,7 +439,7 @@ fn test_state(directory: &std::path::Path) -> Arc<ServerState> {
         shutdown: Default::default(),
         drain_watch_started: AtomicBool::new(false),
         force_stop: AtomicBool::new(false),
-        draining: AtomicBool::new(true),
+        draining: AtomicBool::new(draining),
         exit_intent: Mutex::new(Default::default()),
         closing: AtomicBool::new(false),
         registry: RequestRegistry::new(),
@@ -1852,6 +1861,141 @@ async fn handle_conn(stream: Stream, state: Arc<ServerState>) {
     state.active.fetch_sub(1, Ordering::SeqCst);
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_DISABLE_RESTART_GUARD: bool;
+}
+
+fn restart_guard_io_enabled() -> bool {
+    #[cfg(test)]
+    {
+        !TEST_DISABLE_RESTART_GUARD.try_with(|v| *v).unwrap_or(false)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelloStalenessReason {
+    Fresh,
+    OwnBinaryChanged,
+    OlderProtocolRejected,
+    NewerProtocol,
+    ClientDiffers,
+    OlderVersionClientServed,
+    SameVersionNixStoreClientServed,
+    YieldToNewerClient,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HelloStaleness {
+    stale: bool,
+    own_changed: bool,
+    protocol_newer: bool,
+    reason: HelloStalenessReason,
+}
+
+fn is_nix_store_binary_path(binary_path: &str) -> bool {
+    let store_dir = option_env!("ASKHUMAN_NIX_STORE_DIR")
+        .unwrap_or("/nix/store")
+        .trim_end_matches('/');
+    binary_path
+        .strip_prefix(store_dir)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn assess_hello_staleness(
+    hello: &crate::ipc::ClientHello,
+    daemon_version: &str,
+    daemon_protocol_version: u32,
+    startup_fp: lifecycle::Fingerprint,
+    now_fp: lifecycle::Fingerprint,
+    install_kind: crate::update::InstallKind,
+) -> HelloStaleness {
+    let own_changed = now_fp.differs_from(&startup_fp);
+    let protocol_newer = hello.protocol_version > daemon_protocol_version;
+    let protocol_older = hello.protocol_version < daemon_protocol_version;
+    let version_cmp = crate::update::compare_versions(&hello.client_version, daemon_version);
+
+    // Cross-protocol anti-downgrade: an older-protocol client must never make the daemon yield.
+    if protocol_older {
+        return HelloStaleness {
+            stale: false,
+            own_changed,
+            protocol_newer: false,
+            reason: HelloStalenessReason::OlderProtocolRejected,
+        };
+    }
+
+    if own_changed {
+        return HelloStaleness {
+            stale: true,
+            own_changed,
+            protocol_newer,
+            reason: HelloStalenessReason::OwnBinaryChanged,
+        };
+    }
+
+    if protocol_newer {
+        return HelloStaleness {
+            stale: true,
+            own_changed,
+            protocol_newer,
+            reason: HelloStalenessReason::NewerProtocol,
+        };
+    }
+
+    let client_fp_differs = hello.fingerprint.differs_from(&startup_fp);
+    let own_matches_startup = !now_fp.is_unknown() && now_fp.same_as(&startup_fp);
+    if client_fp_differs && own_matches_startup {
+        if version_cmp < 0 {
+            return HelloStaleness {
+                stale: false,
+                own_changed,
+                protocol_newer,
+                reason: HelloStalenessReason::OlderVersionClientServed,
+            };
+        }
+        if version_cmp == 0
+            && (install_kind == crate::update::InstallKind::Nix
+                || is_nix_store_binary_path(&hello.binary_path))
+        {
+            return HelloStaleness {
+                stale: false,
+                own_changed,
+                protocol_newer,
+                reason: HelloStalenessReason::SameVersionNixStoreClientServed,
+            };
+        }
+        if version_cmp > 0 {
+            return HelloStaleness {
+                stale: true,
+                own_changed,
+                protocol_newer,
+                reason: HelloStalenessReason::YieldToNewerClient,
+            };
+        }
+    }
+
+    if client_fp_differs {
+        return HelloStaleness {
+            stale: true,
+            own_changed,
+            protocol_newer,
+            reason: HelloStalenessReason::ClientDiffers,
+        };
+    }
+
+    HelloStaleness {
+        stale: false,
+        own_changed,
+        protocol_newer,
+        reason: HelloStalenessReason::Fresh,
+    }
+}
+
 /// 控制阶段：处理 Hello / Status / Stop（即时应答）；遇到 Submit / GuiHello 返回以便接管连接。
 async fn control_loop(reader: &mut Reader, w: &mut Writer, state: &Arc<ServerState>) -> Control {
     loop {
@@ -1921,16 +2065,56 @@ async fn control_loop(reader: &mut Reader, w: &mut Writer, state: &Arc<ServerSta
                     let _ = ipc::write_msg(w, &ServerMsg::HelloAck(ack)).await;
                     continue;
                 }
+                if hello.protocol_version < ipc::PROTOCOL_VERSION {
+                    let ack = HelloAck {
+                        agent_lifecycle_version: 1,
+                        protocol_version: ipc::PROTOCOL_VERSION,
+                        daemon_version: version(),
+                        status: HelloStatus::Restarting,
+                        reason: Some(format!(
+                            "client protocol {} is older than daemon protocol {}; restart the client or agent session",
+                            hello.protocol_version, ipc::PROTOCOL_VERSION
+                        )),
+                    };
+                    let _ = ipc::write_msg(w, &ServerMsg::HelloAck(ack)).await;
+                    continue;
+                }
                 let now_fp = lifecycle::launch_fingerprint();
-                // 指纹按「内容哈希」比对（与路径/mtime 无关）：
-                // 自身盘上二进制内容被换 / 客户端二进制内容不一致 / 协议不一致 → 过时，让位换新。
-                // A side that could not be measured (unreadable file, fd exhaustion) is no evidence
-                // of a change, so it never makes the daemon give way.
-                let own_changed = now_fp.differs_from(&state.startup_fp);
-                let protocol_differs = hello.protocol_version != ipc::PROTOCOL_VERSION;
-                let mut stale = own_changed
-                    || hello.fingerprint.differs_from(&state.startup_fp)
-                    || protocol_differs;
+                let daemon_ver = version();
+                let staleness = assess_hello_staleness(
+                    &hello,
+                    &daemon_ver,
+                    ipc::PROTOCOL_VERSION,
+                    state.startup_fp,
+                    now_fp,
+                    crate::update::detect_install_kind(),
+                );
+                let own_changed = staleness.own_changed;
+                let protocol_differs = staleness.protocol_newer;
+                let mut stale = staleness.stale;
+                match staleness.reason {
+                    HelloStalenessReason::OlderVersionClientServed => {
+                        log(&format!(
+                            "serving older client v{} (protocol {}) without downgrading daemon v{} (protocol {})",
+                            hello.client_version,
+                            hello.protocol_version,
+                            daemon_ver,
+                            ipc::PROTOCOL_VERSION,
+                        ));
+                    }
+                    HelloStalenessReason::SameVersionNixStoreClientServed => {
+                        log(&format!(
+                            "serving same-protocol Nix store client v{} (pid={} path={} fp={}) without restarting daemon v{} (fp={})",
+                            hello.client_version,
+                            hello.pid,
+                            hello.binary_path,
+                            hello.fingerprint.short(),
+                            daemon_ver,
+                            state.startup_fp.short(),
+                        ));
+                    }
+                    _ => {}
+                }
                 let auto_restart = std::env::var("ASKHUMAN_DAEMON_AUTORESTART")
                     .map(|v| v != "0")
                     .unwrap_or(true)
@@ -1940,14 +2124,21 @@ async fn control_loop(reader: &mut Reader, w: &mut Writer, state: &Arc<ServerSta
                 // other forever. Once the same pair has swapped twice within ten minutes, stop
                 // giving way to a client that merely differs in content and serve it as it is
                 // (spec daemon-graceful-drain §6). An upgrade (own binary changed on disk) and a
-                // client on another protocol version are never held.
+                // client on a newer protocol version are never held.
                 if stale && auto_restart && restart_guard::holdable(own_changed, protocol_differs) {
-                    match state.restart_hold.assess(
-                        now_ms(),
-                        state.startup_fp,
-                        &peer,
-                        restart_guard::load,
-                    ) {
+                    let verdict = if restart_guard_io_enabled() {
+                        state.restart_hold.assess(
+                            now_ms(),
+                            state.startup_fp,
+                            &peer,
+                            restart_guard::load,
+                        )
+                    } else {
+                        state
+                            .restart_hold
+                            .assess(now_ms(), state.startup_fp, &peer, Vec::new)
+                    };
+                    match verdict {
                         restart_guard::Verdict::Yield => {}
                         restart_guard::Verdict::Hold {
                             started,
@@ -1990,7 +2181,7 @@ async fn control_loop(reader: &mut Reader, w: &mut Writer, state: &Arc<ServerSta
                 let ack = HelloAck {
                     agent_lifecycle_version: 1,
                     protocol_version: ipc::PROTOCOL_VERSION,
-                    daemon_version: version(),
+                    daemon_version: daemon_ver,
                     status: if draining {
                         HelloStatus::Draining
                     } else if restarting {
@@ -2009,20 +2200,22 @@ async fn control_loop(reader: &mut Reader, w: &mut Writer, state: &Arc<ServerSta
                 // client's version, path and pid are the only way to tell them apart afterwards.
                 let yield_detail = if draining || restarting {
                     let trigger = restart_guard::trigger_for(own_changed, protocol_differs);
-                    restart_guard::record(restart_guard::Yield {
-                        at_ms: now_ms(),
-                        trigger,
-                        drained: draining,
-                        daemon_pid: std::process::id(),
-                        daemon_version: version(),
-                        from: state.startup_fp,
-                        to: if own_changed {
-                            now_fp
-                        } else {
-                            hello.fingerprint
-                        },
-                        client: Some(peer.clone()),
-                    });
+                    if restart_guard_io_enabled() {
+                        restart_guard::record(restart_guard::Yield {
+                            at_ms: now_ms(),
+                            trigger,
+                            drained: draining,
+                            daemon_pid: std::process::id(),
+                            daemon_version: version(),
+                            from: state.startup_fp,
+                            to: if own_changed {
+                                now_fp
+                            } else {
+                                hello.fingerprint
+                            },
+                            client: Some(peer.clone()),
+                        });
+                    }
                     format!(
                         "reason: {}; {}; daemon v{} pid={} exe={} fp={}",
                         trigger.label(),
@@ -6358,5 +6551,347 @@ mod tests {
         assert!(!expanded
             .iter()
             .any(|option| option.id == crate::select::MORE_OPTION_ID));
+    }
+
+    #[test]
+    fn assess_hello_staleness_handles_directional_protocols_versions_and_nix_store() {
+        use crate::daemon::lifecycle::Fingerprint;
+        use crate::ipc::ClientHello;
+        let daemon_fp = Fingerprint {
+            size: 100,
+            hash: 100,
+        };
+        let other_fp = Fingerprint {
+            size: 200,
+            hash: 200,
+        };
+        let proto = crate::ipc::PROTOCOL_VERSION;
+
+        let mk_hello = |protocol_version: u32,
+                        client_version: &str,
+                        binary_path: &str,
+                        fingerprint: Fingerprint| ClientHello {
+            protocol_version,
+            client_version: client_version.to_string(),
+            binary_path: binary_path.to_string(),
+            fingerprint,
+            pid: 42,
+        };
+
+        // 1. Older protocol -> never yields (OlderProtocolRejected).
+        let res = super::assess_hello_staleness(
+            &mk_hello(proto.saturating_sub(1), "0.17.0", "/old/AskHuman", other_fp),
+            "0.17.3",
+            proto,
+            daemon_fp,
+            daemon_fp,
+            crate::update::InstallKind::Direct,
+        );
+        assert!(!res.stale);
+        assert_eq!(res.reason, super::HelloStalenessReason::OlderProtocolRejected);
+
+        // 2. Same protocol, older client version, different fp -> served without downgrading.
+        let res = super::assess_hello_staleness(
+            &mk_hello(proto, "0.17.1", "/old/AskHuman", other_fp),
+            "0.17.3",
+            proto,
+            daemon_fp,
+            daemon_fp,
+            crate::update::InstallKind::Direct,
+        );
+        assert!(!res.stale);
+        assert_eq!(
+            res.reason,
+            super::HelloStalenessReason::OlderVersionClientServed
+        );
+
+        // 3. Same protocol, same version, `/nix/store/` client fp differs, `!own_changed` -> served.
+        let res = super::assess_hello_staleness(
+            &mk_hello(
+                proto,
+                "0.17.3",
+                "/nix/store/abc123-askhuman/bin/AskHuman",
+                other_fp,
+            ),
+            "0.17.3",
+            proto,
+            daemon_fp,
+            daemon_fp,
+            crate::update::InstallKind::Direct,
+        );
+        assert!(!res.stale);
+        assert_eq!(
+            res.reason,
+            super::HelloStalenessReason::SameVersionNixStoreClientServed
+        );
+
+        // Same protocol, same version on InstallKind::Nix with differing fp and `!own_changed` -> served.
+        let res = super::assess_hello_staleness(
+            &mk_hello(
+                proto,
+                "0.17.3",
+                "/run/current-system/sw/bin/AskHuman",
+                other_fp,
+            ),
+            "0.17.3",
+            proto,
+            daemon_fp,
+            daemon_fp,
+            crate::update::InstallKind::Nix,
+        );
+        assert!(!res.stale);
+        assert_eq!(
+            res.reason,
+            super::HelloStalenessReason::SameVersionNixStoreClientServed
+        );
+
+        // Same protocol, newer client version on InstallKind::Nix still yields for upgrade.
+        let res = super::assess_hello_staleness(
+            &mk_hello(
+                proto,
+                "0.17.4",
+                "/nix/store/new-askhuman/bin/AskHuman",
+                other_fp,
+            ),
+            "0.17.3",
+            proto,
+            daemon_fp,
+            daemon_fp,
+            crate::update::InstallKind::Nix,
+        );
+        assert!(res.stale);
+        assert_eq!(res.reason, super::HelloStalenessReason::YieldToNewerClient);
+
+        // Non-nix-store client of same version with differing fp still triggers ClientDiffers.
+        let res = super::assess_hello_staleness(
+            &mk_hello(proto, "0.17.3", "/home/user/.local/bin/AskHuman", other_fp),
+            "0.17.3",
+            proto,
+            daemon_fp,
+            daemon_fp,
+            crate::update::InstallKind::Direct,
+        );
+        assert!(res.stale);
+        assert_eq!(res.reason, super::HelloStalenessReason::ClientDiffers);
+
+        // 4. Newer protocol -> stale / yields.
+        let res = super::assess_hello_staleness(
+            &mk_hello(proto + 1, "0.18.0", "/new/AskHuman", other_fp),
+            "0.17.3",
+            proto,
+            daemon_fp,
+            daemon_fp,
+            crate::update::InstallKind::Direct,
+        );
+        assert!(res.stale);
+        assert!(res.protocol_newer);
+        assert_eq!(res.reason, super::HelloStalenessReason::NewerProtocol);
+
+        // 5. Same protocol, newer client version on Direct with differing fp -> yields for upgrade.
+        let res = super::assess_hello_staleness(
+            &mk_hello(
+                proto,
+                "0.17.4",
+                "/home/user/.local/bin/AskHuman",
+                other_fp,
+            ),
+            "0.17.3",
+            proto,
+            daemon_fp,
+            daemon_fp,
+            crate::update::InstallKind::Direct,
+        );
+        assert!(res.stale);
+        assert_eq!(res.reason, super::HelloStalenessReason::YieldToNewerClient);
+
+        // 6. `own_changed == true` with same protocol -> stale; older protocol still never yields.
+        let res = super::assess_hello_staleness(
+            &mk_hello(
+                proto,
+                "0.17.0",
+                "/old/AskHuman",
+                daemon_fp,
+            ),
+            "0.17.3",
+            proto,
+            daemon_fp,
+            other_fp,
+            crate::update::InstallKind::Direct,
+        );
+        assert!(res.stale);
+        assert!(res.own_changed);
+        assert_eq!(res.reason, super::HelloStalenessReason::OwnBinaryChanged);
+
+        let res = super::assess_hello_staleness(
+            &mk_hello(
+                proto.saturating_sub(1),
+                "0.17.0",
+                "/old/AskHuman",
+                daemon_fp,
+            ),
+            "0.17.3",
+            proto,
+            daemon_fp,
+            other_fp,
+            crate::update::InstallKind::Direct,
+        );
+        assert!(!res.stale);
+        assert_eq!(res.reason, super::HelloStalenessReason::OlderProtocolRejected);
+    }
+
+    async fn send_hello_through_control_loop(
+        state: Arc<super::ServerState>,
+        hello: crate::ipc::ClientHello,
+    ) -> crate::ipc::HelloAck {
+        use crate::ipc::{ClientMsg, ServerMsg};
+        super::TEST_DISABLE_RESTART_GUARD
+            .scope(true, async move {
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (server_read, server_write) = tokio::io::split(server);
+                let mut reader: super::Reader = Box::new(tokio::io::BufReader::new(server_read));
+                let mut writer: super::Writer = Box::new(server_write);
+                let (client_read, mut client_write) = tokio::io::split(client);
+                let mut client_read = tokio::io::BufReader::new(client_read);
+
+                let loop_task = tokio::spawn(async move {
+                    super::control_loop(&mut reader, &mut writer, &state).await
+                });
+
+                crate::ipc::write_msg(&mut client_write, &ClientMsg::Hello(hello))
+                    .await
+                    .unwrap();
+                let reply = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    crate::ipc::read_msg::<_, ServerMsg>(&mut client_read),
+                )
+                .await
+                .expect("HelloAck timed out")
+                .expect("HelloAck read error")
+                .expect("HelloAck EOF");
+
+                drop(client_write);
+                drop(client_read);
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), loop_task)
+                    .await
+                    .expect("control_loop did not finish");
+
+                match reply {
+                    ServerMsg::HelloAck(ack) => ack,
+                    other => panic!("expected HelloAck, got {other:?}"),
+                }
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn control_loop_hello_serves_older_and_nix_store_clients_and_yields_on_upgrade() {
+        use crate::daemon::lifecycle::{self, Fingerprint};
+        use crate::ipc::{ClientHello, HelloStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let current_fp = lifecycle::launch_fingerprint();
+        assert!(!current_fp.is_unknown());
+        let other_fp = Fingerprint {
+            size: current_fp.size.saturating_add(1),
+            hash: current_fp.hash ^ 0xdead_beef,
+        };
+        let proto = crate::ipc::PROTOCOL_VERSION;
+        let daemon_ver = super::version();
+
+        // 1. `hello.protocol_version < PROTOCOL_VERSION` -> replies HelloStatus::Restarting with
+        //    reason, and daemon NEVER yields (`exit_intent` unchanged, `draining` remains false).
+        let state = super::test_state_with_hello_config(dir.path(), current_fp, false);
+        let ack = send_hello_through_control_loop(
+            state.clone(),
+            ClientHello {
+                protocol_version: proto.saturating_sub(1),
+                client_version: "0.17.1".into(),
+                binary_path: "/old/AskHuman".into(),
+                fingerprint: other_fp,
+                pid: 1001,
+            },
+        )
+        .await;
+        assert_eq!(ack.status, HelloStatus::Restarting);
+        assert_eq!(ack.protocol_version, proto);
+        assert!(ack
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("older than daemon protocol")));
+        assert!(!state.draining.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            *state.exit_intent.lock().unwrap(),
+            crate::daemon::handoff::Intent::default()
+        );
+
+        // 2. `hello.protocol_version == PROTOCOL_VERSION`, older client_version (`0.0.1` vs current),
+        //    different fp -> HelloStatus::Ok.
+        let state = super::test_state_with_hello_config(dir.path(), current_fp, false);
+        let ack = send_hello_through_control_loop(
+            state,
+            ClientHello {
+                protocol_version: proto,
+                client_version: "0.0.1".into(),
+                binary_path: "/old/AskHuman".into(),
+                fingerprint: other_fp,
+                pid: 1002,
+            },
+        )
+        .await;
+        assert_eq!(ack.status, HelloStatus::Ok);
+
+        // 3. `hello.protocol_version == PROTOCOL_VERSION`, same version, `/nix/store/<old>` client fp
+        //    differs, `!own_changed` -> HelloStatus::Ok.
+        let state = super::test_state_with_hello_config(dir.path(), current_fp, false);
+        let ack = send_hello_through_control_loop(
+            state,
+            ClientHello {
+                protocol_version: proto,
+                client_version: daemon_ver.clone(),
+                binary_path: "/nix/store/oldgen-askhuman/bin/AskHuman".into(),
+                fingerprint: other_fp,
+                pid: 1003,
+            },
+        )
+        .await;
+        assert_eq!(ack.status, HelloStatus::Ok);
+
+        // 4. `hello.protocol_version > PROTOCOL_VERSION` -> HelloStatus::Restarting (yields).
+        let state = super::test_state_with_hello_config(dir.path(), current_fp, false);
+        let ack = send_hello_through_control_loop(
+            state.clone(),
+            ClientHello {
+                protocol_version: proto + 1,
+                client_version: "99.0.0".into(),
+                binary_path: "/new/AskHuman".into(),
+                fingerprint: other_fp,
+                pid: 1004,
+            },
+        )
+        .await;
+        assert_eq!(ack.status, HelloStatus::Restarting);
+        assert_eq!(
+            *state.exit_intent.lock().unwrap(),
+            crate::daemon::handoff::Intent::YieldToClient
+        );
+
+        // 5. `own_changed == true` with same protocol -> HelloStatus::Restarting.
+        let state = super::test_state_with_hello_config(dir.path(), other_fp, false);
+        let ack = send_hello_through_control_loop(
+            state.clone(),
+            ClientHello {
+                protocol_version: proto,
+                client_version: "0.0.1".into(),
+                binary_path: "/old/AskHuman".into(),
+                fingerprint: other_fp,
+                pid: 1005,
+            },
+        )
+        .await;
+        assert_eq!(ack.status, HelloStatus::Restarting);
+        assert_eq!(
+            *state.exit_intent.lock().unwrap(),
+            crate::daemon::handoff::Intent::ReplaceOwnBinary
+        );
     }
 }
