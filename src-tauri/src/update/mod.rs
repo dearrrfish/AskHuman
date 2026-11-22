@@ -86,6 +86,8 @@ pub enum InstallKind {
     Npm,
     /// 直装二进制：`install.sh` / 手动下载（如 `~/.local/bin`）。
     Direct,
+    /// Immutable installation managed by Nix.
+    Nix,
 }
 
 /// How the current binary may apply an available update.
@@ -96,6 +98,7 @@ pub enum UpdateApplyMode {
     #[default]
     ManualDirect,
     ManualNpm,
+    ManualNix,
 }
 
 /// 一次检查的对外结果（供 daemon 落盘、前端展示）。
@@ -112,10 +115,10 @@ pub struct UpdateInfo {
     pub source_url: String,
     /// 安装方式是否为 npm（前端据此决定按钮文案 / 更新行为）。
     pub is_npm: bool,
-    /// Automatic apply on macOS/Linux; manual Direct/npm paths on unsigned Windows.
+    /// Automatic apply for mutable Unix installs; manual Windows and Nix paths.
     #[serde(default)]
     pub apply_mode: UpdateApplyMode,
-    /// Fixed manual npm command. Empty for Direct installations.
+    /// Fixed manual npm command. Empty for Direct and Nix installations.
     #[serde(default)]
     pub manual_command: String,
 }
@@ -173,6 +176,10 @@ pub fn target_triple() -> Option<&'static str> {
 
 /// 当前安装方式（读 `current_exe()` 路径）。
 pub fn detect_install_kind() -> InstallKind {
+    // The package embeds its store directory; wrapper environment variables are not authoritative.
+    if option_env!("ASKHUMAN_NIX_STORE_DIR").is_some() {
+        return InstallKind::Nix;
+    }
     match std::env::current_exe() {
         Ok(p) => install_kind_from_path(&p.to_string_lossy()),
         Err(_) => InstallKind::Direct,
@@ -180,12 +187,16 @@ pub fn detect_install_kind() -> InstallKind {
 }
 
 pub fn apply_mode_for(platform: &str, kind: InstallKind) -> UpdateApplyMode {
+    if kind == InstallKind::Nix {
+        return UpdateApplyMode::ManualNix;
+    }
     if platform != "windows" || WINDOWS_AUTOMATIC_APPLY_ENABLED {
         return UpdateApplyMode::Automatic;
     }
     match kind {
         InstallKind::Direct => UpdateApplyMode::ManualDirect,
         InstallKind::Npm => UpdateApplyMode::ManualNpm,
+        InstallKind::Nix => UpdateApplyMode::ManualNix,
     }
 }
 
@@ -194,12 +205,18 @@ pub fn apply_mode() -> UpdateApplyMode {
 }
 
 pub fn ensure_automatic_apply_allowed() -> Result<()> {
-    if apply_mode() == UpdateApplyMode::Automatic {
-        Ok(())
-    } else {
-        anyhow::bail!(
+    ensure_apply_mode_allowed(apply_mode())
+}
+
+fn ensure_apply_mode_allowed(mode: UpdateApplyMode) -> Result<()> {
+    match mode {
+        UpdateApplyMode::Automatic => Ok(()),
+        UpdateApplyMode::ManualNix => anyhow::bail!(
+            "This installation is managed by Nix; update AskHuman through your declarative configuration or Nix profile"
+        ),
+        _ => anyhow::bail!(
             "Windows automatic update is currently unavailable; prepare and install the update manually"
-        )
+        ),
     }
 }
 
@@ -213,7 +230,10 @@ pub fn spawn_manual_prepare() -> Result<()> {
     use std::process::{Command, Stdio};
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
 
-    if apply_mode() == UpdateApplyMode::Automatic {
+    if !matches!(
+        apply_mode(),
+        UpdateApplyMode::ManualDirect | UpdateApplyMode::ManualNpm
+    ) {
         anyhow::bail!("manual update preparation is unavailable for this build");
     }
     let executable = std::env::current_exe()?;
@@ -235,6 +255,12 @@ pub fn spawn_manual_prepare() -> Result<()> {
 
 /// 纯函数：由路径字符串判定安装方式（便于单测）。
 pub fn install_kind_from_path(path: &str) -> InstallKind {
+    if is_nix_store_path(
+        path,
+        option_env!("ASKHUMAN_NIX_STORE_DIR").unwrap_or("/nix/store"),
+    ) {
+        return InstallKind::Nix;
+    }
     let s = path.replace('\\', "/");
     if s.contains("/node_modules/@humaninloop/") || s.contains("/node_modules/askhuman/") {
         InstallKind::Npm
@@ -243,11 +269,49 @@ pub fn install_kind_from_path(path: &str) -> InstallKind {
     }
 }
 
+/// Recognize only absolute store paths with a valid Nix hash and a package component.
+fn is_nix_store_path(path: &str, store_dir: &str) -> bool {
+    let Some(relative) = path
+        .strip_prefix(store_dir)
+        .and_then(|s| s.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let Some((package, executable)) = relative.split_once('/') else {
+        return false;
+    };
+    let Some((hash, name)) = package.split_once('-') else {
+        return false;
+    };
+    hash.len() == 32
+        && hash
+            .bytes()
+            .all(|b| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&b))
+        && !name.is_empty()
+        && !executable.is_empty()
+        && !relative.split('/').any(|part| part == "." || part == "..")
+}
+
+/// Nix checks upstream metadata, but the package manager owns all installation changes.
+struct NixUpdater;
+
+#[async_trait::async_trait]
+impl Updater for NixUpdater {
+    async fn check_latest(&self, fresh: bool) -> Result<RemoteLatest> {
+        direct::DirectUpdater::new().check_latest(fresh).await
+    }
+
+    async fn apply(&self, _progress: Option<ProgressCb>) -> Result<()> {
+        ensure_apply_mode_allowed(UpdateApplyMode::ManualNix)
+    }
+}
+
 /// 按安装方式选择更新器。
 pub fn select_updater() -> Box<dyn Updater> {
     match detect_install_kind() {
         InstallKind::Npm => Box::new(npm::NpmUpdater::new()),
         InstallKind::Direct => Box::new(direct::DirectUpdater::new()),
+        InstallKind::Nix => Box::new(NixUpdater),
     }
 }
 
@@ -269,7 +333,10 @@ async fn check_with_freshness(fresh: bool) -> Result<UpdateInfo> {
     let current = current_version();
     let available = compare_versions(&latest.version, &current) > 0;
     let apply_mode = apply_mode_for(std::env::consts::OS, kind);
-    let source_url = if apply_mode == UpdateApplyMode::ManualDirect {
+    let source_url = if matches!(
+        apply_mode,
+        UpdateApplyMode::ManualDirect | UpdateApplyMode::ManualNix
+    ) {
         release_url(&latest.version)
     } else {
         latest.source_url
@@ -303,11 +370,11 @@ pub fn persist_check_result(mut info: UpdateInfo, clear_dismissed: bool) -> Upda
     info
 }
 
-/// 规范化版本号：去前缀 `v`、丢弃预发布后缀、仅保留数字与点。
+/// Strip the `v` prefix, prerelease, and build metadata, keeping digits and dots.
 pub fn normalize_version(tag: &str) -> String {
     let core = tag.trim().trim_start_matches('v');
-    // 丢弃 `-rc.1` 等预发布后缀（一期自更新只面向正式版）。
-    let core = core.split('-').next().unwrap_or(core);
+    // Stable update comparisons ignore prerelease and build metadata suffixes.
+    let core = core.split(['-', '+']).next().unwrap_or(core);
     core.chars()
         .filter(|c| c.is_ascii_digit() || *c == '.')
         .collect()
@@ -315,6 +382,7 @@ pub fn normalize_version(tag: &str) -> String {
 
 /// 逐段数字比较：a>b → 1，a<b → -1，相等 → 0。非数字段按 0 处理。
 pub fn compare_versions(a: &str, b: &str) -> i32 {
+    let (a, b) = (normalize_version(a), normalize_version(b));
     let pa: Vec<u64> = a.split('.').map(|s| s.parse().unwrap_or(0)).collect();
     let pb: Vec<u64> = b.split('.').map(|s| s.parse().unwrap_or(0)).collect();
     let n = pa.len().max(pb.len());
@@ -407,6 +475,10 @@ mod tests {
         assert_eq!(compare_versions("0.5", "0.5.0"), 0);
         assert_eq!(compare_versions("0.5.1", "0.5"), 1);
         assert_eq!(compare_versions("0.6.0", "0.5.99"), 1);
+        // Build metadata does not affect base version ordering.
+        assert_eq!(compare_versions("0.15.1", "0.15.1+my-0d2dbbf"), 0);
+        assert_eq!(compare_versions("0.15.2", "0.15.1+my-0d2dbbf"), 1);
+        assert_eq!(compare_versions("0.15.0", "0.15.1+my-0d2dbbf"), -1);
     }
 
     #[test]
@@ -414,6 +486,8 @@ mod tests {
         assert_eq!(normalize_version("v0.5.3"), "0.5.3");
         assert_eq!(normalize_version("0.5.3"), "0.5.3");
         assert_eq!(normalize_version("v0.6.0-rc.1"), "0.6.0");
+        assert_eq!(normalize_version("v0.15.1+my-0d2dbbf"), "0.15.1");
+        assert_eq!(normalize_version("0.15.1+my-0d2dbbf"), "0.15.1");
         assert_eq!(normalize_version(" v1.2.3 "), "1.2.3");
     }
 
@@ -440,6 +514,57 @@ mod tests {
             ),
             InstallKind::Npm
         );
+    }
+
+    #[test]
+    fn nix_store_detection_requires_a_real_store_component() {
+        let package = "0123456789abcdfghijklmnpqrsvwxyz-askhuman-1.2.3";
+        for executable in [
+            "bin/AskHuman",
+            "bin/.AskHuman-wrapped",
+            "lib/node_modules/askhuman/bin/AskHuman",
+        ] {
+            assert_eq!(
+                install_kind_from_path(&format!("/nix/store/{package}/{executable}")),
+                InstallKind::Nix
+            );
+        }
+        for path in [
+            format!("/tmp/nix/store/{package}/bin/AskHuman"),
+            format!("/nix/store-backup/{package}/bin/AskHuman"),
+            format!("/nix/store/{package}/../AskHuman"),
+            "/nix/store/not-a-hash-askhuman/bin/AskHuman".to_string(),
+            "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-askhuman/bin/AskHuman".to_string(),
+            format!("/nix/store/{package}"),
+        ] {
+            assert_eq!(install_kind_from_path(&path), InstallKind::Direct, "{path}");
+        }
+        assert!(is_nix_store_path(
+            &format!("/custom/store/{package}/bin/AskHuman"),
+            "/custom/store"
+        ));
+    }
+
+    #[test]
+    fn nix_cannot_enable_apply_on_any_platform() {
+        for platform in ["linux", "macos", "windows"] {
+            let mode = apply_mode_for(platform, InstallKind::Nix);
+            assert_eq!(mode, UpdateApplyMode::ManualNix);
+            assert!(ensure_apply_mode_allowed(mode)
+                .unwrap_err()
+                .to_string()
+                .contains("managed by Nix"));
+        }
+    }
+
+    #[tokio::test]
+    async fn nix_updater_refuses_apply_unconditionally() {
+        assert!(NixUpdater
+            .apply(None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("managed by Nix"));
     }
 
     #[test]

@@ -483,13 +483,14 @@ fn resolve(entry: &Path) -> Option<Resolved> {
     let symlink = std::fs::symlink_metadata(entry)
         .map(|meta| meta.file_type().is_symlink())
         .unwrap_or(false);
+    let native = crate::executable::unwrap_nix_wrapper(&canonical);
     Some(Resolved {
         source: if in_npm_package(&canonical) {
             Source::Npm
         } else {
             Source::Standalone
         },
-        native: canonical,
+        native,
         link: if symlink { Link::Symlink } else { Link::Direct },
     })
 }
@@ -1180,5 +1181,46 @@ mod tests {
             render_json_value(&report, Lang::En)["findings"][0]["kind"],
             "held"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nix_profile_symlink_wrapper_and_wrapped_binary_merge_into_one_entry_without_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_bin = dir.path().join("store/pkg/bin");
+        let wrapper = store_bin.join("AskHuman");
+        let wrapped = store_bin.join(".AskHuman-wrapped");
+        write_binary(&wrapper, "#!/bin/sh\nexec .AskHuman-wrapped\n");
+        write_binary(&wrapped, "0.17.3");
+
+        let profile_bin = dir.path().join("profile/bin");
+        std::fs::create_dir_all(&profile_bin).unwrap();
+        let profile_entry = profile_bin.join("AskHuman");
+        std::os::unix::fs::symlink(&wrapper, &profile_entry).unwrap();
+
+        let mut input = inputs(vec![profile_bin]);
+        input.current_exe = Some(wrapped.clone());
+        input.daemon = Some(DaemonBinary {
+            exe: wrapped.clone(),
+            fingerprint: Some(lifecycle::fingerprint_uncached(&wrapped)),
+        });
+
+        let report = inspect(&input, &read_version);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(report.copies.len(), 1);
+        let copy = &report.copies[0];
+        assert_eq!(copy.native, std::fs::canonicalize(&wrapped).unwrap());
+        assert_eq!(copy.version.as_deref(), Some("0.17.3"));
+        assert!(copy.on_path());
+        assert!(copy.is_this_process());
+        assert!(copy.is_daemon());
+        assert!(matches!(
+            copy.seen[0],
+            Seen::Path {
+                rank: 1,
+                link: Link::Symlink,
+                ..
+            }
+        ));
     }
 }

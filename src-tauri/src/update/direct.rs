@@ -13,11 +13,15 @@ use super::{
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
-pub struct DirectUpdater;
+pub struct DirectUpdater {
+    apply_mode: super::UpdateApplyMode,
+}
 
 impl DirectUpdater {
     pub fn new() -> Self {
-        Self
+        Self {
+            apply_mode: super::apply_mode(),
+        }
     }
 }
 
@@ -25,30 +29,17 @@ impl DirectUpdater {
 impl Updater for DirectUpdater {
     async fn check_latest(&self, fresh: bool) -> Result<RemoteLatest> {
         let release = fetch_latest_release(fresh).await?;
-        let version = super::normalize_version(release["tag_name"].as_str().unwrap_or(""));
-        if version.is_empty() {
-            return Err(anyhow!("无法解析最新版本号"));
-        }
-        let notes = release["body"].as_str().unwrap_or("").to_string();
-        // 优先平台资产直链；找不到回退到 release 页面（apply 时据此判定需手动下载）。
-        let source_url = asset_url_for_current(&release)
-            .or_else(|| release["html_url"].as_str().map(|s| s.to_string()))
-            .unwrap_or_default();
-        Ok(RemoteLatest {
-            version,
-            notes,
-            source_url,
-        })
+        latest_from_release(&release, target_triple())
     }
 
     async fn apply(&self, progress: Option<ProgressCb>) -> Result<()> {
+        super::ensure_apply_mode_allowed(self.apply_mode)?;
         #[cfg(unix)]
         {
             apply_unix(progress).await
         }
         #[cfg(windows)]
         {
-            super::ensure_automatic_apply_allowed()?;
             apply_windows(progress).await
         }
         #[cfg(not(any(unix, windows)))]
@@ -57,6 +48,23 @@ impl Updater for DirectUpdater {
             Err(anyhow!("auto-update is unsupported on this platform"))
         }
     }
+}
+
+// Metadata is useful to package-managed installations even without a published platform asset.
+fn latest_from_release(release: &Value, triple: Option<&str>) -> Result<RemoteLatest> {
+    let version = super::normalize_version(release["tag_name"].as_str().unwrap_or(""));
+    if version.is_empty() {
+        return Err(anyhow!("无法解析最新版本号"));
+    }
+    let source_url = triple
+        .and_then(|triple| asset_url_for_triple(release, triple))
+        .or_else(|| release["html_url"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    Ok(RemoteLatest {
+        version,
+        notes: release["body"].as_str().unwrap_or("").to_string(),
+        source_url,
+    })
 }
 
 /// 拉取 `/releases/latest` 的 JSON（用带 token 的 GitHub API 客户端）。
@@ -710,11 +718,36 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn nix_apply_is_rejected_before_any_external_operation() {
+        let updater = DirectUpdater {
+            apply_mode: super::super::UpdateApplyMode::ManualNix,
+        };
+        let error = updater.apply(None).await.unwrap_err();
+        assert!(error.to_string().contains("managed by Nix"));
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn unsigned_windows_apply_is_blocked_before_download() {
         let error = DirectUpdater::new().apply(None).await.unwrap_err();
         assert!(error.to_string().contains("automatic update"));
+    }
+
+    #[test]
+    fn release_metadata_remains_available_without_linux_arm_asset() {
+        let release = json!({
+            "tag_name": "v1.2.3",
+            "body": "Release notes",
+            "html_url": "https://example.invalid/releases/v1.2.3",
+            "assets": []
+        });
+        for triple in [None, Some("aarch64-unknown-linux-gnu")] {
+            let latest = latest_from_release(&release, triple).unwrap();
+            assert_eq!(latest.version, "1.2.3");
+            assert_eq!(latest.notes, "Release notes");
+            assert_eq!(latest.source_url, "https://example.invalid/releases/v1.2.3");
+        }
     }
 
     #[test]

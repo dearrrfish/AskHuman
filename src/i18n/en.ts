@@ -1046,6 +1046,8 @@ export default {
       updateFailed: "Update failed",
       manualUnavailable:
         "Windows automatic update is currently unavailable. Please update manually.",
+      nixManaged:
+        "This installation is managed by Nix. Update AskHuman through your declarative configuration or Nix profile.",
       prepareManual: "Prepare manual update…",
       preparingManual: "Preparing…",
       prepareManualHint:

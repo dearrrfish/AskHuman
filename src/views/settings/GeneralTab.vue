@@ -536,7 +536,7 @@ const config = computed(() => ctx.config.value!);
           {{ t("settings.about.restartSettings") }}
         </button>
         <button
-          v-else
+          v-else-if="updateInfo.applyMode === 'manualDirect' || updateInfo.applyMode === 'manualNpm'"
           class="btn btn-primary"
           type="button"
           :disabled="updatePreparing"
@@ -555,6 +555,9 @@ const config = computed(() => ctx.config.value!);
             ? t("settings.about.updatedRestartHint")
             : t("settings.about.applyAfterAnswer")
         }}
+      </p>
+      <p v-else-if="updateInfo.applyMode === 'manualNix'" class="card-desc">
+        {{ t("settings.about.nixManaged") }}
       </p>
       <template v-else>
         <p class="card-desc">{{ t("settings.about.manualUnavailable") }}</p>

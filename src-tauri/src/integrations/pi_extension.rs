@@ -67,11 +67,14 @@ pub fn status() -> ExtensionStatus {
     let expected = crate::development::routing::program_path()
         .ok()
         .and_then(|executable| {
-            render(&refreshed_config(
-                config.clone(),
-                executable.to_string_lossy().to_string(),
-            ))
-            .ok()
+            let exe_str = executable.to_string_lossy().to_string();
+            let effective_exe =
+                if crate::executable::same_program_target(&config.executable, &exe_str) {
+                    config.executable.clone()
+                } else {
+                    exe_str
+                };
+            render(&refreshed_config(config.clone(), effective_exe)).ok()
         });
     ExtensionStatus {
         installed: true,

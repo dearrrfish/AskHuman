@@ -7,12 +7,65 @@ use jsonc_parser::json;
 use jsonc_parser::ParseOptions;
 use serde_json::Value;
 
+/// Split a hook command's leading executable token (`"exe" ...`, `'exe' ...`, or `exe ...`)
+/// from the trailing arguments/flags (including leading whitespace).
+pub(crate) fn split_command_executable(command: &str) -> Option<(&str, &str)> {
+    let trimmed = command.trim_start();
+    if let Some(after_open) = trimmed.strip_prefix('"') {
+        let end = after_open.find('"')?;
+        let exe = &after_open[..end];
+        let rest = &after_open[end + 1..];
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        Some((exe, rest))
+    } else if let Some(after_open) = trimmed.strip_prefix('\'') {
+        let end = after_open.find('\'')?;
+        let exe = &after_open[..end];
+        let rest = &after_open[end + 1..];
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        Some((exe, rest))
+    } else {
+        let split = trimmed
+            .find(char::is_whitespace)
+            .unwrap_or(trimmed.len());
+        Some((&trimmed[..split], &trimmed[split..]))
+    }
+}
+
+/// Whether `actual` and `expected` invoke equivalent AskHuman executables with identical arguments.
+pub(crate) fn same_hook_command(actual: &str, expected: &str) -> bool {
+    same_hook_command_with(actual, expected, crate::executable::same_program_target)
+}
+
+fn same_hook_command_with(
+    actual: &str,
+    expected: &str,
+    same_exe: impl FnOnce(&str, &str) -> bool,
+) -> bool {
+    if actual == expected {
+        return true;
+    }
+    let (Some((actual_exe, actual_rest)), Some((expected_exe, expected_rest))) = (
+        split_command_executable(actual),
+        split_command_executable(expected),
+    ) else {
+        return false;
+    };
+    actual_rest == expected_rest && same_exe(actual_exe, expected_exe)
+}
+
 pub fn command_handler_matches(
     handler: &Value,
     expected: &str,
     expected_windows: Option<&str>,
 ) -> bool {
-    handler.get("command").and_then(Value::as_str) == Some(expected)
+    handler
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|actual| same_hook_command(actual, expected))
         && expected_windows.is_none_or(|expected_windows| {
             handler.get("commandWindows").and_then(Value::as_str) == Some(expected_windows)
         })
@@ -600,5 +653,42 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_hook_command_matches_quoted_and_shlex_unquoted_nix_profile_and_store_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let pkg = store.join("0123456789abcdfghijklmnpqrsvwxyz-askhuman-1.0/bin");
+        let other = store.join("1123456789abcdfghijklmnpqrsvwxyz-askhuman-2.0/bin");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let wrapper = pkg.join("AskHuman");
+        let wrapped = pkg.join(".AskHuman-wrapped");
+        let other_wrapper = other.join("AskHuman");
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+        std::fs::write(&wrapped, "elf-1").unwrap();
+        std::fs::write(&other_wrapper, "#!/bin/sh\n").unwrap();
+
+        let profile_dir = dir.path().join("profile/bin");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile = profile_dir.join("AskHuman");
+        std::os::unix::fs::symlink(&wrapper, &profile).unwrap();
+
+        let expected = format!("\"{}\" __agent-hook claude PreToolUse", profile.display());
+        let unquoted_store = format!("{} __agent-hook claude PreToolUse", wrapper.display());
+        let quoted_store = format!("\"{}\" __agent-hook claude PreToolUse", wrapper.display());
+        let wrong_gen = format!(
+            "\"{}\" __agent-hook claude PreToolUse",
+            other_wrapper.display()
+        );
+        let wrong_args = format!("{} __agent-hook claude Stop", wrapper.display());
+
+        let cmp = |a: &str, b: &str| crate::executable::same_program_target_in(a, b, &store);
+        assert!(same_hook_command_with(&unquoted_store, &expected, cmp));
+        assert!(same_hook_command_with(&quoted_store, &expected, cmp));
+        assert!(!same_hook_command_with(&wrong_gen, &expected, cmp));
+        assert!(!same_hook_command_with(&wrong_args, &expected, cmp));
     }
 }

@@ -780,7 +780,10 @@ fn json_entry_matches(value: &Value, command: &str, timeout: JsonTimeout) -> boo
     let Some(entry) = json_entry(value) else {
         return false;
     };
-    let cmd_ok = entry.get("command").and_then(|v| v.as_str()) == Some(command);
+    let cmd_ok = entry
+        .get("command")
+        .and_then(|v| v.as_str())
+        .is_some_and(|actual| crate::executable::same_program_target(actual, command));
     let args_ok = entry
         .get("args")
         .and_then(|v| v.as_array())
@@ -1083,7 +1086,10 @@ fn toml_entry_matches(target: AgentTarget, text: &str, command: &str) -> bool {
         return false;
     };
     let (startup, tool, ask) = toml_profile(target);
-    let cmd_ok = entry.get("command").and_then(|i| i.as_str()) == Some(command);
+    let cmd_ok = entry
+        .get("command")
+        .and_then(|i| i.as_str())
+        .is_some_and(|actual| crate::executable::same_program_target(actual, command));
     let args_ok = entry
         .get("args")
         .and_then(|i| i.as_array())

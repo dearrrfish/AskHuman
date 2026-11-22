@@ -64,9 +64,10 @@ pub fn current_fingerprint() -> Fingerprint {
 }
 
 /// Detect replacement at the installation entry while retaining current_fingerprint as the
-/// identity of the running image. Linux keeps that image at a different path after an exchange.
+/// identity of the running image. Linux keeps that image at a different path after an exchange,
+/// and Nix follows a validated profile generation to its underlying ELF image.
 pub fn launch_fingerprint() -> Fingerprint {
-    crate::executable::launch_path()
+    crate::executable::image_path()
         .map(|path| fingerprint_at(&path))
         .unwrap_or(Fingerprint::UNKNOWN)
 }
@@ -81,20 +82,21 @@ pub fn fingerprint_at(path: &Path) -> Fingerprint {
 }
 
 fn fingerprint_at_with_cache(path: &Path, cache: &Path) -> Fingerprint {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let resolved = crate::executable::unwrap_nix_wrapper(path);
+    let Ok(meta) = std::fs::metadata(&resolved) else {
         return Fingerprint::UNKNOWN;
     };
     let size = meta.len();
     let mtime_ms = mtime_ms_of(&meta);
-    if let Some(hash) = cached_hash(cache, path, size, mtime_ms) {
+    if let Some(hash) = cached_hash(cache, &resolved, size, mtime_ms) {
         return Fingerprint { size, hash };
     }
     // A failed read is "unknown" and is never cached: the next call has to look again instead of
     // finding this failure recorded as the file's identity.
-    let Ok(hash) = hash_file(path) else {
+    let Ok(hash) = hash_file(&resolved) else {
         return Fingerprint::UNKNOWN;
     };
-    store_cached_hash(cache, path, size, mtime_ms, hash);
+    store_cached_hash(cache, &resolved, size, mtime_ms, hash);
     Fingerprint { size, hash }
 }
 
@@ -103,10 +105,11 @@ fn fingerprint_at_with_cache(path: &Path, cache: &Path) -> Fingerprint {
 /// For inspecting binaries that are not this process's own (`doctor install` scans other copies on
 /// PATH): their paths would only bloat the cache, and a cached hash is useless for a one-off look.
 pub fn fingerprint_uncached(path: &Path) -> Fingerprint {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let resolved = crate::executable::unwrap_nix_wrapper(path);
+    let Ok(meta) = std::fs::metadata(&resolved) else {
         return Fingerprint::UNKNOWN;
     };
-    match hash_file(path) {
+    match hash_file(&resolved) {
         Ok(hash) => Fingerprint {
             size: meta.len(),
             hash,
@@ -854,5 +857,34 @@ mod tests {
         assert_eq!(value["reason"], "codex_thread_source_missing");
         assert!(value.get("threadSource").is_none());
         assert_eq!(value["threadId"], "thread-2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_unwraps_nix_wrapper_and_profile_symlink_to_match_wrapped_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_bin = dir.path().join("store/pkg/bin");
+        std::fs::create_dir_all(&store_bin).unwrap();
+        let wrapper = store_bin.join("AskHuman");
+        let wrapped = store_bin.join(".AskHuman-wrapped");
+        std::fs::write(&wrapper, b"#!/bin/sh\nexec .AskHuman-wrapped\n").unwrap();
+        std::fs::write(&wrapped, b"native-elf-payload-v1").unwrap();
+
+        let profile_bin = dir.path().join("profile/bin");
+        std::fs::create_dir_all(&profile_bin).unwrap();
+        let symlink = profile_bin.join("AskHuman");
+        std::os::unix::fs::symlink(&wrapper, &symlink).unwrap();
+
+        let cache = dir.path().join("binhash.json");
+        let wrapped_fp = fingerprint_at(&wrapped);
+        let wrapper_fp = fingerprint_at(&wrapper);
+        let symlink_fp = fingerprint_at(&symlink);
+
+        assert!(!wrapped_fp.is_unknown());
+        assert_eq!(symlink_fp, wrapped_fp);
+        assert_eq!(wrapper_fp, wrapped_fp);
+        assert_eq!(fingerprint_at_with_cache(&symlink, &cache), wrapped_fp);
+        assert_eq!(fingerprint_uncached(&symlink), wrapped_fp);
+        assert_eq!(fingerprint_uncached(&wrapper), wrapped_fp);
     }
 }

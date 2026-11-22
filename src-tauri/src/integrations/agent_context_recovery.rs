@@ -205,7 +205,7 @@ fn status_from_text(target: AgentTarget, mode: Mode, text: &str, trust_ok: bool)
                 let windows_override_ok = expected_windows
                     .as_deref()
                     .is_none_or(|expected_windows| command_windows == Some(expected_windows));
-                if command == Some(expected.as_str())
+                if command.is_some_and(|actual| hook_edit::same_hook_command(actual, &expected))
                     && windows_override_ok
                     && timeout == Some(TIMEOUT_SECS)
                     && matcher == spec.matcher

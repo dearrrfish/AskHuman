@@ -12,11 +12,15 @@ use serde_json::Value;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-pub struct NpmUpdater;
+pub struct NpmUpdater {
+    apply_mode: super::UpdateApplyMode,
+}
 
 impl NpmUpdater {
     pub fn new() -> Self {
-        Self
+        Self {
+            apply_mode: super::apply_mode(),
+        }
     }
 
     /// 手动更新命令提示（npm 不可用时回显给用户）。
@@ -41,9 +45,9 @@ impl Updater for NpmUpdater {
     }
 
     async fn apply(&self, _progress: Option<ProgressCb>) -> Result<()> {
+        super::ensure_apply_mode_allowed(self.apply_mode)?;
         #[cfg(windows)]
         {
-            super::ensure_automatic_apply_allowed()?;
             stage_windows_npm_worker().await
         }
         #[cfg(not(windows))]
@@ -375,6 +379,15 @@ fn prepend_path(prefix_bin: &Path, current_path: Option<&OsStr>) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn nix_apply_is_rejected_before_any_external_operation() {
+        let updater = NpmUpdater {
+            apply_mode: super::super::UpdateApplyMode::ManualNix,
+        };
+        let error = updater.apply(None).await.unwrap_err();
+        assert!(error.to_string().contains("managed by Nix"));
+    }
 
     #[cfg(windows)]
     #[tokio::test]
