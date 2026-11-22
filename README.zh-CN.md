@@ -41,6 +41,14 @@ npm i -g askhuman
 
 也可从 [GitHub Releases](https://github.com/Naituw/AskHuman/releases) 下载对应平台压缩包，解压后把 `AskHuman` 放入 `PATH`。从源码构建见[开发文档](docs/development.md)。
 
+Nix（`x86_64-linux`）用户可使用启用 Git LFS 的 Flake 运行或接入 `homeManagerModules.askhuman`：
+
+```bash
+nix run 'git+https://github.com/Naituw/AskHuman.git?ref=main&lfs=1'
+```
+
+Flake 提供 `packages.x86_64-linux.askhuman`、`apps.x86_64-linux.default`、`devShells.x86_64-linux.default`、`overlays.default` 以及 `homeManagerModules.askhuman`（声明式配置、密钥文件注入、Agent 集成与 systemd 用户服务）。详见[Nix 开发文档](docs/development.md#nix-flake-linux)与 [Home Manager 选项参考](docs/nix/askhuman-options.md)。Nix 安装请通过原配置或 profile 更新。
+
 > Linux 运行 GUI 弹窗需系统具备 WebKitGTK（如 `libwebkit2gtk-4.1`）；缺失且配置了会话型渠道时会自动改走该渠道。
 
 ## 使用
