@@ -45,6 +45,14 @@ npm i -g askhuman
 
 You can also download a platform archive from [GitHub Releases](https://github.com/Naituw/AskHuman/releases), extract it, and put `AskHuman` on your `PATH`. To build from source, see the [development guide](docs/development.md).
 
+Nix (`x86_64-linux`) users can run the flake with Git LFS enabled or import `homeManagerModules.askhuman`:
+
+```bash
+nix run 'git+https://github.com/Naituw/AskHuman.git?ref=main&lfs=1'
+```
+
+The Flake provides `packages.x86_64-linux.askhuman`, `apps.x86_64-linux.default`, `devShells.x86_64-linux.default`, `overlays.default`, and `homeManagerModules.askhuman` (declarative settings, secret file provisioning, agent integrations, and systemd user services). See the [Nix development guide](docs/development.md#nix-flake-linux) and [Home Manager options reference](docs/nix/askhuman-options.md). Update Nix installations through the configuration or profile that installed them.
+
 > Running the GUI popup on Linux needs system WebKitGTK (e.g. `libwebkit2gtk-4.1`); if it's missing and a session-based channel is configured, AskHuman uses that channel automatically.
 
 ## Usage

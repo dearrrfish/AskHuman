@@ -25,6 +25,40 @@ pnpm build && cargo build --release \
 cargo test --manifest-path src-tauri/Cargo.toml            # Rust unit tests
 ```
 
+### Nix Flake (Linux)
+
+The Flake targets `x86_64-linux` and exposes:
+
+- `packages.x86_64-linux.{default,askhuman}` — packaged `AskHuman` binary (`wrapGAppsHook4`, `libayatana-appindicator`, `WEBKIT_DISABLE_DMABUF_RENDERER=1`, and `$out/share/askhuman/entry-v1.json`)
+- `apps.x86_64-linux.{default,generate-module-docs}` — run `AskHuman` or regenerate [`docs/nix/askhuman-options.md`](./nix/askhuman-options.md)
+- `devShells.x86_64-linux.default` — Rust, Node/pnpm, SQLite, and GTK/WebKitGTK development environment
+- `overlays.default` — adds `pkgs.askhuman`
+- `homeManagerModules.{default,askhuman}` — declarative Home Manager module with sparse writable config reconciliation, secret file provisioning, agent integrations, and systemd user services
+- `checks.x86_64-linux.{package,frontend,module-eval,module-docs,askhuman-reconcile,askhuman-activation}`
+
+Fetch the repository with Git LFS enabled so `src-tauri/icons/` assets are smudged (`inputs.self.lfs = true;` in `flake.nix`, or explicit `?lfs=1` URLs):
+
+```bash
+nix build '.?lfs=1#askhuman'
+nix develop '.?lfs=1'
+nix flake check '.?lfs=1'
+nix run '.?lfs=1#generate-module-docs'
+```
+
+Local Git flakes evaluate tracked files only (`git add -N` newly created files before evaluating `.`; `path:/abs/path` also reads unstaged files). `nix/package.nix` uses `lib.fileset.toSource` so edits under `nix/` or `docs/` do not invalidate the Rust/frontend build; when `pnpm-lock.yaml` or `src-tauri/Cargo.lock` changes, update `pnpmDeps` or `cargoHash` in `nix/package.nix`.
+
+For declarative Home Manager consumers:
+
+```nix
+inputs.askhuman = {
+  url = "git+https://github.com/Naituw/AskHuman.git?ref=main&lfs=1";
+  inputs.nixpkgs.follows = "nixpkgs";
+  inputs.home-manager.follows = "home-manager";
+};
+```
+
+Import `inputs.askhuman.homeManagerModules.askhuman` in Home Manager. On Linux, enabling `programs.askhuman` exports `ASKHUMAN_MANAGED_AUTOSTART=1`, removes residual mutable `~/.config/autostart/askhuman-*.desktop` entries, and manages declarative `systemd.user.services.askhuman-guihost` (by default when `settings.general.menuBarIcon == "always"`) and `systemd.user.services.askhuman-daemon` (by default when `settings.general.daemonLifecycle == "keepalive"`), overridable via `programs.askhuman.services.{guiHost,daemon}.enable`. See [`docs/nix/askhuman-options.md`](./nix/askhuman-options.md) for all evaluated options.
+
 ### UI prototyping (browser-only, no Tauri)
 
 `src/prototype/` hosts standalone HTML entries that run in a plain browser with mock data and
