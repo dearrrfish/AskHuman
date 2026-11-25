@@ -7,11 +7,24 @@ import GeneralTab from "./GeneralTab.vue";
 
 const useSettingsContext = vi.hoisted(() => vi.fn());
 vi.mock("./context", () => ({ useSettingsContext }));
-vi.mock("../../lib/ipc", () => ({ openTestPopup: vi.fn() }));
+vi.mock("../../lib/ipc", () => ({
+  openSetup: vi.fn(),
+  openTestPopup: vi.fn(),
+  quickReplyDefaults: vi.fn().mockResolvedValue({ en: [], zh: [] }),
+}));
 
 function setup(mode: UpdateApplyMode) {
   const ctx = {
-    config: ref({ general: {}, channels: { popup: {} }, experimental: {} }),
+    config: ref({
+      general: {
+        away: { capsule: true, welcomeBack: true, pushAfterSecs: 900 },
+        quickReplies: null,
+      },
+      channels: { popup: {} },
+      experimental: {},
+    }),
+    setupState: ref(null),
+    persist: vi.fn(),
     isMac: false, soundSupport: ref({ kind: "none" }),
     appVersion: ref("1.0.0"), updateInfo: ref({ available: true, latestVersion: "2.0.0", applyMode: mode, manualCommand: "npm i -g askhuman@latest" }),
     updateChecking: ref(false), updateApplying: ref(false), updatePreparing: ref(false),

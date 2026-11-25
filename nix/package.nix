@@ -13,7 +13,7 @@ let
       /. + builtins.unsafeDiscardStringContext source.outPath;
   env = import ./environment.nix { inherit pkgs; };
   version = (builtins.fromJSON (builtins.readFile (sourcePath + "/package.json"))).version;
-  # Exclude nix/, docs/, and local developer outputs so editing them does not invalidate builds.
+  # Exclude nix/, unrelated docs/, and local developer outputs so editing them does not invalidate builds.
   src = lib.fileset.toSource {
     root = sourcePath;
     fileset = lib.fileset.unions (
@@ -28,9 +28,16 @@ let
         "src"
         "scripts"
         ".agents/skills/ios-testflight/scripts"
+        "docs/public/ios"
+        "docs/wiki/ios-broker.md"
+        "docs/wiki/ios-broker.en.md"
+        "docs/wiki/ios-setup.md"
+        "docs/wiki/ios-setup.en.md"
+        "ios/AskHuman/Resources/Localizable.xcstrings"
         "ios/AskHuman/Resources/WebMarkdown"
         "ios/Fixtures"
         "ios/Tools/agent-logos"
+        "ios/project.yml"
         "todo-sync-helper/Fixtures"
         "todo-sync-helper/scripts"
         "src-tauri/Cargo.toml"
@@ -73,7 +80,9 @@ rustPlatform.buildRustPackage {
 
   cargoRoot = "src-tauri";
   buildAndTestSubdir = "src-tauri";
-  cargoHash = "sha256-JLx/qr6m2Uy9xYEISmOd1NCyfU47yB0ALx1hbin5wSs=";
+  # Derive vendored crate downloads directly from Cargo.lock checksums so upstream
+  # lockfile updates and release version bumps do not trigger cargoHash drift.
+  cargoLock.lockFile = sourcePath + "/src-tauri/Cargo.lock";
   buildFeatures = [ "custom-protocol" ];
 
   # Only immutable package builds carry this marker; local devShell installs do not.

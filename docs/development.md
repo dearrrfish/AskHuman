@@ -45,7 +45,7 @@ nix flake check '.?lfs=1'
 nix run '.?lfs=1#generate-module-docs'
 ```
 
-Local Git flakes evaluate tracked files only (`git add -N` newly created files before evaluating `.`; `path:/abs/path` also reads unstaged files). `nix/package.nix` uses `lib.fileset.toSource` so edits under `nix/` or `docs/` do not invalidate the Rust/frontend build; when `pnpm-lock.yaml` or `src-tauri/Cargo.lock` changes, update `pnpmDeps` or `cargoHash` in `nix/package.nix`.
+Local Git flakes evaluate tracked files only (`git add -N` newly created files before evaluating `.`; `path:/abs/path` also reads unstaged files). `nix/package.nix` uses `lib.fileset.toSource` so edits under `nix/` or unrelated `docs/` do not invalidate the Rust/frontend build. Rust crate dependencies are imported directly from `src-tauri/Cargo.lock` via `cargoLock.lockFile` (no `cargoHash` update is needed for crates.io bumps or release versions; only a new Git crate would require `cargoLock.outputHashes`); when `pnpm-lock.yaml` changes, update `pnpmDeps.hash` in `nix/package.nix`.
 
 For declarative Home Manager consumers:
 
