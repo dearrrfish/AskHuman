@@ -1,0 +1,81 @@
+name: nix-check
+
+# Verifies x86_64-linux Nix flake packaging, lockfile consistency, frontend tests,
+# Home Manager module evaluation/docs, and activation checks. Kept separate from
+# upstream's build.yml so sync-upstream rebases never conflict with upstream CI edits.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "nix/**"
+      - "docs/nix/**"
+      - "docs/public/ios/**"
+      - "docs/wiki/ios-broker*.md"
+      - "docs/wiki/ios-setup*.md"
+      - "ios/AskHuman/Resources/Localizable.xcstrings"
+      - "ios/AskHuman/Resources/WebMarkdown/**"
+      - "ios/Fixtures/**"
+      - "ios/Tools/agent-logos/**"
+      - "ios/project.yml"
+      - "todo-sync-helper/Fixtures/**"
+      - "todo-sync-helper/scripts/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "src/**"
+      - "scripts/**"
+      - "src-tauri/**"
+      - ".github/workflows/nix-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: nix-check-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  flake-check:
+    name: nix flake check (x86_64-linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Free runner disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          lfs: true
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v32
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-x86_64-linux-${{ hashFiles('flake.lock', 'src-tauri/Cargo.lock', 'pnpm-lock.yaml', 'nix/environment.nix') }}
+          restore-prefixes-first-match: |
+            nix-x86_64-linux-
+          gc-max-store-size-linux: 5G
+          purge: ${{ github.ref == 'refs/heads/main' }}
+          purge-prefixes: nix-x86_64-linux-
+          purge-created: 0
+          purge-last-accessed: P7D
+          purge-primary-key: never
+
+      - name: Run Nix flake checks and package build
+        run: nix flake check '.?lfs=1' -L --keep-going
