@@ -82,7 +82,8 @@ pub fn fingerprint_at(path: &Path) -> Fingerprint {
 }
 
 fn fingerprint_at_with_cache(path: &Path, cache: &Path) -> Fingerprint {
-    let resolved = crate::executable::unwrap_nix_wrapper(path);
+    let resolved = crate::executable::unwrap_nix_wrapper_if_present(path)
+        .unwrap_or_else(|| path.to_path_buf());
     let Ok(meta) = std::fs::metadata(&resolved) else {
         return Fingerprint::UNKNOWN;
     };
@@ -105,7 +106,8 @@ fn fingerprint_at_with_cache(path: &Path, cache: &Path) -> Fingerprint {
 /// For inspecting binaries that are not this process's own (`doctor install` scans other copies on
 /// PATH): their paths would only bloat the cache, and a cached hash is useless for a one-off look.
 pub fn fingerprint_uncached(path: &Path) -> Fingerprint {
-    let resolved = crate::executable::unwrap_nix_wrapper(path);
+    let resolved = crate::executable::unwrap_nix_wrapper_if_present(path)
+        .unwrap_or_else(|| path.to_path_buf());
     let Ok(meta) = std::fs::metadata(&resolved) else {
         return Fingerprint::UNKNOWN;
     };
@@ -758,6 +760,29 @@ mod tests {
         assert_eq!(entry.hash, measured.hash, "the poisoned entry was replaced");
         // And the healed entry is what the next call uses.
         assert_eq!(fingerprint_at_with_cache(&path, &cache), measured);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_entry_via_symlinked_parent_dir_heals_under_original_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("private");
+        let alias_dir = dir.path().join("var");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let path = alias_dir.join("AskHuman");
+        let cache = dir.path().join("binhash.json");
+        std::fs::write(&path, b"the real binary content").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        store_cached_hash(&cache, &path, meta.len(), mtime_ms_of(&meta), 0);
+
+        let measured = fingerprint_at_with_cache(&path, &cache);
+        assert_eq!(measured, fingerprint_uncached(&path));
+        let entry = read_hash_cache(&cache)
+            .remove(path.to_string_lossy().as_ref())
+            .unwrap();
+        assert_eq!(entry.hash, measured.hash);
     }
 
     #[test]

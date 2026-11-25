@@ -139,27 +139,42 @@ pub fn image_path() -> io::Result<PathBuf> {
 }
 
 /// Resolve Nix `makeWrapper` binaries (`bin/AskHuman` -> `bin/.AskHuman-wrapped`) to the underlying
+/// native binary when a sibling wrapped executable exists. Returns `None` for ordinary non-wrapper
+/// binaries so callers like `binhash.json` keep their original path key across platforms.
+#[allow(dead_code)]
+pub fn unwrap_nix_wrapper_if_present(path: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let (parent, name) = (
+            canonical.parent()?,
+            canonical.file_name().and_then(|n| n.to_str())?,
+        );
+        if !name.is_empty() && !name.starts_with('.') && !name.ends_with("-wrapped") {
+            for candidate in [
+                parent.join(format!(".{name}-wrapped")),
+                parent.join(format!("{name}-wrapped")),
+            ] {
+                if std::fs::metadata(&candidate).is_ok_and(|meta| meta.is_file()) {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Resolve Nix `makeWrapper` binaries (`bin/AskHuman` -> `bin/.AskHuman-wrapped`) to the underlying
 /// ELF binary so content fingerprints and install diagnostics compare the same native executable.
 #[allow(dead_code)]
 pub fn unwrap_nix_wrapper(path: &Path) -> PathBuf {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let (Some(parent), Some(name)) = (
-        canonical.parent(),
-        canonical.file_name().and_then(|n| n.to_str()),
-    ) else {
-        return canonical;
-    };
-    if !name.is_empty() && !name.starts_with('.') && !name.ends_with("-wrapped") {
-        for candidate in [
-            parent.join(format!(".{name}-wrapped")),
-            parent.join(format!("{name}-wrapped")),
-        ] {
-            if std::fs::metadata(&candidate).is_ok_and(|meta| meta.is_file()) {
-                return candidate;
-            }
-        }
-    }
-    canonical
+    unwrap_nix_wrapper_if_present(path)
+        .unwrap_or_else(|| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
 /// Whether two configured/expected program paths refer to the same installation target.
@@ -197,14 +212,15 @@ fn same_program_target_with_store(configured: &str, expected: &str, store: &Path
         let Ok(canon_right) = std::fs::canonicalize(right) else {
             return false;
         };
+        let canon_store = std::fs::canonicalize(store).unwrap_or_else(|_| store.to_path_buf());
         let resolved_left = unwrap_nix_wrapper(&canon_left);
         let resolved_right = unwrap_nix_wrapper(&canon_right);
         if resolved_left != resolved_right {
             return false;
         }
-        let in_store = nix::package_root(&resolved_left, store).is_ok();
+        let in_store = nix::package_root(&resolved_left, &canon_store).is_ok();
         let nix_profile_hint = is_nix_profile_path(left) || is_nix_profile_path(right);
-        in_store || (nix_profile_hint && canon_left.starts_with(store))
+        in_store || (nix_profile_hint && canon_left.starts_with(&canon_store))
     }
     #[cfg(not(unix))]
     {
@@ -1174,6 +1190,14 @@ mod nix {
             assert!(same_program_target_in(&wrapper_str, profile_str, &f.store));
             assert!(same_program_target_in(profile_str, &wrapper_str, &f.store));
             assert!(same_program_target_in(&wrapped_str, profile_str, &f.store));
+            // Also matches when the store root traverses a symlink (e.g. macOS /var -> /private/var).
+            let store_alias = f.dir.path().join("store-alias");
+            symlink(&f.store, &store_alias).unwrap();
+            assert!(same_program_target_in(
+                &wrapper_str,
+                profile_str,
+                &store_alias
+            ));
             assert!(!same_program_target_in(
                 &other_wrapper,
                 profile_str,
