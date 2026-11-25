@@ -490,8 +490,8 @@ mod nix {
                         for _ in 0..4 {
                             hex.push(c.next().ok_or("truncated unicode escape")?);
                         }
-                        let code = u32::from_str_radix(&hex, 16)
-                            .map_err(|_| "invalid unicode escape")?;
+                        let code =
+                            u32::from_str_radix(&hex, 16).map_err(|_| "invalid unicode escape")?;
                         out.push(char::from_u32(code).ok_or("invalid unicode scalar")?);
                     }
                     _ => return Err("unsupported JSON escape".into()),
@@ -519,7 +519,7 @@ mod nix {
         }
         match c.next() {
             Some('0') => {}
-            Some(ch) if matches!(ch, '1'..='9') => {
+            Some('1'..='9') => {
                 while c.peek().is_some_and(|d| d.is_ascii_digit()) {
                     c.next();
                 }
@@ -706,9 +706,8 @@ mod nix {
             let mut resolved = root.to_path_buf();
             let check = |path: &Path| -> io::Result<fs::Metadata> {
                 let meta = fs::symlink_metadata(path)?;
-                let trusted_owner = meta.uid() == 0
-                    || meta.uid() == uid
-                    || (!root_mapped && meta.uid() == 65534);
+                let trusted_owner =
+                    meta.uid() == 0 || meta.uid() == uid || (!root_mapped && meta.uid() == 65534);
                 // The root-owned sticky store directory can be writable by nixbld. Sticky
                 // semantics protect existing entries; every child still needs a trusted owner.
                 let sticky_root_dir = meta.is_dir()
@@ -1165,7 +1164,11 @@ mod nix {
             f.switch(&a);
             let profile_str = f.profile.to_str().unwrap();
             let wrapper_str = a.join("bin/AskHuman").to_str().unwrap().to_string();
-            let wrapped_str = a.join("bin/.AskHuman-wrapped").to_str().unwrap().to_string();
+            let wrapped_str = a
+                .join("bin/.AskHuman-wrapped")
+                .to_str()
+                .unwrap()
+                .to_string();
             let other_wrapper = b.join("bin/AskHuman").to_str().unwrap().to_string();
 
             assert!(same_program_target_in(&wrapper_str, profile_str, &f.store));
@@ -1363,6 +1366,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn nix_parse_metadata_skips_arbitrary_json_fields() {
         let json = br#"{

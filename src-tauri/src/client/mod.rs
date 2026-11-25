@@ -2034,7 +2034,9 @@ mod tests {
         let mut client_read = tokio::io::BufReader::new(client_read);
 
         let responder = tokio::spawn(async move {
-            let _ = ipc::read_msg::<_, ClientMsg>(&mut server_read).await.unwrap();
+            let _ = ipc::read_msg::<_, ClientMsg>(&mut server_read)
+                .await
+                .unwrap();
             ipc::write_msg(
                 &mut server_write,
                 &ServerMsg::HelloAck(ipc::HelloAck {

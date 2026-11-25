@@ -284,10 +284,7 @@ fn resolve_program_exe_with(
     public: impl FnOnce() -> std::io::Result<PathBuf>,
     launch: impl FnOnce() -> std::io::Result<PathBuf>,
 ) -> Option<PathBuf> {
-    routing()
-        .or_else(|_| public())
-        .or_else(|_| launch())
-        .ok()
+    routing().or_else(|_| public()).or_else(|_| launch()).ok()
 }
 
 fn resolve_program_exe() -> Option<PathBuf> {
@@ -655,7 +652,14 @@ mod tests {
         assert_ne!(exe, std::env::current_exe().unwrap());
 
         let writable = |_: &Path| false;
-        let report = build_report(inputs(EnvLookup::Missing, Some(&exe), &home, &temp, &writable, None));
+        let report = build_report(inputs(
+            EnvLookup::Missing,
+            Some(&exe),
+            &home,
+            &temp,
+            &writable,
+            None,
+        ));
         let fix = report.path_fix.expect("path fix expected");
         assert!(fix.command.contains(&*wrapper.to_string_lossy()));
         assert!(!fix.command.contains(".AskHuman-wrapped"));

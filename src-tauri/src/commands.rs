@@ -6205,10 +6205,7 @@ mod tests {
         }
         let resolved = mcp_command_path().unwrap();
         assert_eq!(resolved, wrapper.to_string_lossy());
-        assert_ne!(
-            resolved,
-            std::env::current_exe().unwrap().to_string_lossy()
-        );
+        assert_ne!(resolved, std::env::current_exe().unwrap().to_string_lossy());
     }
 }
 

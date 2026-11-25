@@ -28,9 +28,7 @@ pub(crate) fn split_command_executable(command: &str) -> Option<(&str, &str)> {
         }
         Some((exe, rest))
     } else {
-        let split = trimmed
-            .find(char::is_whitespace)
-            .unwrap_or(trimmed.len());
+        let split = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
         Some((&trimmed[..split], &trimmed[split..]))
     }
 }

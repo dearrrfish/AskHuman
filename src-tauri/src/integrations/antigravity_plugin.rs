@@ -936,7 +936,8 @@ fn snapshot_at(
                 State::NeedsRepair
             } else {
                 let desired = executable.and_then(|executable| {
-                    let rendered = render(manifest, executable, &rules(manifest.variant.into())).ok()?;
+                    let rendered =
+                        render(manifest, executable, &rules(manifest.variant.into())).ok()?;
                     if owned.present == digests(&rendered) {
                         return Some(rendered);
                     }

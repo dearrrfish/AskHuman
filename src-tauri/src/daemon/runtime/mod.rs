@@ -6588,7 +6588,10 @@ mod tests {
             crate::update::InstallKind::Direct,
         );
         assert!(!res.stale);
-        assert_eq!(res.reason, super::HelloStalenessReason::OlderProtocolRejected);
+        assert_eq!(
+            res.reason,
+            super::HelloStalenessReason::OlderProtocolRejected
+        );
 
         // 2. Same protocol, older client version, different fp -> served without downgrading.
         let res = super::assess_hello_staleness(
@@ -6689,12 +6692,7 @@ mod tests {
 
         // 5. Same protocol, newer client version on Direct with differing fp -> yields for upgrade.
         let res = super::assess_hello_staleness(
-            &mk_hello(
-                proto,
-                "0.17.4",
-                "/home/user/.local/bin/AskHuman",
-                other_fp,
-            ),
+            &mk_hello(proto, "0.17.4", "/home/user/.local/bin/AskHuman", other_fp),
             "0.17.3",
             proto,
             daemon_fp,
@@ -6706,12 +6704,7 @@ mod tests {
 
         // 6. `own_changed == true` with same protocol -> stale; older protocol still never yields.
         let res = super::assess_hello_staleness(
-            &mk_hello(
-                proto,
-                "0.17.0",
-                "/old/AskHuman",
-                daemon_fp,
-            ),
+            &mk_hello(proto, "0.17.0", "/old/AskHuman", daemon_fp),
             "0.17.3",
             proto,
             daemon_fp,
@@ -6736,7 +6729,10 @@ mod tests {
             crate::update::InstallKind::Direct,
         );
         assert!(!res.stale);
-        assert_eq!(res.reason, super::HelloStalenessReason::OlderProtocolRejected);
+        assert_eq!(
+            res.reason,
+            super::HelloStalenessReason::OlderProtocolRejected
+        );
     }
 
     async fn send_hello_through_control_loop(

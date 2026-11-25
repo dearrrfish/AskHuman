@@ -402,7 +402,13 @@ fn systemd_unit_managed_in(
 ) -> bool {
     if xdg_config_home
         .filter(|v| !v.is_empty())
-        .is_some_and(|dir| Path::new(dir).join("systemd").join("user").join(unit_name).exists())
+        .is_some_and(|dir| {
+            Path::new(dir)
+                .join("systemd")
+                .join("user")
+                .join(unit_name)
+                .exists()
+        })
     {
         return true;
     }
@@ -420,8 +426,7 @@ fn systemd_unit_managed_in(
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn is_managed_autostart() -> bool {
-    !is_dev_instance_context()
-        && std::env::var_os(MANAGED_AUTOSTART_ENV).is_some_and(|v| v == "1")
+    !is_dev_instance_context() && std::env::var_os(MANAGED_AUTOSTART_ENV).is_some_and(|v| v == "1")
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -1051,7 +1056,10 @@ mod tests {
         assert!(!gui_desktop.exists());
 
         // Missing file under systemd-managed stays absent (no directory or file created).
-        let uncreated = temp.path().join("never-created").join("askhuman-guihost.desktop");
+        let uncreated = temp
+            .path()
+            .join("never-created")
+            .join("askhuman-guihost.desktop");
         install_desktop_entry(&uncreated, true, || {
             panic!("should not generate .desktop when systemd-managed")
         })
@@ -1119,12 +1127,16 @@ mod tests {
         // managed, without falsely claiming a systemd unit exists on disk.
         let home_systemd = crate::paths::integration_home().join(".config/systemd/user");
         if !home_systemd.join(SYSTEMD_GUIHOST_UNIT).exists()
-            && !Path::new("/etc/systemd/user").join(SYSTEMD_GUIHOST_UNIT).exists()
+            && !Path::new("/etc/systemd/user")
+                .join(SYSTEMD_GUIHOST_UNIT)
+                .exists()
         {
             assert!(!is_systemd_guihost_managed());
         }
         if !home_systemd.join(SYSTEMD_DAEMON_UNIT).exists()
-            && !Path::new("/etc/systemd/user").join(SYSTEMD_DAEMON_UNIT).exists()
+            && !Path::new("/etc/systemd/user")
+                .join(SYSTEMD_DAEMON_UNIT)
+                .exists()
         {
             assert!(!is_systemd_daemon_managed());
         }
